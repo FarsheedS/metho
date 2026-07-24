@@ -154,11 +154,13 @@ Required (one of):
 
 Options:
   --subfinder-config FILE Path to subfinder provider-config.yaml (API keys)
+  --amass-config FILE     Path to amass config.yaml (API keys -> fewer 403/429)
   --auto                  Skip all checkpoint prompts
   --skip-phase {1,2,3}    Skip specific phase(s)
   --skip-cloud            Shorthand for --skip-phase 2
   --no-port-scan          Skip port scanning phase
   --threads N             Thread count (default: 50)
+  --parallel-hosts N      Hosts crawled in parallel per per-host tool (default: 5)
   --rate-limit N          Requests/second (default: 100)
   --timeout N             Checkpoint auto-continue timeout in seconds (default: 30)
   --output DIR            Output directory (default: /output)
@@ -220,6 +222,24 @@ docker run --rm -it \
   --auto
 ```
 
+**With an Amass config (API keys -> fewer 403/429 from passive sources):**
+```bash
+docker run --rm -it \
+  -v $(pwd)/results:/output \
+  -v $(pwd)/targets.txt:/input/domains.txt:ro \
+  -v $(pwd)/amass-config.yaml:/input/amass-config.yaml:ro \
+  metho \
+  --domains-file /input/domains.txt \
+  --amass-config /input/amass-config.yaml \
+  --auto
+```
+Without a config, Amass runs passively but ~40 premium data sources
+(Shodan, Censys, SecurityTrails, URLScan, VirusTotal, ...) skip the auth
+check and you see a flood of "check callback failed" / `403` / `429` lines in
+`phase2/amass.stderr.log`. A `config.yaml` with those keys makes them answer.
+The remaining `403/429` from *free* sources are provider-side rate/geo blocks,
+not config issues.
+
 **Skip cloud discovery and port scanning:**
 ```bash
 docker run --rm -it \
@@ -264,6 +284,7 @@ pipeline. Set the env var when you run the container:
 | `CLOUD_ENUM_TIMEOUT`     | `1800`  | Cloud_Enum keyword mutation (single call per Phase 2 run)        |
 | `KATANA_CRAWL_DURATION`  | `30m`   | Katana per-host wall-clock cap (uses Katana's `-ct` flag, s/m/h) |
 | `CEWL_TIMEOUT`           | `600`   | CeWL word-crawl (per live host)                                  |
+| `GAU_TIMEOUT`            | `300`   | GAU fetch (per root domain) -- archives can stall on some targets |
 | `CEWL_DEPTH`             | `2`     | CeWL spider depth on the first pass (retries at depth 1 on failure) |
 | `CEWL_MEM_LIMIT_MB`      | `1024`  | CeWL per-process address-space cap (`ulimit -v`, in MB) — stops CeWL from being OOM-killed on huge sites; on hitting the cap CeWL exits cleanly and the host is retried at depth 1 |
 
@@ -274,8 +295,33 @@ docker run --rm -it \
   -e AMASS_TIMEOUT=2700 \
   -e KATANA_CRAWL_DURATION=15m \
   -e CEWL_MEM_LIMIT_MB=1536 \
-  metho --domains "example.com" --auto
+  metho --domains "example.com" --parallel-hosts 8 --auto
 ```
+
+### Parallel host crawling
+
+The per-host stages (CeWL, GoSpider, SubDomainizer in Phase 1; Amass and
+Katana in Phase 2) crawl their host/domain lists **in parallel** instead of
+one at a time. These stages are where the pipeline spends the vast majority
+of its wall-clock (a serial crawl of ~60 live hosts took ~3h45m of a ~4h run;
+parallelizing ~5x drops that to ~45m). Control the pool size:
+
+```
+--parallel-hosts N      Hosts crawled concurrently per per-host tool (default: 5)
+```
+
+Each host still runs the same tool with the same flags into its **own** temp
+file, merged after the pool finishes -- so there is no data loss and no
+shared-file contention. The pool is bounded on purpose: N concurrent hosts,
+each already using the tool's internal concurrency, multiplies the request
+rate, so keep N modest to avoid tripping the target's WAF/rate-limiter.
+Lower it (`--parallel-hosts 2`) for aggressive CDN/WAF targets; raise it
+(`--parallel-hosts 10`) on a beefy machine against a tolerant target.
+
+> **Memory note:** CeWL holds its crawl in RAM under a per-process `ulimit -v`
+> cap (`CEWL_MEM_LIMIT_MB`, default 1024 MB). With `--parallel-hosts 5` that is
+> up to ~5 GB of CeWL address space reserved at once -- fine on most machines,
+> but lower either knob if memory is tight.
 
 **Why the CeWL knobs exist:** CeWL holds the spider frontier and all
 collected words in RAM and has no built-in page/memory limit, so a `-d 2`

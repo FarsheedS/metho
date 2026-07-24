@@ -19,7 +19,20 @@ run_consolidation() {
     [[ -s "${fdir}/final_live_web_servers.txt" ]] && live_total=$(wc -l < "${fdir}/final_live_web_servers.txt")
 
     # ── HTTPx Metadata (all JSON from all rounds) ───────────────────────────
-    cat "${OUTPUT_DIR}"/phase1/*/httpx_results_final.json 2>/dev/null | sort -u > "${fdir}/final_httpx_metadata.json" || true
+    # Dedup by the `.url` field (one metadata record per live host). The old
+    # `cat | sort -u` deduped only whole lines, so two records for the same
+    # host that differed in any byte (timestamp, hash) both survived. Prefixing
+    # each line with `.url` and unique-sorting on just that column keeps exactly
+    # one record per URL, stream-safe (jq processes line by line, no slurp).
+    if cat "${OUTPUT_DIR}"/phase1/*/httpx_results_final.json 2>/dev/null | \
+        jq -r '(.url // empty) + "\t" + tojson' 2>/dev/null | \
+        sort -u -t$'\t' -k1,1 | cut -f2- > "${fdir}/final_httpx_metadata.json" 2>/dev/null; then
+        :
+    else
+        # Fallback: if jq/parse hiccups, keep the plain concat (no data loss).
+        cat "${OUTPUT_DIR}"/phase1/*/httpx_results_final.json 2>/dev/null \
+            > "${fdir}/final_httpx_metadata.json" || true
+    fi
 
     # ── Cloud Assets (from Phase 2) ─────────────────────────────────────────
     cat "${OUTPUT_DIR}/phase2/final_cloud_assets.txt" 2>/dev/null | sort -u > "${fdir}/final_cloud_assets.txt" || true

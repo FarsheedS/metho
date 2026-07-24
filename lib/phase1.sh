@@ -119,7 +119,11 @@ process_domain() {
     # GAU
     if command -v gau &>/dev/null; then
         log_info "Running GAU..."
-        echo "$domain" | gau --subs --threads 10 2>/dev/null | \
+        # GAU pulls from Wayback/CommonCrawl/OTX/URLScan. Those archives are
+        # slow and unresponsive to some targets; without a cap a single bad
+        # provider stalls Stage 1 for many minutes (observed ~5 min producing
+        # 0 results). GAU_TIMEOUT default 300s.
+        timeout "${GAU_TIMEOUT:-300}" gau --subs --threads 10 "$domain" 2>/dev/null | \
             grep -oE '([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}' | \
             grep "$domain" | sort -u > gau_results.txt || true
         local gau_count=0
@@ -219,17 +223,26 @@ process_domain() {
     : > wordlists/custom_wordlist.txt
 
     if [[ -s live_subdomains_round1.txt ]] && command -v cewl &>/dev/null; then
-        while read -r url; do
-            [[ -z "$url" ]] && continue
-            log_info "  Crawling $url for words (depth ${CEWL_DEPTH:-2}, mem cap ${CEWL_MEM_LIMIT_MB:-1024}MB)..."
-            if ! run_cewl "$url" "${CEWL_DEPTH:-2}" | cewl_filter >> wordlists/custom_wordlist.txt; then
-                # Failed (memory cap / timeout / crash) — retry shallower so
-                # we still collect this host's words instead of losing them.
-                log_warn "  CeWL failed on $url at depth ${CEWL_DEPTH:-2} — retrying at depth 1"
-                run_cewl "$url" 1 | cewl_filter >> wordlists/custom_wordlist.txt || \
-                    log_warn "  CeWL failed on $url even at depth 1 — skipping host"
+        # Per-host worker: crawl one URL for words into its own temp file so
+        # concurrent CeWL processes never contend on a shared file. The depth-2
+        # / depth-1 retry logic is preserved verbatim inside the worker.
+        local _cewl_tmpdir="wordlists/.perhost"
+        mkdir -p "$_cewl_tmpdir"; rm -f "$_cewl_tmpdir"/*
+
+        _cewl_one_host() {
+            local url="$1" depth="${CEWL_DEPTH:-2}"
+            local out="${_cewl_tmpdir}/$(_safe_name "$url").txt"
+            if ! run_cewl "$url" "$depth" | cewl_filter > "$out"; then
+                log_warn "CeWL failed on $url at depth $depth -- retrying at depth 1"
+                run_cewl "$url" 1 | cewl_filter > "$out" || rm -f "$out"
             fi
-        done < live_subdomains_round1.txt
+        }
+
+        log_info "CeWL: crawling $(wc -l < live_subdomains_round1.txt) hosts (depth ${CEWL_DEPTH:-2}, mem cap ${CEWL_MEM_LIMIT_MB:-1024}MB, ${PARALLEL_HOSTS:-5} in parallel)..."
+        bounded_parallel "${PARALLEL_HOSTS:-5}" live_subdomains_round1.txt _cewl_one_host
+
+        cat "$_cewl_tmpdir"/*.txt 2>/dev/null > wordlists/custom_wordlist.txt || :
+        rm -rf "$_cewl_tmpdir"
         sort -u wordlists/custom_wordlist.txt -o wordlists/custom_wordlist.txt
 
         # Final label-sanity filter. Digits are ALLOWED (token must merely
@@ -496,41 +509,30 @@ WORDBASE
         # the number of seeds we fed it; (b) if the outer loop gets cut short by
         # a timeout/pipefail glitch, the bash counter understates reality. We
         # now report both numbers so any future divergence is visible.
-        local gs_loop_count=0
-        while read -r url; do
-            [[ -z "$url" ]] && continue
-            gs_loop_count=$((gs_loop_count + 1))
-            log_info "  Crawling $url with GoSpider..."
-            # `< /dev/null` is CRITICAL: gospider reads EXTRA crawl targets
-            # from any non-TTY stdin (main.go: os.Stdin.Stat + bufio.Scanner,
-            # merged with -s). Inside this `while read ... done < file` loop
-            # the loop's stdin IS live_subdomains_round2.txt, so the first
-            # gospider call slurped every remaining seed and the loop ended
-            # after ONE host — verified against our run logs ("1 seeds").
+        # Per-host worker: run GoSpider on one URL into its own temp file.
+        # `< /dev/null` is CRITICAL (see old comment): gospider reads extra
+        # crawl targets from any non-TTY stdin, merged with -s.
+        _gospider_one_host() {
+            local url="$1"
+            local out="gospider/$(_safe_name "$url").jsonl"
             timeout "${GOSPIDER_TIMEOUT:-600}" gospider -s "$url" -c 10 -d 3 -t 1 -k 1 -K 2 -m 30 \
                 --blacklist ".(jpg|jpeg|gif|css|tif|tiff|png|ttf|woff|woff2|ico|svg)" \
-                -a -w -r --js --sitemap --robots --json -v < /dev/null 2>/dev/null | \
-                tee -a gospider/raw_output.txt || true
-        done < live_subdomains_round2.txt
+                -a -w -r --js --sitemap --robots --json -v < /dev/null > "$out" 2>/dev/null || true
+        }
+
+        log_info "GoSpider: crawling $(wc -l < live_subdomains_round2.txt) hosts (${PARALLEL_HOSTS:-5} in parallel)..."
+        bounded_parallel "${PARALLEL_HOSTS:-5}" live_subdomains_round2.txt _gospider_one_host
+        cat gospider/*.jsonl 2>/dev/null > gospider/raw_output.txt || : > gospider/raw_output.txt
 
         if [[ -s gospider/raw_output.txt ]]; then
-            # Count distinct `input` hosts actually processed by gospider (from
-            # its JSON output). This is what really got scanned, regardless of
-            # whether they came from the seed loop or from `-a -w -r` archives.
-            local gs_actual_hosts
-            # `{ grep ... || true; }` — grep exits 1 when no "input" lines
-            # exist; under set -e + pipefail that would abort the whole run.
-            # (The group keeps grep's stdout flowing into the pipe; a bare
-            # `grep || true | sort` would mis-parse and skip the pipeline.)
-            gs_actual_hosts=$( { grep -oE '"input":"[^"]+"' gospider/raw_output.txt 2>/dev/null || true; } | \
-                sort -u | wc -l | tr -d ' ')
+            # Count distinct `input` hosts actually processed by gospider
+            # (from its JSON output), including those pulled via -a -w -r.
+            local gs_actual_hosts gs_loop_count
+            gs_actual_hosts=$( { grep -oE '"input":"[^"]+"' gospider/raw_output.txt 2>/dev/null || true; } | sort -u | wc -l | tr -d ' ')
+            gs_loop_count=$(wc -l < live_subdomains_round2.txt | tr -d ' ')
             [[ -z "$gs_actual_hosts" ]] && gs_actual_hosts=0
 
             extract_domains gospider/raw_output.txt gospider/all_domains.txt
-            # Anchor to the exact domain suffix (dots escaped) so lookalikes
-            # (`arvancloudXir`, `notarvancloud.ir.evil.tld`) don't leak into
-            # scope. A bare `grep "$domain"` treats dots as regex any-char
-            # and matches mere substrings.
             grep -E "(^|\.)${domain//./\\.}$" gospider/all_domains.txt | sort -u > gospider_subdomains.txt || true
             if [[ -s gospider_subdomains.txt ]]; then
                 log_success "GoSpider subdomains (${gs_actual_hosts} hosts crawled across ${gs_loop_count} seeds): $(wc -l < gospider_subdomains.txt)"
@@ -538,8 +540,11 @@ WORDBASE
                 log_info "GoSpider: crawled ${gs_actual_hosts} hosts across ${gs_loop_count} seeds, no $domain subdomains discovered"
             fi
         else
+            local gs_loop_count
+            gs_loop_count=$(wc -l < live_subdomains_round2.txt | tr -d ' ')
             log_info "GoSpider: scanned ${gs_loop_count} seeds, no output captured"
         fi
+        rm -f gospider/*.jsonl
     fi
 
     # Subdomainizer
@@ -566,42 +571,32 @@ WORDBASE
         : > subdomainizer/raw_output.txt
         : > subdomainizer/stdout.log
 
-        local sd_total=0 sd_hosts=0
-        while read -r url; do
-            [[ -z "$url" ]] && continue
-            sd_hosts=$((sd_hosts + 1))
-            log_info "  Running Subdomainizer on $url..."
-
-            # -o writes the file; we ALSO redirect stdout into stdout.log so
-            # we never lose the tool's output. -k is --nossl here, NOT
-            # cookies (cookies are -c). `< /dev/null` detaches the loop's
-            # stdin defensively (same while-read stdin bug class as gospider).
+        # Per-host worker: run SubDomainizer on one URL. Writes -o output
+        # to a per-host temp file (avoids the shared-file race under the
+        # parallel pool). -k is --nossl; `< /dev/null` detaches stdin.
+        _subdomainizer_one_host() {
+            local url="$1"
+            local out="subdomainizer/$(_safe_name "$url").txt"
             timeout "${SUBDOMAINIZER_TIMEOUT:-300}" python3 \
                 /opt/tools/SubDomainizer/SubDomainizer.py \
-                -u "$url" -k -o subdomainizer/temp_output.txt \
-                < /dev/null >> subdomainizer/stdout.log 2>&1 || true
+                -u "$url" -k -o "$out" < /dev/null >> subdomainizer/stdout.log 2>&1 || true
+            [[ -s "$out" ]] || rm -f "$out"
+        }
 
-            local sd_added=0
-            if [[ -s subdomainizer/temp_output.txt ]]; then
-                cat subdomainizer/temp_output.txt >> subdomainizer/raw_output.txt
-                sd_added=$(wc -l < subdomainizer/temp_output.txt)
-                rm -f subdomainizer/temp_output.txt
-            fi
-            if [[ "$sd_added" -gt 0 ]]; then
-                log_info "    → Subdomainizer found $sd_added entries on $url"
-                sd_total=$((sd_total + sd_added))
-            fi
-        done < live_subdomains_round2.txt
+        log_info "Subdomainizer: scanning $(wc -l < live_subdomains_round2.txt) hosts (${PARALLEL_HOSTS:-5} in parallel)..."
+        bounded_parallel "${PARALLEL_HOSTS:-5}" live_subdomains_round2.txt _subdomainizer_one_host
+
+        cat subdomainizer/*.txt 2>/dev/null > subdomainizer/raw_output.txt || : > subdomainizer/raw_output.txt
 
         # Dedupe the union of -o output and any stdout the tool emitted.
         if [[ -s subdomainizer/raw_output.txt ]] || [[ -s subdomainizer/stdout.log ]]; then
+            local sd_hosts
+            sd_hosts=$(wc -l < live_subdomains_round2.txt | tr -d ' ')
             {
                 cat subdomainizer/raw_output.txt
                 cat subdomainizer/stdout.log 2>/dev/null
             } > /tmp/sd_combined.txt
             extract_domains /tmp/sd_combined.txt subdomainizer/all_domains.txt
-            # Same anchoring as the gospider grep above (exact suffix, dots
-            # escaped) — keeps out-of-scope lookalike domains out.
             grep -E "(^|\.)${domain//./\\.}$" subdomainizer/all_domains.txt | sort -u > subdomainizer_subdomains.txt || true
             rm -f /tmp/sd_combined.txt
             if [[ -s subdomainizer_subdomains.txt ]]; then
@@ -610,6 +605,8 @@ WORDBASE
                 log_info "Subdomainizer: ran on ${sd_hosts} hosts, no $domain subdomains discovered"
             fi
         else
+            local sd_hosts
+            sd_hosts=$(wc -l < live_subdomains_round2.txt | tr -d ' ')
             log_info "Subdomainizer: ran on ${sd_hosts} hosts, nothing found"
         fi
     else

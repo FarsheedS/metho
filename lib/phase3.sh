@@ -105,12 +105,21 @@ run_phase3() {
     # ── Stage 2: IP → ASN Lookup via whois.cymru.com ────────────────────────
     log_info "Stage 2: Looking up ASNs via whois.cymru.com"
 
+    # Query whois.cymru.com ONCE and cache the raw response. The previous code
+    # issued two identical queries (one for asn_raw.txt, one for ip_asn_map.txt)
+    # which doubled the network round-trips on a service that is often slow /
+    # flaky. A single query + two local awk passes over the cache is faster and
+    # keeps both derived views consistent (same response snapshot).
+    local _cymru_cache="${pdir}/.cymru_raw.txt"
     {
         echo "begin"
         echo "verbose"
         cat "${pdir}/all_ips.txt"
         echo "end"
-    } | nc whois.cymru.com 43 2>/dev/null | awk -F'|' '
+    } | nc whois.cymru.com 43 2>/dev/null > "$_cymru_cache" || true
+
+    # View 1: ASN|Prefix|Name -> per-(asn,prefix) IP count.
+    awk -F'|' '
     NR>1 {
         gsub(/^[ \t]+|[ \t]+$/, "", $1);
         gsub(/^[ \t]+|[ \t]+$/, "", $3);
@@ -125,15 +134,10 @@ run_phase3() {
             split(k, parts, "|")
             printf "%s|%s|%s|%d\n", parts[1], parts[2], parts[3], count[k]
         }
-    }' > "${pdir}/asn_raw.txt" || true
+    }' "$_cymru_cache" > "${pdir}/asn_raw.txt" || true
 
-    # Build IP→ASN mapping by re-querying
-    {
-        echo "begin"
-        echo "verbose"
-        cat "${pdir}/all_ips.txt"
-        echo "end"
-    } | nc whois.cymru.com 43 2>/dev/null | awk -F'|' '
+    # View 2: per-IP IP|ASN|Name|Prefix mapping.
+    awk -F'|' '
     NR>1 {
         gsub(/^[ \t]+|[ \t]+$/, "", $1);
         gsub(/^[ \t]+|[ \t]+$/, "", $2);
@@ -142,7 +146,9 @@ run_phase3() {
 
         asn="AS"$1
         print $2 "|" asn "|" $3 "|" $7
-    }' > "${pdir}/ip_asn_map.txt" || true
+    }' "$_cymru_cache" > "${pdir}/ip_asn_map.txt" || true
+
+    rm -f "$_cymru_cache"
 
     # Build ASN summary sorted by occurrence count (descending)
     : > "${pdir}/asn_summary.txt"

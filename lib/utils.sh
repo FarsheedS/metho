@@ -38,6 +38,60 @@ _format_duration() {
     fi
 }
 
+# Turn a URL/host string into a filename-safe token (drop :/, etc.).
+# Used as the per-host temp-file key when crawling hosts in parallel so
+# concurrent workers never write the same file.
+_safe_name() {
+    printf '%s' "$1" | tr -c '[:alnum:].-' '_'
+}
+
+# Run FUNC once per non-empty line of INPUT with bounded concurrency.
+# Each FUNC invocation runs in a backgrounded subshell (which inherits all
+# sourced functions/vars, so no export needed). FUNC receives the line as $1
+# plus any trailing args. Caller is responsible for giving each worker its
+# own output file (see _safe_name) and merging results after this returns.
+#
+# Why: CeWL/GoSpider/SubDomainizer/Katana crawl hosts serially and spend the
+# vast majority of pipeline wall-clock there. A small pool makes them ~Nx
+# faster with no data loss -- the per-host work is identical, just concurrent,
+# and bounded so we don't provoke the target's WAF/rate-limiter.
+#
+# `wait -n` (wait for any one job) needs bash >= 4.3 (Kali ships 5.x). We probe
+# for it once; on older bash we fall back to `wait` (all jobs) between batches,
+# which still parallelizes within a batch and never crashes.
+bounded_parallel() {
+    local concurrency="$1" input="$2" func="$3"; shift 3
+    local running=0 _prev_errexit
+    # Guard: a non-positive PARALLEL_HOSTS would mean no workers spawn.
+    [[ "$concurrency" -lt 1 ]] && concurrency=1
+    # Detect `wait -n` support (bash >= 4.3). Done once; cheap.
+    if [[ -z "${_METHO_HAS_WAIT_N+x}" ]]; then
+        if (wait -n) 2>/dev/null; then _METHO_HAS_WAIT_N=1; else _METHO_HAS_WAIT_N=0; fi
+    fi
+    # Temporarily disable errexit AND save/restore it. A worker that returns
+    # non-zero must NOT abort the pool (its exit surfaces through `wait`), and
+    # we must not leak `set +e` back to the caller. Each worker is also wrapped
+    # in `(... || true)` run in its own backgrounded subshell.
+    case $- in *e*) _prev_errexit=1; set +e;; *) _prev_errexit=0;; esac
+    while read -r line; do
+        [[ -z "$line" ]] && continue
+        ( "$func" "$line" "$@" || true ) &
+        running=$((running + 1))
+        if (( running >= concurrency )); then
+            if [[ "$_METHO_HAS_WAIT_N" == 1 ]]; then
+                wait -n || true
+                running=$((running - 1))
+            else
+                # Older bash: wait for the whole batch, then start the next.
+                wait || true
+                running=0
+            fi
+        fi
+    done < "$input"
+    wait || true
+    [[ "$_prev_errexit" == 1 ]] && set -e
+}
+
 log_info()    { local msg="[*] $*"; echo -e "${CYAN}${msg}${NC}"; [[ -n "$LOG_FILE" ]] && echo "$(_log_ts) ${msg}" >> "$LOG_FILE"; }
 log_success() { local msg="[+] $*"; echo -e "${GREEN}${msg}${NC}"; [[ -n "$LOG_FILE" ]] && echo "$(_log_ts) ${msg}" >> "$LOG_FILE"; }
 log_warn()    { local msg="[!] $*"; echo -e "${YELLOW}${msg}${NC}"; [[ -n "$LOG_FILE" ]] && echo "$(_log_ts) ${msg}" >> "$LOG_FILE"; }
@@ -48,6 +102,7 @@ log_skip()    { local msg="[SKIP] $*"; echo -e "${YELLOW}${msg}${NC}"; [[ -n "$L
 DOMAINS=""
 DOMAINS_FILE=""
 SUBFINDER_PROVIDER_CONFIG=""
+AMASS_CONFIG=""
 AUTO=false
 SKIP_PHASES=()
 THREADS=50
@@ -57,6 +112,13 @@ OUTPUT_DIR="/output"
 GITHUB_TOKENS_FILE=""
 CLOUD_ENUM_KEYWORDS=""
 PORT_SCAN=true
+# How many live hosts to crawl in parallel within a per-host tool (CeWL,
+# GoSpider, SubDomainizer, Katana). These stages spend the vast majority of
+# wall-clock time crawling hosts one-by-one; a small bounded pool cuts that
+# ~Nx with no data loss (each host still runs the same tool/flags into its
+# own temp file, merged after). Keep it modest so concurrent requests don't
+# trip the target's WAF/rate-limiter (N hosts * each tool's internal -c/-t).
+PARALLEL_HOSTS=5
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -64,11 +126,13 @@ parse_args() {
             --domains)        DOMAINS="$2"; shift 2 ;;
             --domains-file)   DOMAINS_FILE="$2"; shift 2 ;;
             --subfinder-config) SUBFINDER_PROVIDER_CONFIG="$2"; shift 2 ;;
+            --amass-config)   AMASS_CONFIG="$2"; shift 2 ;;
             --auto)           AUTO=true; shift ;;
             --skip-phase)     SKIP_PHASES+=("$2"); shift 2 ;;
             --skip-cloud)     SKIP_PHASES+=("2"); shift ;;
             --no-port-scan)   PORT_SCAN=false; shift ;;
             --threads)        THREADS="$2"; shift 2 ;;
+            --parallel-hosts) PARALLEL_HOSTS="$2"; shift 2 ;;
             --rate-limit)     RATE_LIMIT="$2"; shift 2 ;;
             --timeout)        CHECKPOINT_TIMEOUT="$2"; shift 2 ;;
             --output)         OUTPUT_DIR="$2"; shift 2 ;;
@@ -83,11 +147,13 @@ parse_args() {
                 echo ""
                 echo "Options:"
                 echo "  --subfinder-config FILE Path to subfinder provider-config.yaml"
+                echo "  --amass-config FILE     Path to amass config.yaml (API keys -> fewer 403/429)"
                 echo "  --auto                  Skip all checkpoint prompts"
                 echo "  --skip-phase {1,2,3}    Skip specific phase(s)"
                 echo "  --skip-cloud            Shorthand for --skip-phase 2"
                 echo "  --no-port-scan          Skip port scanning phase"
                 echo "  --threads N             Thread count (default: 50)"
+                echo "  --parallel-hosts N      Hosts crawled in parallel per tool (default: 5)"
                 echo "  --rate-limit N          Requests/second (default: 100)"
                 echo "  --timeout N             Checkpoint auto-continue seconds (default: 30)"
                 echo "  --output DIR            Output directory (default: /output)"
@@ -116,6 +182,10 @@ validate_args() {
         log_error "Subfinder config file not found: $SUBFINDER_PROVIDER_CONFIG"
         exit 1
     fi
+    if [[ -n "$AMASS_CONFIG" && ! -f "$AMASS_CONFIG" ]]; then
+        log_error "Amass config file not found: $AMASS_CONFIG"
+        exit 1
+    fi
     if [[ -n "$GITHUB_TOKENS_FILE" && ! -f "$GITHUB_TOKENS_FILE" ]]; then
         log_error "GitHub tokens file not found: $GITHUB_TOKENS_FILE"
         exit 1
@@ -123,6 +193,10 @@ validate_args() {
     if [[ -n "$SUBFINDER_PROVIDER_CONFIG" ]]; then
         export SUBFINDER_PROVIDER_CONFIG
         log_info "Subfinder provider config: $SUBFINDER_PROVIDER_CONFIG"
+    fi
+    if [[ -n "$AMASS_CONFIG" ]]; then
+        export AMASS_CONFIG
+        log_info "Amass config: $AMASS_CONFIG"
     fi
 }
 
@@ -202,12 +276,19 @@ checkpoint() {
 }
 
 # ── Directory Setup ─────────────────────────────────────────────────────────
+# 777 (not u+rwX) is intentional: the container runs as root but the host
+# user mounting /output is usually a non-root uid. World-writable lets the
+# host user read, modify, and delete results without "permission denied".
 setup_dirs() {
     mkdir -p "${OUTPUT_DIR}"/{phase1,phase2,phase3,final}
     chmod -R 777 "$OUTPUT_DIR" 2>/dev/null
 }
 
 # ── Dependency Check ────────────────────────────────────────────────────────
+# Only the core plumbing tools are checked up-front. The recon tools
+# (amass, dnsx, shuffledns, katana, gospider, etc.) are validated lazily,
+# per-stage, with `command -v` so any missing tool is skipped cleanly
+# instead of failing the whole run.
 REQUIRED_TOOLS=(jq curl wget git)
 
 validate_deps() {

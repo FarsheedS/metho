@@ -60,13 +60,30 @@ run_phase2() {
 
         : > "${pdir}/amass_enum_output.txt"
         : > "${pdir}/amass.stderr.log"
-        while read -r domain; do
-            [[ -z "$domain" ]] && continue
-            log_info "  Amass Enum on: $domain (wall-clock cap ${AMASS_TIMEOUT:-1800}s)"
-            # NOTE: stdout in passive mode is the final graph (appears at
-            # the very end), stderr carries progress. We stream stderr to
-            # amass.stderr.log for debuggability and stdout to the tee'd
-            # amass_enum_output.txt for downstream filtering.
+
+        # Build optional -config arg. A config.yaml with API keys lets the
+        # ~40 premium data sources (Shodan, Censys, SecurityTrails, URLScan,
+        # VirusTotal, ...) actually answer instead of failing the auth check
+        # with "check callback failed for the configuration" -- which is the
+        # source of the flood of 403/429 lines when no keys are configured.
+        # The free sources that still 403/429 are provider-side blocks
+        # (rate limits / geo), not config issues; -config cannot fix those.
+        local -a amass_cfg=()
+        if [[ -n "${AMASS_CONFIG:-}" ]]; then
+            amass_cfg+=(-config "$AMASS_CONFIG")
+        fi
+
+        # Per-domain worker. Amass passive mode is CPU/network bound, so running
+        # multiple root domains concurrently (bounded) is a safe speedup. Each
+        # worker writes its own stdout/stderr temp so the pool never contends on
+        # a shared file; we merge after. -log goes to its own per-domain file
+        # (one file per domain, no race).
+        local _amass_tmp="${pdir}/.perhost"
+        mkdir -p "$_amass_tmp"; rm -f "$_amass_tmp"/*
+
+        _amass_one_domain() {
+            local domain="$1" tag
+            tag="$(_safe_name "$domain")"
             timeout "${AMASS_TIMEOUT:-1800}" amass enum -passive \
                 -nocolor \
                 -timeout 5 \
@@ -74,9 +91,18 @@ run_phase2() {
                 -trf /opt/scripts/wordlists/resolvers.txt \
                 -rqps 10 \
                 -log "${pdir}/amass_${domain}.log" \
-                < /dev/null 2>>"${pdir}/amass.stderr.log" \
-                | tee -a "${pdir}/amass_enum_output.txt" || true
-        done < "$root_domains_file"
+                "${amass_cfg[@]}" \
+                < /dev/null > "${_amass_tmp}/${tag}.out" 2>"${_amass_tmp}/${tag}.err" || true
+        }
+
+        log_info "  Amass Enum on $(wc -l < "$root_domains_file") domain(s) (wall-clock cap ${AMASS_TIMEOUT:-1800}s each, ${PARALLEL_HOSTS:-5} in parallel)..."
+        bounded_parallel "${PARALLEL_HOSTS:-5}" "$root_domains_file" _amass_one_domain
+
+        # Merge per-domain temps into the stable filenames the rest of the
+        # phase (and consolidate) reads.
+        cat "${_amass_tmp}"/*.out 2>/dev/null > "${pdir}/amass_enum_output.txt" || : > "${pdir}/amass_enum_output.txt"
+        cat "${_amass_tmp}"/*.err 2>/dev/null > "${pdir}/amass.stderr.log" || : > "${pdir}/amass.stderr.log"
+        rm -rf "$_amass_tmp"
 
         if [[ -s "${pdir}/amass_enum_output.txt" ]]; then
             filter_cloud_domains "${pdir}/amass_enum_output.txt" "${pdir}/amass_cloud_domains.txt"
@@ -179,30 +205,47 @@ run_phase2() {
         local ce_log="${pdir}/cloud_enum.stderr.log"
         : > "$ce_log"
 
-        local keywords=""
+
+        # Build the keyword set. cloud_enum's -k/--keyword uses argparse
+        # action='append' -- it takes ONE keyword per flag, NOT a comma list.
+        # Passing "-k a,b,c" makes cloud_enum mutate the single literal string
+        # "a,b,c" (useless). So we collect keywords into an array and emit one
+        # -k flag each. User keywords come from --cloud-enum-keywords (comma or
+        # whitespace separated); the base name of each root domain is added too.
+        local -a ce_kw=()
         if [[ -n "$CLOUD_ENUM_KEYWORDS" ]]; then
-            keywords="$CLOUD_ENUM_KEYWORDS"
+            # Split on comma AND whitespace, drop empties.
+            read -ra _tmp <<< "${CLOUD_ENUM_KEYWORDS//,/ }"
+            ce_kw+=("${_tmp[@]}")
         fi
         if [[ -s "$root_domains_file" ]]; then
-            local domain_keywords
-            domain_keywords=$(cat "$root_domains_file" | sed 's/\..*//' | tr '\n' ',' | sed 's/,$//')
-            if [[ -n "$keywords" ]]; then
-                keywords="${keywords},${domain_keywords}"
-            else
-                keywords="$domain_keywords"
-            fi
+            while read -r d; do
+                [[ -z "$d" ]] && continue
+                ce_kw+=("${d%%.*}")
+            done < "$root_domains_file"
         fi
 
-        if [[ -n "$keywords" ]]; then
-            log_info "  Cloud_Enum keywords: $keywords (wall-clock cap ${CLOUD_ENUM_TIMEOUT:-1800}s)"
+        if [[ ${#ce_kw[@]} -gt 0 ]]; then
+            # Dedupe keywords (order-preserving) for a clean log line.
+            local _seen="" _kw_list=""
+            local kw
+            for kw in "${ce_kw[@]}"; do
+                [[ " $_seen " == *" $kw "* ]] && continue
+                _seen+=" $kw"
+                _kw_list+="${_kw_list:+, }$kw"
+            done
+            log_info "  Cloud_Enum keywords: $_kw_list (wall-clock cap ${CLOUD_ENUM_TIMEOUT:-1800}s)"
+
+            # Emit one -k per keyword.
+            local -a ce_args=(-nsf /opt/scripts/wordlists/resolvers.txt)
+            for kw in "${ce_kw[@]}"; do
+                ce_args+=(-k "$kw")
+            done
+            ce_args+=(-l "${pdir}/cloud_enum_results.json" -f json -t "$THREADS")
+
             timeout "${CLOUD_ENUM_TIMEOUT:-1800}" python3 \
-                /opt/tools/cloud_enum/cloud_enum.py \
-                -k "$keywords" \
-                -nsf /opt/scripts/wordlists/resolvers.txt \
-                -l "${pdir}/cloud_enum_results.json" \
-                -f json \
-                -t "$THREADS" 2>>"$ce_log" || \
-                    log_warn "Cloud_Enum exited non-zero (or was killed by CLOUD_ENUM_TIMEOUT) — see ${ce_log}"
+                /opt/tools/cloud_enum/cloud_enum.py "${ce_args[@]}" 2>>"$ce_log" || \
+                    log_warn "Cloud_Enum exited non-zero or was killed by CLOUD_ENUM_TIMEOUT -- see ${ce_log}"
 
             if [[ -s "${pdir}/cloud_enum_results.json" ]]; then
                 jq -r 'select(.msg != null) | .target' "${pdir}/cloud_enum_results.json" 2>/dev/null | \
@@ -246,64 +289,77 @@ run_phase2() {
     #                that bounds Katana by time). Accepts 30s, 5m, 1h.
     #
     # We use -ct (crawl duration) as the per-URL wall-clock cap so a
-    # single never-finishing target can't stall Phase 2 forever. For a
-    # quick sanity check on whether Katana is making progress, we also
-    # tee JSON to raw_output.txt.
+    # single never-finishing target can't stall Phase 2 forever. Hosts are
+    # crawled via a bounded pool (see bounded_parallel); each writes its own
+    # JSONL temp, merged and URL-extracted below -- the raw JSONL is NOT kept
+    # (it was the 4.5GB footprint; only the extracted URLs are persisted).
     if command -v katana &>/dev/null && [[ -s "$live_web_file" ]]; then
         log_info "Stage 4: Katana crawling for cloud assets (per-host cap ${KATANA_CRAWL_DURATION:-30m})"
         local katana_start=$(_now)
         mkdir -p "${pdir}/katana"
-        : > "${pdir}/katana/raw_output.txt"
         : > "${pdir}/katana.stderr.log"
 
-        local ka_hosts=0
-        while read -r url; do
-            [[ -z "$url" ]] && continue
-            ka_hosts=$((ka_hosts + 1))
-            log_info "  Crawling $url with Katana..."
-            # -ct caps the wall-clock per seed URL. Setting a per-host cap
-            # ALSO via the bash `timeout` shell command would be belt-
-            # and-braces but `-ct` is enough for Katana since it cleanly
-            # tears down on expiry.
-            #
-            # `< /dev/null` is CRITICAL: katana merges any non-TTY stdin
-            # into its crawl-target set (internal/runner/options.go:
-            # fileutil.HasStdin() + bufio.Scanner, same `values` map as -u).
-            # Inside this `while read ... done < file` loop the loop's stdin
-            # IS the seed file, so the first katana call would slurp every
-            # remaining seed and end the loop after ONE host — same bug
-            # class as gospider in Phase 1, verified live in our tests.
+        local ka_tmp="${pdir}/katana/.perhost"
+        mkdir -p "$ka_tmp"; rm -f "$ka_tmp"/*
+
+        # Per-host worker.
+        # -ob / -or: OMIT the response body and raw request/response from the
+        #   JSONL. By default Katana's -j includes the full body+raw (~7.8KB/
+        #   line), which ballooned raw_output to 4.5GB -- almost entirely HTML
+        #   error pages we never read. URLs live in request.endpoint, which is
+        #   always present with -ob/-or, so dropping body/raw loses nothing the
+        #   pipeline uses and shrinks output ~40x.
+        # -ct caps wall-clock per seed. < /dev/null is CRITICAL (see note in the
+        #   header comment above): katana merges non-TTY stdin into its seed set.
+        # Each host writes its own JSONL temp (no shared-file race under the pool).
+        _katana_one_host() {
+            local url="$1" tag
+            tag="$(_safe_name "$url")"
             katana -u "$url" -d 3 -jc -j \
+                -ob -or \
                 -timeout 30 -c 20 -p 1 \
                 -retry 2 -rd 1 -rl 10 \
                 -ct "${KATANA_CRAWL_DURATION:-30m}" \
                 -silent \
-                < /dev/null 2>>"${pdir}/katana.stderr.log" \
-                | tee -a "${pdir}/katana/raw_output.txt" >/dev/null || \
-                    log_warn "Katana on $url exited non-zero (likely -ct hit) — see ${pdir}/katana.stderr.log"
-        done < "$live_web_file"
+                < /dev/null > "${ka_tmp}/${tag}.jsonl" 2>>"${pdir}/katana.stderr.log" || true
+        }
 
-        if [[ -s "${pdir}/katana/raw_output.txt" ]]; then
-            # Katana's -j emits one JSON object per line. URLs appear in
-            # the "request" field (the URL itself) and "response" body
-            # sometimes. We pull URL-like strings to keep it simple and
-            # format-agnostic.
-            grep -oE 'https?://[^"'\''[:space:}]+' "${pdir}/katana/raw_output.txt" 2>/dev/null | \
-                sort -u > "${pdir}/katana/all_urls.txt" || true
+        log_info "  Katana: crawling $(wc -l < "$live_web_file") hosts (per-host cap ${KATANA_CRAWL_DURATION:-30m}, ${PARALLEL_HOSTS:-5} in parallel)..."
+        bounded_parallel "${PARALLEL_HOSTS:-5}" "$live_web_file" _katana_one_host
+
+        local ka_hosts
+        ka_hosts=$(wc -l < "$live_web_file" | tr -d ' ')
+
+        # Merge per-host JSONL into one combined stream, then extract URLs.
+        # We deliberately do NOT persist the raw JSONL -- it is large and the
+        # pipeline only consumes the extracted URLs from it.
+        cat "$ka_tmp"/*.jsonl 2>/dev/null > "${ka_tmp}/_combined.jsonl" || : > "${ka_tmp}/_combined.jsonl"
+        rm -f "$ka_tmp"/*.jsonl  # remove per-host files, keep _combined
+
+        if [[ -s "${ka_tmp}/_combined.jsonl" ]]; then
+            local ka_lines ka_cloud
+            ka_lines=$(wc -l < "${ka_tmp}/_combined.jsonl" | tr -d ' ')
+            # Extract URL-like strings. NOTE: the old regex used a POSIX
+            # [:space:] class INSIDE a bracket expression which GNU/BSD grep
+            # reject ("invalid character class") -- producing a silent 0-byte
+            # all_urls.txt despite 620K JSON lines. A literal stop-set (quote,
+            # apostrophe, space) is portable and correct.
+            grep -oE 'https?://[^"'"'"' ]+' "${ka_tmp}/_combined.jsonl" 2>/dev/null |                 sort -u > "${pdir}/katana/all_urls.txt" || true
+            rm -f "${ka_tmp}/_combined.jsonl"
+            rmdir "$ka_tmp" 2>/dev/null || rm -rf "$ka_tmp"
+
             filter_cloud_domains "${pdir}/katana/all_urls.txt" "${pdir}/katana_cloud_assets.txt"
-            local ka_cloud=0
-            [[ -s "${pdir}/katana_cloud_assets.txt" ]] && ka_cloud=$(wc -l < "${pdir}/katana_cloud_assets.txt")
-            log_success "Katana: $(wc -l < "${pdir}/katana/raw_output.txt") JSON lines, $ka_cloud cloud-related on $ka_hosts hosts ($(_format_duration $(($(_now) - katana_start))) total)"
+            [[ -s "${pdir}/katana_cloud_assets.txt" ]] && ka_cloud=$(wc -l < "${pdir}/katana_cloud_assets.txt") || ka_cloud=0
+            log_success "Katana: ${ka_lines} JSON lines, ${ka_cloud} cloud-related on ${ka_hosts} hosts ($(_format_duration $(($(_now) - katana_start))) total)"
         elif [[ -s "${pdir}/katana.stderr.log" ]]; then
+            rm -rf "$ka_tmp"
             log_warn "Katana produced no output. Last stderr lines:"
             tail -5 "${pdir}/katana.stderr.log" | sed 's/^/    /'
         else
+            rm -rf "$ka_tmp"
             log_warn "Katana produced no output and no stderr"
         fi
-    else
-        log_warn "Katana not available or no live web servers — skipping Katana cloud scan"
     fi
-
     # ── Stage 5: Consolidate Cloud Assets ───────────────────────────────────
     log_info "Consolidating cloud assets"
 

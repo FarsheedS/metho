@@ -153,8 +153,16 @@ RUN git clone --depth 1 https://github.com/nsonaniya2010/SubDomainizer.git /opt/
         beautifulsoup4 requests termcolor colorama tldextract cffi 2>/dev/null || true
 
 # Cloud_Enum - Cloud bucket/service brute force
+# cloud_enum migrated off requirements.txt to uv/pyproject.toml, so the old
+# `pip install -r requirements.txt` now 404s on GitHub, the install silently
+# fails (swallowed by `2>/dev/null || true`), and at runtime enum_tools/utils.py
+# prints "[!] Please pip install requirements.txt." and sys.exit()s before
+# doing any work -- Stage 3 produced zero output for exactly this reason.
+# Install the three real runtime deps (from pyproject.toml) explicitly,
+# mirroring the CeWL/Sublist3r explicit-deps pattern.
 RUN git clone --depth 1 https://github.com/initstring/cloud_enum.git /opt/tools/cloud_enum && \
-    pip3 install --break-system-packages -r /opt/tools/cloud_enum/requirements.txt 2>/dev/null || true
+    pip3 install --break-system-packages \
+        dnspython requests requests-futures 2>/dev/null || true
 
 # ── Copy Scripts ────────────────────────────────────────────────────────────
 COPY recon.sh /opt/scripts/recon.sh
