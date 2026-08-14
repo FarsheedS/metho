@@ -110,6 +110,13 @@ canonical_dns_add_sources() {
         local root_domain="$explicit_root"
         if [[ -z "$root_domain" ]]; then
             root_domain=$(match_root_domain "$host")
+        else
+            # Normalize the explicit root domain so the value stored in the
+            # root_domain column is canonical (lowercase, no trailing dot).
+            # A root domain stored in original case was later matched
+            # case-sensitively by the per-root slice, silently emptying that
+            # root's results.
+            root_domain=$(normalize_hostname "$root_domain")
         fi
         # root_domain may legitimately be empty for out-of-scope cloud hosts;
         # such hosts are still tracked so their IPs get resolved/classified.

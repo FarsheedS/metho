@@ -19,11 +19,17 @@ run_consolidation() {
     [[ -s "${fdir}/final_live_web_servers.txt" ]] && live_total=$(wc -l < "${fdir}/final_live_web_servers.txt")
 
     # ── HTTPx Metadata (all JSON from all rounds) ───────────────────────────
-    # Dedup by the `.url` field (one metadata record per live host). Keep the
-    # richest record (most fields populated) per URL.
+    # Dedup by `.url`, KEEPING the RICHEST record per URL (most populated
+    # fields). A host probed in multiple rounds can have sparser records (e.g.
+    # a redirect captured early); scoring by populated-field count and taking
+    # the max per URL avoids keeping a thin record over a rich one.
     if cat "${OUTPUT_DIR}"/phase1/*/httpx_results_final.json 2>/dev/null | \
-        jq -r '(.url // empty) + "\t" + tojson' 2>/dev/null | \
-        sort -u -t$'\t' -k1,1 | cut -f2- > "${fdir}/final_httpx_metadata.json" 2>/dev/null; then
+        jq -s -r 'map(select(.url != null))
+                  | group_by(.url)
+                  | map( (map(. as $r | {rec:$r, score: ([$r | to_entries[] | select(.value != null)] | length)})
+                         | sort_by(-.score) | .[0].rec) )
+                  | .[]
+                  | tojson' > "${fdir}/final_httpx_metadata.json" 2>/dev/null; then
         :
     else
         # Fallback: if jq/parse hiccups, keep the plain concat (no data loss).

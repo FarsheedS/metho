@@ -13,9 +13,11 @@ run_phase2() {
     mkdir -p "$pdir"
     CURRENT_PHASE=2
 
+    # Only the root-domain set is needed here: Phase 2 queries the canonical
+    # DNS dataset (populated in Phase 1) for cloud record types and uses the
+    # root domains as cloud_enum keywords. It does not consume the Phase 1
+    # all-subdomains / live-web intermediate lists.
     local root_domains_file="$1"
-    local all_subdomains_file="$2"
-    local live_web_file="$3"
 
     log_info "═══ PHASE 2: Cloud Asset Discovery ═══"
 

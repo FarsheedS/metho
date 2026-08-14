@@ -169,8 +169,14 @@ process_domain() {
         # Resolve all pending hostnames through DNSx into the canonical dataset
         canonical_dns_resolve_pending
 
-        # Extract resolved hostnames for HTTPx probing
-        canonical_dns_extract_resolved > live_candidates_round1.txt || true
+        # Extract resolved hostnames for HTTPx probing. Scope to THIS domain
+        # (the canonical dataset holds every domain processed so far) so a host
+        # resolved under an earlier domain is not re-probed here — before this
+        # filter, Round 1 re-probed all prior domains' hosts each iteration
+        # (O(N²) overall). Only resolved hosts are probed, never the raw
+        # candidate list.
+        canonical_dns_extract_resolved \
+            | grep -E "(^|\.)${domain//./\\.}$" > live_candidates_round1.txt || true
 
         if [[ -s live_candidates_round1.txt ]]; then
             httpx_probe live_candidates_round1.txt httpx_results_round1.json
@@ -399,12 +405,20 @@ WORDBASE
     if [[ "$new_only_subs" -gt 0 ]]; then
         canonical_dns_resolve_pending
 
-        # Extract resolved hostnames for HTTPx probing
-        canonical_dns_extract_resolved > live_candidates_round2.txt || true
+        # HTTPX Round 2 probes ONLY the brute-force additions that actually
+        # resolved and belong to this domain. We intersect the resolved set
+        # (which, globally, includes earlier domains' hosts) with this domain's
+        # brute-force additions so no other-domain or unresolved label is probed.
+        comm -12 \
+            <(canonical_dns_extract_resolved | grep -E "(^|\.)${domain//./\\.}$" | sort -u) \
+            <(sort -u new_subdomains_round2.txt) \
+            > new_resolved_round2.txt || true
 
-        # Probe ONLY the newly discovered subdomains that resolved
-        if [[ -s new_subdomains_round2.txt ]]; then
-            httpx_probe new_subdomains_round2.txt httpx_results_round2.json
+        if [[ -s new_resolved_round2.txt ]]; then
+            httpx_probe new_resolved_round2.txt httpx_results_round2.json
+        else
+            log_info "Round 2: no brute-force subdomains resolved — nothing new to probe"
+            : > httpx_results_round2.json
         fi
 
         if [[ -s httpx_results_round2.json ]]; then
@@ -597,7 +611,21 @@ WORDBASE
     log_info "New subdomains since Round 2 (from crawling): $crawl_new"
 
     if [[ "$crawl_new" -gt 0 ]]; then
-        httpx_probe new_subdomains_final.txt httpx_results_final.json
+        # HTTPX Round 3 probes ONLY the crawler-discovered subdomains that
+        # actually resolved and belong to this domain (same reasoning as Round 2:
+        # the resolved set includes earlier domains' hosts; keep only this
+        # domain's resolved crawl additions).
+        comm -12 \
+            <(canonical_dns_extract_resolved | grep -E "(^|\.)${domain//./\\.}$" | sort -u) \
+            <(sort -u new_subdomains_final.txt) \
+            > new_resolved_final.txt || true
+
+        if [[ -s new_resolved_final.txt ]]; then
+            httpx_probe new_resolved_final.txt httpx_results_final.json
+        else
+            log_info "Round 3: no crawler subdomains resolved — nothing new to probe"
+            : > httpx_results_final.json
+        fi
         if [[ -s httpx_results_final.json ]]; then
             jq -r '.url' httpx_results_final.json | sort -u > new_live_subdomains_final.txt || true
         else

@@ -298,7 +298,21 @@ checkpoint() {
 
     case "${choice,,}" in
         c|""|"continue")   return 0 ;;
-        s|skip)            return 2 ;;
+        s|skip)
+            # "Skip next phase" records the phase that follows the one that just
+            # ran (CURRENT_PHASE is still set to it). Next-phase is consulted by
+            # should_skip_phase a moment later, so the skip genuinely takes
+            # effect. Establish the user's intent as state rather than a return
+            # code, because callers invoke checkpoint with `|| true` (the exit
+            # status is otherwise swallowed).
+            local next_phase=$((CURRENT_PHASE + 1))
+            if [[ "$next_phase" -le 3 ]]; then
+                SKIP_PHASES+=("$next_phase")
+                log_info "Skip registered for Phase $next_phase."
+            else
+                log_info "No further phase to skip (all phases already ran)."
+            fi
+            return 0 ;;
         q|quit)            log_info "Exiting."; exit 0 ;;
         r|review)
             echo ""

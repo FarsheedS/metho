@@ -75,16 +75,11 @@ fi
 
 # ── Phase 2: Cloud Asset Discovery ─────────────────────────────────────────
 if ! should_skip_phase 2; then
-    ALL_SUBDOMAINS_FILE="${OUTPUT_DIR}/final/final_all_domains.txt"
-    LIVE_WEB_FILE="${OUTPUT_DIR}/final/final_live_web_servers.txt"
-
-    # Build intermediate files if Phase 1 ran
-    if ! should_skip_phase 1; then
-        cat "${OUTPUT_DIR}"/phase1/*/all_subdomains_final.txt 2>/dev/null | sort -u > "$ALL_SUBDOMAINS_FILE" || true
-        cat "${OUTPUT_DIR}"/phase1/*/live_subdomains_final.txt 2>/dev/null | sort -u > "$LIVE_WEB_FILE" || true
-    fi
-
-    run_phase2 "$ROOT_DOMAINS_FILE" "$ALL_SUBDOMAINS_FILE" "$LIVE_WEB_FILE"
+    # Phase 2 reads the canonical DNS dataset (Phase 1's source of truth) and
+    # the root domains directly; the per-run intermediate lists that used to be
+    # passed to it were never consumed by run_phase2, so they are no longer
+    # built here.
+    run_phase2 "$ROOT_DOMAINS_FILE"
 
     checkpoint "Phase 2 complete. Cloud assets: $(wc -l < "${OUTPUT_DIR}/phase2/final_cloud_assets.txt" 2>/dev/null || echo '?')" || true
 else
