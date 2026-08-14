@@ -7,13 +7,15 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV GOPATH=/root/go
 ENV PATH="${PATH}:/usr/local/go/bin:${GOPATH}/bin"
 
-# Build-only system dependencies
+# Build-only system dependencies (ca-certificates is required for Go to
+# verify TLS certificates when downloading modules from proxy.golang.org).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     golang-go \
     git \
     build-essential \
     wget \
     curl \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Go-based Recon Tools ───────────────────────────────────────────────────
