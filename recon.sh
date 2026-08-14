@@ -17,6 +17,7 @@ source "${SCRIPT_DIR}/lib/phase1.sh"
 source "${SCRIPT_DIR}/lib/phase2.sh"
 source "${SCRIPT_DIR}/lib/phase3.sh"
 source "${SCRIPT_DIR}/lib/consolidate.sh"
+source "${SCRIPT_DIR}/lib/results.sh"
 
 # Parse CLI arguments
 parse_args "$@"
@@ -101,6 +102,12 @@ fi
 
 # ── Final Consolidation ────────────────────────────────────────────────────
 run_consolidation
+
+# ── Per-Root-Domain Results ───────────────────────────────────────────────────
+# Clean, concise per-root presentation layer sliced from the global datasets.
+# Runs only after all discovery/DNS/HTTPX/cloud/classification/Nmap phases have
+# completed. Does not re-run tools or duplicate raw artifacts.
+generate_per_root_results
 
 log_success "Recon pipeline complete!"
 log_info "Full log saved to ${OUTPUT_DIR}/recon.log"
