@@ -25,8 +25,6 @@ _log_ts() { date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo '?'; }
 _now() { date +%s 2>/dev/null || date '+%Y%m%d%H%M%S' | sed 's/^/0/'; }
 
 # Pretty-print a duration in seconds as e.g. "2m 14s" or "47s".
-# Used by Stage timing lines added in Phase 2 to help identify which
-# tool stalled when a long-running scan is interrupted.
 _format_duration() {
     local secs="$1"
     if [[ "$secs" -lt 60 ]]; then
@@ -39,26 +37,69 @@ _format_duration() {
 }
 
 # Turn a URL/host string into a filename-safe token (drop :/, etc.).
-# Used as the per-host temp-file key when crawling hosts in parallel so
-# concurrent workers never write the same file.
 _safe_name() {
     printf '%s' "$1" | tr -c '[:alnum:].-' '_'
 }
 
+# ── Normalize a hostname ────────────────────────────────────────────────────
+# Strip leading *. wildcard, lowercase, strip trailing dot.
+normalize_hostname() {
+    echo "$1" | sed 's/^\*\.//; s/\.$//' | tr '[:upper:]' '[:lower:]'
+}
+
+# ── crt.name Certificate Transparency query ──────────────────────────────────
+# Queries the crt.name API for a root domain and extracts in-scope hostnames.
+# Usage: crtname_query <domain> <output_hostnames_file> <raw_json_file>
+#
+# The crt.name API returns JSON: [{"sub":"hostname.example.com"}, ...]
+# We normalize hostnames, filter to in-scope (matching the root domain),
+# deduplicate, and preserve the raw API response.
+crtname_query() {
+    local domain="$1" output_file="$2" raw_file="$3"
+
+    : > "$output_file"
+    : > "$raw_file"
+
+    if ! command -v curl &>/dev/null; then
+        log_warn "crt.name: curl not found, skipping certificate transparency query"
+        return
+    fi
+
+    log_info "Querying crt.name for $domain..."
+    local api_url="https://crt.name/v1/search?apex=${domain}&format=json"
+    local http_code
+    http_code=$(curl -s -w '%{http_code}' -o "$raw_file" "$api_url" 2>/dev/null || echo "000")
+
+    if [[ "$http_code" != "200" ]]; then
+        log_warn "crt.name: API returned HTTP $http_code for $domain"
+        return
+    fi
+
+    if [[ ! -s "$raw_file" ]]; then
+        log_warn "crt.name: empty response for $domain"
+        return
+    fi
+
+    # Extract "sub" fields from JSON, normalize, filter to in-scope, deduplicate
+    local escaped_domain="${domain//./\\.}"
+    jq -r '.[].sub // empty' "$raw_file" 2>/dev/null | \
+        while IFS= read -r raw_host; do
+            normalize_hostname "$raw_host"
+        done | \
+        grep -E "(^|\.)${escaped_domain}$" | \
+        sort -u > "$output_file"
+
+    local count=0
+    [[ -s "$output_file" ]] && count=$(wc -l < "$output_file")
+    log_success "crt.name subdomains for $domain: $count"
+}
+
+# ── Bounded parallel execution ──────────────────────────────────────────────
 # Run FUNC once per non-empty line of INPUT with bounded concurrency.
 # Each FUNC invocation runs in a backgrounded subshell (which inherits all
 # sourced functions/vars, so no export needed). FUNC receives the line as $1
 # plus any trailing args. Caller is responsible for giving each worker its
 # own output file (see _safe_name) and merging results after this returns.
-#
-# Why: CeWL/GoSpider/SubDomainizer/Katana crawl hosts serially and spend the
-# vast majority of pipeline wall-clock there. A small pool makes them ~Nx
-# faster with no data loss -- the per-host work is identical, just concurrent,
-# and bounded so we don't provoke the target's WAF/rate-limiter.
-#
-# `wait -n` (wait for any one job) needs bash >= 4.3 (Kali ships 5.x). We probe
-# for it once; on older bash we fall back to `wait` (all jobs) between batches,
-# which still parallelizes within a batch and never crashes.
 bounded_parallel() {
     local concurrency="$1" input="$2" func="$3"; shift 3
     local running=0 _prev_errexit
@@ -70,8 +111,7 @@ bounded_parallel() {
     fi
     # Temporarily disable errexit AND save/restore it. A worker that returns
     # non-zero must NOT abort the pool (its exit surfaces through `wait`), and
-    # we must not leak `set +e` back to the caller. Each worker is also wrapped
-    # in `(... || true)` run in its own backgrounded subshell.
+    # we must not leak `set +e` back to the caller.
     case $- in *e*) _prev_errexit=1; set +e;; *) _prev_errexit=0;; esac
     while read -r line; do
         [[ -z "$line" ]] && continue
@@ -101,32 +141,33 @@ log_skip()    { local msg="[SKIP] $*"; echo -e "${YELLOW}${msg}${NC}"; [[ -n "$L
 # ── CLI Argument Parsing ────────────────────────────────────────────────────
 DOMAINS=""
 DOMAINS_FILE=""
-SUBFINDER_PROVIDER_CONFIG=""
-AMASS_CONFIG=""
+SUBFASTER_PROVIDER_CONFIG=""
 AUTO=false
 SKIP_PHASES=()
 THREADS=50
 RATE_LIMIT=100
 CHECKPOINT_TIMEOUT=30
 OUTPUT_DIR="/output"
-GITHUB_TOKENS_FILE=""
 CLOUD_ENUM_KEYWORDS=""
 PORT_SCAN=true
 # How many live hosts to crawl in parallel within a per-host tool (CeWL,
-# GoSpider, SubDomainizer, Katana). These stages spend the vast majority of
-# wall-clock time crawling hosts one-by-one; a small bounded pool cuts that
-# ~Nx with no data loss (each host still runs the same tool/flags into its
-# own temp file, merged after). Keep it modest so concurrent requests don't
-# trip the target's WAF/rate-limiter (N hosts * each tool's internal -c/-t).
+# Katana, SubDomainizer). These stages spend the vast majority of wall-clock
+# time crawling hosts one-by-one; a small bounded pool cuts that ~Nx with no
+# data loss.
 PARALLEL_HOSTS=5
+# ASN classification config file (shell-sourceable)
+ASN_CONFIG_FILE=""
+# Waymore mode: U (URLs only), R (responses only), B (both, default)
+WAYMORE_MODE="B"
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --domains)        DOMAINS="$2"; shift 2 ;;
             --domains-file)   DOMAINS_FILE="$2"; shift 2 ;;
-            --subfinder-config) SUBFINDER_PROVIDER_CONFIG="$2"; shift 2 ;;
-            --amass-config)   AMASS_CONFIG="$2"; shift 2 ;;
+            --subfaster-config) SUBFASTER_PROVIDER_CONFIG="$2"; shift 2 ;;
+            --asn-config)     ASN_CONFIG_FILE="$2"; shift 2 ;;
+            --waymore-mode)   WAYMORE_MODE="$2"; shift 2 ;;
             --auto)           AUTO=true; shift ;;
             --skip-phase)     SKIP_PHASES+=("$2"); shift 2 ;;
             --skip-cloud)     SKIP_PHASES+=("2"); shift ;;
@@ -136,29 +177,28 @@ parse_args() {
             --rate-limit)     RATE_LIMIT="$2"; shift 2 ;;
             --timeout)        CHECKPOINT_TIMEOUT="$2"; shift 2 ;;
             --output)         OUTPUT_DIR="$2"; shift 2 ;;
-            --github-tokens-file) GITHUB_TOKENS_FILE="$2"; shift 2 ;;
             --cloud-enum-keywords) CLOUD_ENUM_KEYWORDS="$2"; shift 2 ;;
             -h|--help)
                 echo "Usage: recon.sh [options]"
                 echo ""
                 echo "Required (one of):"
-                echo "  --domains d1,d2,...     Comma-separated root domains"
-                echo "  --domains-file FILE     Line-separated root domains file"
+                echo "  --domains d1,d2,...       Comma-separated root domains"
+                echo "  --domains-file FILE       Line-separated root domains file"
                 echo ""
                 echo "Options:"
-                echo "  --subfinder-config FILE Path to subfinder provider-config.yaml"
-                echo "  --amass-config FILE     Path to amass config.yaml (API keys -> fewer 403/429)"
-                echo "  --auto                  Skip all checkpoint prompts"
-                echo "  --skip-phase {1,2,3}    Skip specific phase(s)"
-                echo "  --skip-cloud            Shorthand for --skip-phase 2"
-                echo "  --no-port-scan          Skip port scanning phase"
-                echo "  --threads N             Thread count (default: 50)"
-                echo "  --parallel-hosts N      Hosts crawled in parallel per tool (default: 5)"
-                echo "  --rate-limit N          Requests/second (default: 100)"
-                echo "  --timeout N             Checkpoint auto-continue seconds (default: 30)"
-                echo "  --output DIR            Output directory (default: /output)"
-                echo "  --github-tokens-file FILE  File with GitHub tokens (one per line) for github-subdomains"
-                echo "  --cloud-enum-keywords KW   Keywords for cloud_enum brute force (comma-sep)"
+                echo "  --subfaster-config FILE   Path to subfaster provider-config.yaml (API keys)"
+                echo "  --asn-config FILE         Path to ASN provider classification config (default: built-in)"
+                echo "  --waymore-mode MODE       Waymore mode: U (URLs), R (responses), B (both, default)"
+                echo "  --auto                    Skip all checkpoint prompts"
+                echo "  --skip-phase {1,2,3}      Skip specific phase(s)"
+                echo "  --skip-cloud              Shorthand for --skip-phase 2"
+                echo "  --no-port-scan            Skip port scanning phase"
+                echo "  --threads N               Thread count (default: 50)"
+                echo "  --parallel-hosts N         Hosts crawled in parallel per tool (default: 5)"
+                echo "  --rate-limit N            Requests/second (default: 100)"
+                echo "  --timeout N               Checkpoint auto-continue seconds (default: 30)"
+                echo "  --output DIR              Output directory (default: /output)"
+                echo "  --cloud-enum-keywords KW  Keywords for cloud_enum brute force (comma-sep)"
                 exit 0 ;;
             *) log_error "Unknown argument: $1"; exit 1 ;;
         esac
@@ -178,26 +218,23 @@ validate_args() {
         log_error "Domains file is empty: $DOMAINS_FILE"
         exit 1
     fi
-    if [[ -n "$SUBFINDER_PROVIDER_CONFIG" && ! -f "$SUBFINDER_PROVIDER_CONFIG" ]]; then
-        log_error "Subfinder config file not found: $SUBFINDER_PROVIDER_CONFIG"
+    if [[ -n "$SUBFASTER_PROVIDER_CONFIG" && ! -f "$SUBFASTER_PROVIDER_CONFIG" ]]; then
+        log_error "Subfaster config file not found: $SUBFASTER_PROVIDER_CONFIG"
         exit 1
     fi
-    if [[ -n "$AMASS_CONFIG" && ! -f "$AMASS_CONFIG" ]]; then
-        log_error "Amass config file not found: $AMASS_CONFIG"
+    if [[ -n "$ASN_CONFIG_FILE" && ! -f "$ASN_CONFIG_FILE" ]]; then
+        log_error "ASN config file not found: $ASN_CONFIG_FILE"
         exit 1
     fi
-    if [[ -n "$GITHUB_TOKENS_FILE" && ! -f "$GITHUB_TOKENS_FILE" ]]; then
-        log_error "GitHub tokens file not found: $GITHUB_TOKENS_FILE"
-        exit 1
+    if [[ -n "$SUBFASTER_PROVIDER_CONFIG" ]]; then
+        export SUBFASTER_PROVIDER_CONFIG
+        log_info "Subfaster provider config: $SUBFASTER_PROVIDER_CONFIG"
     fi
-    if [[ -n "$SUBFINDER_PROVIDER_CONFIG" ]]; then
-        export SUBFINDER_PROVIDER_CONFIG
-        log_info "Subfinder provider config: $SUBFINDER_PROVIDER_CONFIG"
-    fi
-    if [[ -n "$AMASS_CONFIG" ]]; then
-        export AMASS_CONFIG
-        log_info "Amass config: $AMASS_CONFIG"
-    fi
+    # Validate waymore mode
+    case "$WAYMORE_MODE" in
+        U|R|B) ;;
+        *) log_error "Invalid --waymore-mode: $WAYMORE_MODE (must be U, R, or B)"; exit 1 ;;
+    esac
 }
 
 # Resolve domain input (--domains or --domains-file) into a file path.
@@ -231,7 +268,7 @@ should_skip_phase() {
     return 1
 }
 
-# ── Checkpoint System ───────────────────────────────────────────────────────
+# ── Checkpoint System ────────────────────────────────────────────────────────
 checkpoint() {
     local message="$1"
     echo ""
@@ -275,21 +312,21 @@ checkpoint() {
     esac
 }
 
-# ── Directory Setup ─────────────────────────────────────────────────────────
+# ── Directory Setup ──────────────────────────────────────────────────────────
 # 777 (not u+rwX) is intentional: the container runs as root but the host
 # user mounting /output is usually a non-root uid. World-writable lets the
 # host user read, modify, and delete results without "permission denied".
 setup_dirs() {
-    mkdir -p "${OUTPUT_DIR}"/{phase1,phase2,phase3,final}
+    mkdir -p "${OUTPUT_DIR}"/{phase1,phase2,phase3,final,config}
     chmod -R 777 "$OUTPUT_DIR" 2>/dev/null
 }
 
 # ── Dependency Check ────────────────────────────────────────────────────────
 # Only the core plumbing tools are checked up-front. The recon tools
-# (amass, dnsx, shuffledns, katana, gospider, etc.) are validated lazily,
-# per-stage, with `command -v` so any missing tool is skipped cleanly
-# instead of failing the whole run.
-REQUIRED_TOOLS=(jq curl wget git)
+# (dnsx, shuffledns, katana, etc.) are validated lazily, per-stage, with
+# `command -v` so any missing tool is skipped cleanly instead of failing
+# the whole run.
+REQUIRED_TOOLS=(jq curl wget)
 
 validate_deps() {
     local missing=()
@@ -306,7 +343,14 @@ validate_deps() {
 # Default: httpx probes port 443 (HTTPS) then falls back to 80 (HTTP).
 # No -ports flag = much faster, covers the vast majority of web services.
 # No -mc flag = show all responses (equivalent to listing every status code).
-
+#
+# HTTPX flags for rich metadata:
+#   -cdn            detect CDN and include cdn field in JSON output
+#   -status-code    include HTTP status code
+#   -title          include page title
+#   -tech-detect    detect web technologies
+#   -web-server     include web server header (alias: -server)
+#   -content-length include content length
 httpx_probe() {
     local input_file="$1"
     local output_json="$2"
@@ -323,18 +367,20 @@ httpx_probe() {
     # httpx log file for full verbose output (for debugging)
     local httpx_log="${output_json%.json}.httpx.log"
 
-    # Run httpx. The -o file captures the JSON results; httpx ALSO prints the
-    # same JSON to stdout, which would flood the console with raw JSONL (seen
-    # in our runs), so stdout goes to /dev/null. `|| true`: a non-zero httpx
-    # exit (no live hosts, resolver failure) must not abort the whole
-    # pipeline under set -e + pipefail.
+    # Run httpx with CDN detection and full metadata.
+    # -cdn: detect CDN (adds "cdn" boolean field to JSON output)
+    # -tech-detect: detect web technologies (adds "tech" array)
+    # -web-server: detect web server (alias for -server in some versions)
+    # -content-length: include content_length field
+    # -status-code, -title: include status code and page title
     cat "$input_file" | httpx \
         -silent \
         -json \
+        -cdn \
         -status-code \
         -title \
         -tech-detect \
-        -server \
+        -web-server \
         -content-length \
         -timeout 10 \
         -retries 2 \
@@ -351,6 +397,11 @@ httpx_probe() {
 
     # Append a summary to the httpx log for context
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] httpx run complete: ${count} results from ${target_count} targets" >> "$httpx_log"
+
+    # Merge httpx metadata into the canonical DNS dataset
+    if [[ -s "$output_json" ]]; then
+        canonical_dns_merge_httpx "$output_json"
+    fi
 }
 
 # ── Domain Extraction ───────────────────────────────────────────────────────
@@ -389,49 +440,9 @@ extract_domains() {
 #   Linode:     linodeobjects.com
 #   Oracle:     oraclecloud.com / oraclecloudusercontent.com
 #   Supabase:   supabase.co / supabase.in
-#
-# Notes:
-#   - `s3[^0-9]` keeps AWS S3 (matches "s3-", "s3.") but excludes
-#     unrelated tokens that happen to start with "s3" (e.g. "s395").
-#   - All alternatives are case-insensitive (`-i`).
-#   - Patterns are written as `(...|...)` groups so adding a new
-#     provider is a single-line edit.
 filter_cloud_domains() {
     local input_file="$1"
     local output_file="$2"
     grep -iE '(amazonaws|cloudfront|elasticbeanstalk|azurewebsites|azure-api|blob\.core\.windows|cloudapp|googleapis|appspot|cloudfunctions|storage\.googleapis|web\.app|cloudflarestorage|workers\.dev|digitaloceanspaces|digitalocean\.app|ondigitalocean\.app|herokuapp|vercel\.app|netlify\.app|fly\.dev|railway\.app|onrender\.com|backblazeb2|linodeobjects|oraclecloud|supabase\.co|supabase\.in)' \
         "$input_file" | sort -u > "$output_file" 2>/dev/null || true
-}
-
-# ── CDN ASN Detection ──────────────────────────────────────────────────────
-CDN_ASNS=(
-    "AS13335"   # Cloudflare
-    "AS54113"   # Fastly
-    "AS16509"   # Amazon/AWS
-    "AS14618"   # Amazon/AWS
-    "AS8075"    # Microsoft/Azure CDN
-    "AS15169"   # Google
-    "AS20940"   # Akamai
-    "AS16625"   # Akamai
-    "AS12222"   # Akamai
-    "AS53913"   # Akamai
-    "AS8403"    # SPB Telecom (some CDN)
-    "AS54994"   # Zeit/Vercel
-    "AS7604"    # Alibaba CDN
-    "AS46606"   # Tumblr
-    "AS19551"   # Incapsula/Imperva
-    "AS19551"   # Incapsula
-    "AS53667"   # FranTech (VPN/Proxy)
-    "AS20446"   # Highwinds/StackPath
-    "AS30081"   # CacheNetworks
-    "AS11427"   # Charter/Time Warner Cable
-    "AS8001"    # Netrail/Akamai
-)
-
-is_cdn_asn() {
-    local asn="$1"
-    for cdn_asn in "${CDN_ASNS[@]}"; do
-        [[ "$asn" == "$cdn_asn" ]] && return 0
-    done
-    return 1
 }

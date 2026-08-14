@@ -1,115 +1,68 @@
 #!/usr/bin/env bash
-# Phase 3: IP Extraction, ASN Lookup, CDN Filtering, Port Scanning
-# Resolves all discovered domains to IPs, maps IPs to ASNs (sorted by occurrence),
-# filters out CDN ranges, and port scans non-CDN IPs.
+# Phase 3: IP Extraction, Deterministic Classification, and Port Scanning
+#
+# Uses the canonical DNS dataset (populated in Phases 1-2) as the source of
+# truth for hostnames and IPs. No re-resolution of the entire corpus — only
+# newly discovered hosts get resolved incrementally.
+#
+# Classification is deterministic:
+#   1. HTTPX CDN = true        → "cdn"
+#   2. ASN/provider matches CDN → "cdn"
+#   3. ASN/provider matches cloud → "cloud"
+#   4. ASN/provider matches dedicated → "dedicated"
+#   5. Otherwise               → "unknown"
+#
+# Nmap candidates = dedicated + cloud + unknown (CDN excluded from scanning).
 
 run_phase3() {
     local pdir="${OUTPUT_DIR}/phase3"
     mkdir -p "$pdir"
     CURRENT_PHASE=3
 
-    log_info "═══ PHASE 3: IP Extraction → ASN Mapping → Port Scanning ═══"
+    log_info "═══ PHASE 3: IP → Classification → Port Scanning ═══"
 
-    local all_domains_file="${OUTPUT_DIR}/final/final_all_domains.txt"
-    if [[ ! -s "$all_domains_file" ]]; then
-        cat "${OUTPUT_DIR}"/phase1/*/all_subdomains_final.txt 2>/dev/null | sort -u > "$all_domains_file" || true
-    fi
+    # ── Stage 1: Extract IPs from Canonical DNS Dataset ─────────────────────
+    log_info "Stage 1: Extracting IPs from canonical DNS dataset"
 
-    if [[ ! -s "$all_domains_file" ]]; then
-        log_error "No domains available for IP extraction"
+    # Final resolution pass — resolve any hostnames still pending
+    canonical_dns_resolve_pending
+
+    # Extract the domain→IP mapping from the canonical DNS dataset
+    local dns_tsv="${OUTPUT_DIR}/canonical_dns.tsv"
+    if [[ ! -s "$dns_tsv" ]]; then
+        log_error "Canonical DNS dataset not found — cannot proceed with IP classification"
         return 1
     fi
 
-    local domain_count
-    domain_count=$(wc -l < "$all_domains_file")
-    log_info "Resolving IPs for ${domain_count} domains..."
-
-    # ── Stage 1: DNS Resolution → IP Addresses ──────────────────────────────
-    log_info "Stage 1: Resolving domains to IP addresses"
-
-    : > "${pdir}/all_ips_raw.txt"
+    # Build domain_ip_map.txt from canonical DNS (hostname A_record)
+    # The A column (field 4) contains semicolon-separated IPs.
     : > "${pdir}/domain_ip_map.txt"
+    tail -n +2 "$dns_tsv" | awk -F'\t' '{
+        if ($4 != "" && $7 == "resolved") {
+            n = split($4, ips, ";")
+            for (i = 1; i <= n; i++) {
+                gsub(/^[ \t]+|[ \t]+$/, "", ips[i])
+                if (ips[i] != "") printf "%s %s\n", $1, ips[i]
+            }
+        }
+    }' > "${pdir}/domain_ip_map.txt"
 
-    # Use dnsx for fast bulk resolution if available
-    if command -v dnsx &>/dev/null; then
-        log_info "Using dnsx for bulk DNS resolution..."
-        # timeout wraps dnsx (never `cat` — an instant command — which would
-        # leave dnsx uncapped). dnsx reads the target list from the stdin
-        # pipe, which is exactly what we want here.
-        cat "$all_domains_file" | timeout "${DNSX_TIMEOUT:-600}" \
-            dnsx -silent -a -json -retry 2 2>/dev/null \
-            > "${pdir}/dnsx_resolution.json" || true
-
-        # Domain→IP mapping and bare IPs from the dnsx JSONL.
-        # (The previous jq was `.host as $host | .a[]? | "\($host) \(. "")"`
-        # — `(. "")` indexes a string with an empty-string key, so jq errored
-        # on EVERY record, dnsx_resolution.json came out empty, and ALL
-        # resolution silently fell back to the slow serial dig loop.)
-        jq -r 'select(.a != null) | .host as $h | .a[] | "\($h) \(.)"' \
-            "${pdir}/dnsx_resolution.json" 2>/dev/null > "${pdir}/domain_ip_map.txt" || true
-        jq -r '.a[]?' "${pdir}/dnsx_resolution.json" 2>/dev/null \
-            >> "${pdir}/all_ips_raw.txt" || true
-
-        local resolved_count=0
-        [[ -s "${pdir}/domain_ip_map.txt" ]] && \
-            resolved_count=$(cut -d' ' -f1 "${pdir}/domain_ip_map.txt" | sort -u | wc -l | tr -d ' ')
-        log_info "dnsx resolved ${resolved_count} of ${domain_count} domains"
-    else
-        log_info "dnsx not available — resolving with dig only..."
-    fi
-
-    # dig fallback — ONLY for domains dnsx didn't resolve. A domain can be
-    # missed by dnsx (resolver timeout, rate limit), so skipping this
-    # entirely would lose data; running it over ALL domains (the old code)
-    # duplicated work dnsx already did.
-    local pending_file="${pdir}/.pending_resolution.txt"
-    if [[ -s "${pdir}/domain_ip_map.txt" ]]; then
-        cut -d' ' -f1 "${pdir}/domain_ip_map.txt" | sort -u > "${pdir}/.resolved_hosts.txt" || true
-        comm -23 <(sort -u "$all_domains_file") "${pdir}/.resolved_hosts.txt" \
-            > "$pending_file" || true
-    else
-        sort -u "$all_domains_file" > "$pending_file" || true
-    fi
-
-    local pending_count=0
-    [[ -s "$pending_file" ]] && pending_count=$(wc -l < "$pending_file" | tr -d ' ')
-    if [[ "$pending_count" -gt 0 ]]; then
-        log_info "dig fallback for ${pending_count} unresolved domain(s)..."
-        while read -r dom; do
-            [[ -z "$dom" ]] && continue
-            local ips
-            # `|| true`: for an unresolvable domain grep exits 1 — under
-            # set -e + pipefail the failing command substitution would
-            # otherwise abort the ENTIRE pipeline mid-loop (verified).
-            ips=$(dig +short "$dom" A 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)
-            for ip in $ips; do
-                echo "$dom $ip" >> "${pdir}/domain_ip_map.txt"
-                echo "$ip" >> "${pdir}/all_ips_raw.txt"
-            done
-        done < "$pending_file"
-    fi
-    rm -f "$pending_file" "${pdir}/.resolved_hosts.txt"
-
-    sort -u "${pdir}/all_ips_raw.txt" > "${pdir}/all_ips.txt" 2>/dev/null || true
-    rm -f "${pdir}/all_ips_raw.txt"
+    # Build all_ips.txt from the domain_ip_map (unique IPs)
+    cut -d' ' -f2 "${pdir}/domain_ip_map.txt" | sort -u -V > "${pdir}/all_ips.txt"
 
     local ip_count=0
     [[ -s "${pdir}/all_ips.txt" ]] && ip_count=$(wc -l < "${pdir}/all_ips.txt")
-    log_success "Unique IP addresses resolved: $ip_count"
+    log_success "Unique IP addresses from canonical DNS: $ip_count"
 
     if [[ "$ip_count" -eq 0 ]]; then
-        log_warn "No IPs resolved, skipping ASN lookup and port scanning"
+        log_warn "No IPs resolved, skipping classification and port scanning"
         return 0
     fi
 
-    # ── Stage 2: IP → ASN Lookup via whois.cymru.com ────────────────────────
+    # ── Stage 2: IP → ASN Lookup via whois.cymru.com ───────────────────────
     log_info "Stage 2: Looking up ASNs via whois.cymru.com"
 
-    # Query whois.cymru.com ONCE and cache the raw response. The previous code
-    # issued two identical queries (one for asn_raw.txt, one for ip_asn_map.txt)
-    # which doubled the network round-trips on a service that is often slow /
-    # flaky. A single query + two local awk passes over the cache is faster and
-    # keeps both derived views consistent (same response snapshot).
+    # Query whois.cymru.com ONCE and cache the raw response.
     local _cymru_cache="${pdir}/.cymru_raw.txt"
     {
         echo "begin"
@@ -167,38 +120,26 @@ run_phase3() {
     cut -d'|' -f1 "${pdir}/asn_summary.txt" 2>/dev/null | sort -u > "${pdir}/asn_list.txt" || true
     cut -d'|' -f3 "${pdir}/asn_summary.txt" 2>/dev/null | sort -u > "${pdir}/network_ranges.txt" || true
 
-    # ── Stage 3: CDN Filtering ──────────────────────────────────────────────
-    log_info "Stage 3: Identifying CDN-associated IPs"
+    # ── Stage 3: Deterministic IP Classification ────────────────────────────
+    log_info "Stage 3: Deterministic IP classification"
 
-    : > "${pdir}/cdn_ips.txt"
-    : > "${pdir}/non_cdn_ips.txt"
+    # Load the ASN provider config (CDN/cloud/dedicated lists)
+    load_asn_config || {
+        log_error "Failed to load ASN provider configuration — cannot classify IPs"
+        return 1
+    }
 
-    if [[ -s "${pdir}/ip_asn_map.txt" ]]; then
-        while IFS='|' read -r ip asn name prefix; do
-            [[ -z "$ip" || -z "$asn" ]] && continue
-            if is_cdn_asn "$asn"; then
-                echo "$ip" >> "${pdir}/cdn_ips.txt"
-            else
-                echo "$ip" >> "${pdir}/non_cdn_ips.txt"
-            fi
-        done < "${pdir}/ip_asn_map.txt"
-    fi
+    # Build the classification datasets using write_ip_datasets from lib/classify.sh
+    write_ip_datasets "${pdir}/domain_ip_map.txt" "${pdir}/ip_asn_map.txt" "${pdir}"
 
-    sort -u "${pdir}/cdn_ips.txt" -o "${pdir}/cdn_ips.txt" 2>/dev/null || true
-    sort -u "${pdir}/non_cdn_ips.txt" -o "${pdir}/non_cdn_ips.txt" 2>/dev/null || true
-
-    local cdn_count=0 non_cdn_count=0
-    [[ -s "${pdir}/cdn_ips.txt" ]] && cdn_count=$(wc -l < "${pdir}/cdn_ips.txt")
-    [[ -s "${pdir}/non_cdn_ips.txt" ]] && non_cdn_count=$(wc -l < "${pdir}/non_cdn_ips.txt")
-
-    log_info "CDN IPs: $cdn_count | Non-CDN IPs: $non_cdn_count"
-
-    # ── Stage 4: Port Scan on Non-CDN IPs ───────────────────────────────────
-    if [[ "$PORT_SCAN" == true && -s "${pdir}/non_cdn_ips.txt" ]]; then
-        log_info "Stage 4: Port scanning ${non_cdn_count} non-CDN IPs"
+    # ── Stage 4: Port Scan on Nmap Candidates ───────────────────────────────
+    if [[ "$PORT_SCAN" == true && -s "${pdir}/nmap_candidates.txt" ]]; then
+        local nmap_count=0
+        nmap_count=$(wc -l < "${pdir}/nmap_candidates.txt")
+        log_info "Stage 4: Port scanning ${nmap_count} nmap candidates (non-CDN IPs)"
 
         if command -v nmap &>/dev/null; then
-            nmap -iL "${pdir}/non_cdn_ips.txt" \
+            nmap -iL "${pdir}/nmap_candidates.txt" \
                 -p 21,22,23,25,53,80,110,111,135,139,143,443,445,993,995,1433,1521,2049,3306,3389,5432,5900,5985,5986,6379,6443,8080,8443,8888,9090,9200,9443,27017 \
                 --open --min-rate 500 \
                 -oG "${pdir}/port_scan_results.txt" 2>/dev/null || true
@@ -227,7 +168,7 @@ run_phase3() {
     elif [[ "$PORT_SCAN" != true ]]; then
         log_skip "Port scanning disabled (--no-port-scan)"
     else
-        log_warn "No non-CDN IPs to port scan"
+        log_warn "No nmap candidates to port scan"
     fi
 
     log_success "Phase 3 complete"

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Phase 1: Root Domains → All Subdomains
-# For each root domain, discovers subdomains via scraping, brute forcing, and crawling.
+# For each root domain, discovers subdomains via passive enumeration,
+# historical recon, DNS brute force, and web crawling.
 
 run_phase1() {
     local pdir="${OUTPUT_DIR}/phase1"
@@ -23,7 +24,7 @@ run_phase1() {
     done < "$root_domains_file"
 }
 
-# ── CeWL helpers (Stage 3a) ─────────────────────────────────────────────────
+# ── CeWL helpers (Stage 4) ─────────────────────────────────────────────────
 # CeWL keeps the spider frontier and every collected word in RAM (it prints
 # words only after the crawl finishes). On large doc/library sites a `-d 2`
 # crawl can grow past the container's memory and get SIGKILLed by the kernel
@@ -44,7 +45,7 @@ run_phase1() {
 #     junk reaches the wordlist.
 #   * `< /dev/null` detaches cewl's stdin from the enclosing `while read`
 #     loop (defence against the stdin-consumption bug class that
-#     gospider/katana exhibited).
+#     katana exhibited).
 run_cewl() {
     local url="$1" depth="$2"
     (
@@ -82,150 +83,111 @@ process_domain() {
 
     cd "$ddir" || return 1
 
-    # ── Stage 1: Web Scraping ───────────────────────────────────────────────
-    log_info "Stage 1: Web Scraping for subdomains"
+    # ── Stage 1: Passive Subdomain Enumeration ──────────────────────────────
+    log_info "Stage 1: Passive subdomain enumeration"
 
-    # Cero (replaces crt.sh — scrapes domain names from TLS certificates)
-    if command -v cero &>/dev/null; then
-        log_info "Running Cero (certificate transparency)..."
-        cero -d "$domain" 2>/dev/null | sort -u > cero_results.txt || true
-        local cero_count=0
-        [[ -s cero_results.txt ]] && cero_count=$(wc -l < cero_results.txt)
-        log_success "Cero subdomains: $cero_count"
-    else
-        log_warn "Cero not found, skipping certificate transparency scan"
-    fi
-
-    # Subfinder
-    log_info "Running Subfinder..."
-    local subfinder_opts=(-d "$domain" -all -silent -o subfinder_results.txt)
-    if [[ -n "$SUBFINDER_PROVIDER_CONFIG" ]]; then
-        subfinder_opts+=(-provider-config "$SUBFINDER_PROVIDER_CONFIG")
-    fi
-    subfinder "${subfinder_opts[@]}" 2>/dev/null || true
-    local sf_count=0
-    [[ -s subfinder_results.txt ]] && sf_count=$(wc -l < subfinder_results.txt)
-    log_success "Subfinder subdomains: $sf_count"
-
-    # Assetfinder
-    if command -v assetfinder &>/dev/null; then
-        log_info "Running Assetfinder..."
-        assetfinder --subs-only "$domain" > assetfinder_results.txt 2>/dev/null || true
-        local af_count=0
-        [[ -s assetfinder_results.txt ]] && af_count=$(wc -l < assetfinder_results.txt)
-        log_success "Assetfinder subdomains: $af_count"
-    fi
-
-    # GAU
-    if command -v gau &>/dev/null; then
-        log_info "Running GAU..."
-        # GAU pulls from Wayback/CommonCrawl/OTX/URLScan. Those archives are
-        # slow and unresponsive to some targets; without a cap a single bad
-        # provider stalls Stage 1 for many minutes (observed ~5 min producing
-        # 0 results). GAU_TIMEOUT default 300s.
-        timeout "${GAU_TIMEOUT:-300}" gau --subs --threads 10 "$domain" 2>/dev/null | \
-            grep -oE '([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}' | \
-            grep "$domain" | sort -u > gau_results.txt || true
-        local gau_count=0
-        [[ -s gau_results.txt ]] && gau_count=$(wc -l < gau_results.txt)
-        log_success "GAU subdomains: $gau_count"
-    fi
-
-    # Sublist3r - capture results despite warnings/errors
-    # Sublist3r prints results to stdout even when some engines fail
-    if command -v sublist3r &>/dev/null || [[ -f /opt/tools/sublist3r/sublist3r.py ]]; then
-        log_info "Running Sublist3r..."
-        local sl3_cmd="sublist3r"
-        command -v sublist3r &>/dev/null || sl3_cmd="python3 /opt/tools/sublist3r/sublist3r.py"
-
-        # Run sublist3r, capture ALL output (stdout+stderr), then extract valid subdomains
-        # Use timeout to prevent hanging, and run with -v for verbose output
-        local sublist3r_all_output="sublist3r_all_output.txt"
-        : > "$sublist3r_all_output"
-
-        # Capture both stdout and stderr; sublist3r prints discovered subdomains to stdout
-        # even when some search engines throw exceptions
-        timeout 300 bash -c "$sl3_cmd -d \"$domain\" -t \"$THREADS\" -v 2>&1" > "$sublist3r_all_output" || true
-
-        # Extract subdomains from verbose output. Sublist3r's -v mode prints lines like:
-        #   Netcraft: it.idp.vodafone.com
-        #   Baidu: sub.domain.com
-        # as well as bare domain lines in the final summary.
-        # Use grep -oE (no anchors) to extract domains from anywhere on the line,
-        # then filter to only those matching the target domain.
-        # -- fix: Sublist3r wraps every discovered subdomain in ANSI color escapes
-        # (e.g. `\033[0m`, `\033[92m`). grep -oE matches the bytes AFTER the stripped
-        # ESC, gluing the trailing color suffix onto the next domain token, producing
-        # entries like `0macademy.arvancloud.ir` and `92macademy.arvancloud.ir`.
-        # Strip ANSI escapes with sed before applying the domain regex.
-        # Also escape literal dots in $domain so multi-label TLDs (e.g. co.uk) match
-        # cleanly.
-        sed -E $'s/\x1b\\[[0-9;?]*[a-zA-Z]//g' "$sublist3r_all_output" 2>/dev/null | \
-            grep -oE '([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}' | \
-            grep -E "\.${domain//./\\.}$|^${domain//./\\.}$" | \
-            sort -u > sublist3r_results.txt || true
-
-        local sl3_count=0
-        [[ -s sublist3r_results.txt ]] && sl3_count=$(wc -l < sublist3r_results.txt)
-        log_success "Sublist3r subdomains: $sl3_count (errors from some engines ignored)"
-
-        # Keep full output for debugging
-        mv "$sublist3r_all_output" sublist3r_full_output.txt
-    fi
-
-    # github-subdomains
-    if [[ -n "$GITHUB_TOKENS_FILE" ]] && command -v github-subdomains &>/dev/null; then
-        log_info "Running github-subdomains..."
-        github-subdomains -d "$domain" \
-            -t "$GITHUB_TOKENS_FILE" \
-            -o github_subdomains_results.txt 2>/dev/null || true
-        local gh_count=0
-        [[ -s github_subdomains_results.txt ]] && gh_count=$(wc -l < github_subdomains_results.txt)
-        log_success "github-subdomains subdomains: $gh_count"
-    else
-        if [[ -z "$GITHUB_TOKENS_FILE" ]]; then
-            log_skip "github-subdomains skipped (no --github-tokens-file)"
-        else
-            log_skip "github-subdomains skipped (tool not installed)"
+    # Subfaster (replaces Subfinder)
+    if command -v subfaster &>/dev/null; then
+        log_info "Running Subfaster..."
+        local sf_opts=(-d "$domain" -silent -o subfaster_results.txt)
+        if [[ -n "$SUBFASTER_PROVIDER_CONFIG" ]]; then
+            sf_opts+=(-provider-config "$SUBFASTER_PROVIDER_CONFIG")
         fi
+        subfaster "${sf_opts[@]}" 2>/dev/null || true
+        local sf_count=0
+        [[ -s subfaster_results.txt ]] && sf_count=$(wc -l < subfaster_results.txt)
+        log_success "Subfaster subdomains: $sf_count"
+    else
+        log_warn "Subfaster not found, skipping passive subdomain enumeration"
     fi
 
-    # ── Stage 2: Consolidate & HTTPx Round 1 ────────────────────────────────
-    log_info "Stage 2: Consolidating scraping results + HTTPx Round 1"
+    # crt.name — Certificate Transparency
+    crtname_query "$domain" crtname_results.txt crtname_raw.json
 
+    # Add all Stage 1 discoveries to the canonical DNS dataset
+    [[ -s subfaster_results.txt ]] && canonical_dns_add_sources "subfaster" "subfaster_results.txt"
+    [[ -s crtname_results.txt ]] && canonical_dns_add_sources "crt.name" "crtname_results.txt"
+
+    # ── Stage 2: Historical Recon (Waymore) ─────────────────────────────────
+    # Waymore operates on ROOT DOMAINS ONLY — it fetches historical URLs and
+    # responses from Wayback, CommonCrawl, OTX, URLScan, VirusTotal, etc.
+    log_info "Stage 2: Historical reconnaissance (Waymore)"
+
+    if command -v waymore &>/dev/null; then
+        local wm_output_dir="${ddir}/waymore_output"
+        mkdir -p "$wm_output_dir"
+        local wm_urls="${ddir}/waymore_urls.txt"
+
+        log_info "Running Waymore on root domain $domain (mode ${WAYMORE_MODE:-B})..."
+        timeout "${WAYMORE_TIMEOUT:-1800}" waymore \
+            -i "$domain" \
+            -mode "${WAYMORE_MODE:-B}" \
+            -oU "$wm_urls" \
+            -oR "$wm_output_dir" \
+            -t 30 -p 2 --verbose \
+            2>/dev/null || true
+
+        if [[ -s "$wm_urls" ]]; then
+            # Extract subdomains from URLs, filter to in-scope, deduplicate
+            extract_domains "$wm_urls" waymore_all_domains.txt || true
+            local escaped_domain="${domain//./\\.}"
+            grep -E "(^|\.)${escaped_domain}$" waymore_all_domains.txt | sort -u > waymore_subdomains.txt || true
+
+            local wm_count=0
+            [[ -s waymore_subdomains.txt ]] && wm_count=$(wc -l < waymore_subdomains.txt)
+            log_success "Waymore: found $wm_count in-scope subdomains from $(wc -l < "$wm_urls") URLs"
+
+            # Add newly discovered subdomains to canonical DNS dataset
+            [[ -s waymore_subdomains.txt ]] && canonical_dns_add_sources "waymore" "waymore_subdomains.txt"
+        else
+            log_info "Waymore: no URLs discovered for $domain"
+        fi
+    else
+        log_warn "Waymore not found, skipping historical reconnaissance"
+    fi
+
+    # ── Stage 3: Consolidate + DNSx Canonical Resolution + HTTPx Round 1 ────
+    log_info "Stage 3: Consolidating passive results + DNSx resolution + HTTPx Round 1"
+
+    # Merge all discovered subdomains so far
     cat \
-        cero_results.txt \
-        subfinder_results.txt \
-        assetfinder_results.txt \
-        gau_results.txt \
-        sublist3r_results.txt \
-        github_subdomains_results.txt \
+        subfaster_results.txt \
+        crtname_results.txt \
+        waymore_subdomains.txt \
         2>/dev/null | sort -u > all_subdomains_round1.txt || true
 
     if [[ -s all_subdomains_round1.txt ]]; then
-        log_success "Subdomains from scraping: $(wc -l < all_subdomains_round1.txt)"
-        httpx_probe all_subdomains_round1.txt httpx_results_round1.json
-        # `|| true`: jq exits non-zero on a malformed JSONL line; that must
-        # not abort the run under set -e (this `&&` list ends with the jq
-        # pipeline, so its failure WOULD trigger set -e).
-        [[ -s httpx_results_round1.json ]] && jq -r '.url' httpx_results_round1.json | sort -u > live_subdomains_round1.txt || true
+        log_success "Subdomains from passive enumeration: $(wc -l < all_subdomains_round1.txt)"
+
+        # Resolve all pending hostnames through DNSx into the canonical dataset
+        canonical_dns_resolve_pending
+
+        # Extract resolved hostnames for HTTPx probing
+        canonical_dns_extract_resolved > live_candidates_round1.txt || true
+
+        if [[ -s live_candidates_round1.txt ]]; then
+            httpx_probe live_candidates_round1.txt httpx_results_round1.json
+            [[ -s httpx_results_round1.json ]] && jq -r '.url' httpx_results_round1.json | sort -u > live_subdomains_round1.txt || true
+        else
+            log_warn "No resolved subdomains to probe with HTTPx"
+            : > live_subdomains_round1.txt
+        fi
     else
-        log_warn "No subdomains found from scraping for $domain"
+        log_warn "No subdomains found from passive enumeration for $domain"
         cd "$pdir" || return 1
         return 0
     fi
 
-    # ── Stage 3: Brute Force with Custom Wordlist ──────────────────────────
-    log_info "Stage 3: Brute force subdomain discovery"
+    # ── Stage 4: Brute Force with Custom Wordlist ──────────────────────────
+    log_info "Stage 4: Brute force subdomain discovery"
 
-    # Step 3a: Generate custom wordlist with CeWL
+    # Step 4a: Generate custom wordlist with CeWL
     mkdir -p wordlists
     : > wordlists/custom_wordlist.txt
 
     if [[ -s live_subdomains_round1.txt ]] && command -v cewl &>/dev/null; then
         # Per-host worker: crawl one URL for words into its own temp file so
-        # concurrent CeWL processes never contend on a shared file. The depth-2
-        # / depth-1 retry logic is preserved verbatim inside the worker.
+        # concurrent CeWL processes never contend on a shared file.
         local _cewl_tmpdir="wordlists/.perhost"
         mkdir -p "$_cewl_tmpdir"; rm -f "$_cewl_tmpdir"/*
 
@@ -351,21 +313,7 @@ WORDBASE
 
     log_info "Wordlist size: $(wc -l < wordlists/custom_wordlist.txt) unique words (CeWL-filtered)"
 
-    # Step 3b: ShuffleDNS brute force
-    # Per https://github.com/projectdiscovery/shuffledns:
-    #   -d <domain>     target domain (only mode where wildcard filtering works)
-    #   -w <wordlist>   words to permute against the domain
-    #   -r <resolvers>  file of trusted DNS resolvers used by the underlying massdns
-    #   -mode bruteforce enumerate via DNS brute force
-    #   -sw             strict wildcard check (filters multi-level wildcard pollution)
-    #   -t              concurrent massdns resolves (default 10000)
-    #   -o              output file
-    #   -duc            disable update check (avoids any first-run network call
-    #                   to projectdiscovery's release server)
-    #   -wt N           concurrent wildcard-check threads (default 250)
-    # massdns must be installed in the image (added to the Dockerfile);
-    # shuffledns does NOT ship its own copy and silently produces 0 output
-    # if /usr/bin/massdns or /usr/local/bin/massdns isn't on PATH.
+    # Step 4b: ShuffleDNS brute force
     if command -v shuffledns &>/dev/null; then
         if ! command -v massdns &>/dev/null; then
             log_warn "massdns not found on PATH — ShuffleDNS brute force will produce 0 results. Re-build the Docker image to include massdns."
@@ -377,10 +325,6 @@ WORDBASE
 
         log_info "Running ShuffleDNS brute force on $(wc -l < wordlists/custom_wordlist.txt) words against $domain..."
 
-        # Capture stderr AND stdout: shuffledns writes subdomains to -o on
-        # success but its diagnostic info (massdns progress, errors) goes
-        # to stderr. We stream both to a debug log so a "0 results" outcome
-        # is always explainable, even when -o is empty.
         local shuffledns_log="shuffledns.debug.log"
         : > "$shuffledns_log"
         local shuffledns_exit=0
@@ -397,8 +341,6 @@ WORDBASE
 
         if [[ "$shuffledns_exit" -ne 0 ]]; then
             log_warn "ShuffleDNS exited with code ${shuffledns_exit} — see ${shuffledns_log}"
-            # Surface a tail of the log to stdout so the user can see
-            # what happened without opening the file.
             tail -5 "$shuffledns_log" 2>/dev/null | sed 's/^/    /'
         fi
 
@@ -407,9 +349,6 @@ WORDBASE
             bf_count=$(wc -l < shuffledns_results.txt)
             log_success "Subdomains from brute force: ${bf_count} (see ${shuffledns_log})"
         elif [[ -s "$shuffledns_log" ]]; then
-            # Distinguish "ran fine, found nothing" from "didn't run" — the
-            # log tells us which one. Sample up to 3 lines so the user can
-            # immediately tell whether massdns crashed or just had no hits.
             log_info "ShuffleDNS: no output file produced. Last log lines:"
             tail -3 "$shuffledns_log" 2>/dev/null | sed 's/^/    /'
         else
@@ -419,43 +358,48 @@ WORDBASE
         log_warn "ShuffleDNS not found, skipping brute force"
     fi
 
-    # comm (Stage 4 below) requires BOTH inputs sorted, but shuffledns -o
+    # comm (Stage 5 below) requires BOTH inputs sorted, but shuffledns -o
     # output is in massdns discovery order — NOT sorted. Sorting it in place
-    # here fixes the "comm: file 2 is not in sorted order" error, which was
-    # producing a wrong new-vs-known set (it reported 8 "new" hosts when the
-    # true number was 0, and on other targets can silently DROP genuinely
-    # new hosts so they're never probed).
+    # here fixes the "comm: file 2 is not in sorted order" error.
     if [[ -s shuffledns_results.txt ]]; then
         sort -u shuffledns_results.txt -o shuffledns_results.txt || true
     fi
 
-    # ── Stage 4: Consolidate & HTTPx Round 2 ────────────────────────────────
-    log_info "Stage 4: Consolidate + HTTPx Round 2"
+    # Add ShuffleDNS results to canonical DNS dataset
+    [[ -s shuffledns_results.txt ]] && canonical_dns_add_sources "shuffledns" "shuffledns_results.txt"
 
-    # Build the full set so far (round-1 scraping + brute force).
+    # ── Stage 5: Consolidate + DNSx Delta Resolution + HTTPx Round 2 ───────
+    log_info "Stage 5: Consolidate + DNSx delta resolution + HTTPx Round 2"
+
+    # Build the full set so far (round-1 passive + brute force).
     cat all_subdomains_round1.txt shuffledns_results.txt 2>/dev/null | \
         sort -u > all_subdomains_round2.txt || true
 
     # Compute ONLY the newly discovered subdomains from brute force so we don't
-    # re-probe the entire round-1 set with httpx again.
+    # re-probe the entire round-1 set with HTTPx again.
     local new_only_subs=0
     : > new_subdomains_round2.txt
     if [[ -s all_subdomains_round1.txt && -s shuffledns_results.txt ]]; then
         comm -13 all_subdomains_round1.txt shuffledns_results.txt \
             > new_subdomains_round2.txt || true
     elif [[ -s shuffledns_results.txt ]]; then
-        # No round-1 set (unusual); treat brute-force result as the new set.
         cp shuffledns_results.txt new_subdomains_round2.txt
     fi
     [[ -s new_subdomains_round2.txt ]] && new_only_subs=$(wc -l < new_subdomains_round2.txt)
     log_success "New subdomains from brute force: $new_only_subs"
 
+    # Resolve newly discovered hostnames through DNSx
     if [[ "$new_only_subs" -gt 0 ]]; then
-        # Probe ONLY the newly discovered subdomains. We append the new live
-        # servers to the round-1 live set to produce the round-2 live set,
-        # so crawling (Stage 5) and final consolidation (Stage 6) still see
-        # the union of all live hosts.
-        httpx_probe new_subdomains_round2.txt httpx_results_round2.json
+        canonical_dns_resolve_pending
+
+        # Extract resolved hostnames for HTTPx probing
+        canonical_dns_extract_resolved > live_candidates_round2.txt || true
+
+        # Probe ONLY the newly discovered subdomains that resolved
+        if [[ -s new_subdomains_round2.txt ]]; then
+            httpx_probe new_subdomains_round2.txt httpx_results_round2.json
+        fi
+
         if [[ -s httpx_results_round2.json ]]; then
             jq -r '.url' httpx_results_round2.json | sort -u > new_live_subdomains_round2.txt || true
         else
@@ -465,9 +409,7 @@ WORDBASE
         cat live_subdomains_round1.txt new_live_subdomains_round2.txt 2>/dev/null | \
             sort -u > live_subdomains_round2.txt || true
 
-        # Preserve a merged JSON for downstream consumers/debugging.
-        # NOTE: we cannot use `cat a b > b` because the redirection truncates
-        # the second input before cat reads it. Read into a temp file first.
+        # Merge JSON for downstream consumers/debugging.
         cat httpx_results_round1.json httpx_results_round2.json 2>/dev/null \
             > httpx_results_round2.json.tmp || true
         mv -f httpx_results_round2.json.tmp httpx_results_round2.json
@@ -477,93 +419,91 @@ WORDBASE
         cp httpx_results_round1.json httpx_results_round2.json 2>/dev/null || : > httpx_results_round2.json
     fi
 
-    # ── Stage 5: Web Crawling ───────────────────────────────────────────────
-    log_info "Stage 5: Web Crawling & JS Link Discovery"
+    # ── Stage 6: Web Crawling + JavaScript Analysis ────────────────────────
+    log_info "Stage 6: Web Crawling & JavaScript Analysis"
 
-    # GoSpider
-    # Per https://github.com/jaeles-project/gospider:
-    #   -s URL    site to crawl
-    #   -c N      per-domain concurrency (default 5)
-    #   -d N      max depth (0 = infinite; default 1) — we use 3
-    #   -t N      parallel threads across sites (default 1) — we use 3
-    #   -k N      fixed delay between requests (sec)
-    #   -K N      randomized extra delay on top of -k (sec)
-    #   -m N      per-request timeout in seconds (gospider's letter M = timeout,
-    #             NOT max pages; easy to mis-read)
-    #   -a -w -r  pull URLs from Archive.org / CommonCrawl / VirusTotal /
-    #             AlienVault; include subdomains found in 3rd-party; crawl
-    #             those URLs too. Together they cover sources outside the seed.
-    #   --js      run linkfinder on JS files (default true; explicit for clarity)
-    #   --sitemap --robots: try those for additional URLs (default true; explicit)
-    # Each host is wrapped in `timeout` so a single slow / never-responds
-    # URL can't stall the stage for hours (gospider is single-threaded per
-    # host; -m 30 only caps the request timeout, not the overall crawl).
-    if command -v gospider &>/dev/null && [[ -s live_subdomains_round2.txt ]]; then
-        mkdir -p gospider
-        : > gospider/raw_output.txt
-        # -- fix: prior version reported `${gs_hosts}` (the bash loop counter over
-        # live_subdomains_round2.txt) as the "hosts crawled" number. That was
-        # misleading in two ways: (a) gospider can internally follow `-a -w -r`
-        # (Wayback/CommonCrawl/VirusTotal/AlienVault) subdomains, so the number
-        # of distinct `input` URLs gospider emitted in its JSON output can exceed
-        # the number of seeds we fed it; (b) if the outer loop gets cut short by
-        # a timeout/pipefail glitch, the bash counter understates reality. We
-        # now report both numbers so any future divergence is visible.
-        # Per-host worker: run GoSpider on one URL into its own temp file.
-        # `< /dev/null` is CRITICAL (see old comment): gospider reads extra
-        # crawl targets from any non-TTY stdin, merged with -s.
-        _gospider_one_host() {
-            local url="$1"
-            local out="gospider/$(_safe_name "$url").jsonl"
-            timeout "${GOSPIDER_TIMEOUT:-600}" gospider -s "$url" -c 10 -d 3 -t 1 -k 1 -K 2 -m 30 \
-                --blacklist ".(jpg|jpeg|gif|css|tif|tiff|png|ttf|woff|woff2|ico|svg)" \
-                -a -w -r --js --sitemap --robots --json -v < /dev/null > "$out" 2>/dev/null || true
+    # Katana (replaces GoSpider)
+    # Per https://github.com/projectdiscovery/katana README:
+    #   -u URL       seed URL to crawl
+    #   -d N         max depth (we use 3)
+    #   -jc          parse endpoints from JS files (default off)
+    #   -j           emit JSON Lines
+    #   -timeout N   per-HTTP-request timeout (default 10s)
+    #   -c N         concurrent fetchers per target
+    #   -p N         concurrent input targets (1 — we iterate per-URL)
+    #   -retry N     retries per failed request
+    #   -rd N        per-request delay (politeness)
+    #   -rl N        global rate-limit (req/s)
+    #   -ct DURATION wall-clock cap for the whole crawl (s/m/h suffix)
+    #   -ob -or      omit response body and raw request/response from JSONL
+    #   -silent      suppress banner and progress
+    if command -v katana &>/dev/null && [[ -s live_subdomains_round2.txt ]]; then
+        mkdir -p katana
+        : > katana/raw_output.jsonl
+        local ka_tmp="katana/.perhost"
+        mkdir -p "$ka_tmp"; rm -f "$ka_tmp"/*
+
+        _katana_one_host() {
+            local url="$1" tag
+            tag="$(_safe_name "$url")"
+            timeout "${KATANA_TIMEOUT:-600}" katana -u "$url" -d 3 -jc -j \
+                -ob -or \
+                -timeout 30 -c 20 -p 1 \
+                -retry 2 -rd 1 -rl 10 \
+                -ct "${KATANA_CRAWL_DURATION:-30m}" \
+                -silent \
+                < /dev/null > "${ka_tmp}/${tag}.jsonl" 2>/dev/null || true
         }
 
-        log_info "GoSpider: crawling $(wc -l < live_subdomains_round2.txt) hosts (${PARALLEL_HOSTS:-5} in parallel)..."
-        bounded_parallel "${PARALLEL_HOSTS:-5}" live_subdomains_round2.txt _gospider_one_host
-        cat gospider/*.jsonl 2>/dev/null > gospider/raw_output.txt || : > gospider/raw_output.txt
+        log_info "Katana: crawling $(wc -l < live_subdomains_round2.txt) hosts (per-host cap ${KATANA_CRAWL_DURATION:-30m}, ${PARALLEL_HOSTS:-5} in parallel)..."
+        bounded_parallel "${PARALLEL_HOSTS:-5}" live_subdomains_round2.txt _katana_one_host
 
-        if [[ -s gospider/raw_output.txt ]]; then
-            # Count distinct `input` hosts actually processed by gospider
-            # (from its JSON output), including those pulled via -a -w -r.
-            local gs_actual_hosts gs_loop_count
-            gs_actual_hosts=$( { grep -oE '"input":"[^"]+"' gospider/raw_output.txt 2>/dev/null || true; } | sort -u | wc -l | tr -d ' ')
-            gs_loop_count=$(wc -l < live_subdomains_round2.txt | tr -d ' ')
-            [[ -z "$gs_actual_hosts" ]] && gs_actual_hosts=0
+        cat "$ka_tmp"/*.jsonl 2>/dev/null > katana/raw_output.jsonl || : > katana/raw_output.jsonl
+        rm -f "$ka_tmp"/*.jsonl
 
-            extract_domains gospider/raw_output.txt gospider/all_domains.txt
-            grep -E "(^|\.)${domain//./\\.}$" gospider/all_domains.txt | sort -u > gospider_subdomains.txt || true
-            if [[ -s gospider_subdomains.txt ]]; then
-                log_success "GoSpider subdomains (${gs_actual_hosts} hosts crawled across ${gs_loop_count} seeds): $(wc -l < gospider_subdomains.txt)"
-            else
-                log_info "GoSpider: crawled ${gs_actual_hosts} hosts across ${gs_loop_count} seeds, no $domain subdomains discovered"
-            fi
+        if [[ -s katana/raw_output.jsonl ]]; then
+            local ka_lines ka_hosts_count
+            ka_lines=$(wc -l < katana/raw_output.jsonl | tr -d ' ')
+            ka_hosts_count=$(wc -l < live_subdomains_round2.txt | tr -d ' ')
+
+            # Discovered URLs (preserve separately from hostnames)
+            grep -oE 'https?://[^"'"'"' ]+' katana/raw_output.jsonl 2>/dev/null | \
+                sort -u > katana/discovered_urls.txt || true
+
+            # Discovered hosts (domain-level)
+            extract_domains katana/raw_output.jsonl katana/all_domains.txt || true
+            local escaped_domain="${domain//./\\.}"
+            grep -E "(^|\.)${escaped_domain}$" katana/all_domains.txt | sort -u > katana/discovered_hosts.txt || true
+
+            # JavaScript assets (from -jc flag)
+            jq -r 'select(.javascript != null) | .javascript[]? | select(. != null)' katana/raw_output.jsonl 2>/dev/null | \
+                sort -u > katana/javascript_assets.txt || true
+
+            local ka_sub_count=0
+            [[ -s katana/discovered_hosts.txt ]] && ka_sub_count=$(wc -l < katana/discovered_hosts.txt)
+            log_success "Katana: ${ka_lines} JSON lines, ${ka_sub_count} in-scope subdomains, $(wc -l < katana/discovered_urls.txt 2>/dev/null || echo 0) URLs, $(wc -l < katana/javascript_assets.txt 2>/dev/null || echo 0) JS assets across ${ka_hosts_count} hosts"
+
+            # Add newly discovered hosts to canonical DNS dataset
+            [[ -s katana/discovered_hosts.txt ]] && canonical_dns_add_sources "katana" "katana/discovered_hosts.txt"
         else
-            local gs_loop_count
-            gs_loop_count=$(wc -l < live_subdomains_round2.txt | tr -d ' ')
-            log_info "GoSpider: scanned ${gs_loop_count} seeds, no output captured"
+            local ka_hosts_count
+            ka_hosts_count=$(wc -l < live_subdomains_round2.txt | tr -d ' ')
+            log_info "Katana: scanned ${ka_hosts_count} seeds, no output captured"
         fi
-        rm -f gospider/*.jsonl
+        rm -rf "$ka_tmp"
+    else
+        if ! command -v katana &>/dev/null; then
+            log_warn "Katana not found, skipping web crawling"
+        else
+            log_skip "Katana skipped (no live hosts to crawl)"
+        fi
     fi
 
     # Subdomainizer
     # Per https://github.com/nsonaniya2010/SubDomainizer:
     #   -u URL         target URL to scan for JS-loaded subdomains
     #   -o FILE        write results to FILE
-    #   -c COOKIE      send Cookie header (we don't pass this; no cookies)
-    #   -k             --nossl — disable SSL verification (handy for self-signed
-    #                   or wildcard subdomains that present the parent's cert)
-    # SubDomainizer prints the subdomain list to STDOUT *and* writes the
-    # same to -o. We capture BOTH stdout and the -o file so a tool that
-    # only prints (e.g. an old version, or a flag that bypasses -o) still
-    # flows into raw_output.txt.
-    #
-    # Previous bug: stdout was discarded (`2>/dev/null` only redirects
-    # stderr), which silently dropped any tool output that didn't write
-    # to the -o file. That's why subdomainizer_subdomains.txt was always
-    # empty in our runs.
-    #
+    #   -k             --nossl — disable SSL verification
     # Each per-host scan is wrapped in `timeout` so a single slow/unreachable
     # URL can't stall the whole stage for hours.
     if [[ -f /opt/tools/SubDomainizer/SubDomainizer.py ]] && [[ -s live_subdomains_round2.txt ]]; then
@@ -571,9 +511,6 @@ WORDBASE
         : > subdomainizer/raw_output.txt
         : > subdomainizer/stdout.log
 
-        # Per-host worker: run SubDomainizer on one URL. Writes -o output
-        # to a per-host temp file (avoids the shared-file race under the
-        # parallel pool). -k is --nossl; `< /dev/null` detaches stdin.
         _subdomainizer_one_host() {
             local url="$1"
             local out="subdomainizer/$(_safe_name "$url").txt"
@@ -588,7 +525,6 @@ WORDBASE
 
         cat subdomainizer/*.txt 2>/dev/null > subdomainizer/raw_output.txt || : > subdomainizer/raw_output.txt
 
-        # Dedupe the union of -o output and any stdout the tool emitted.
         if [[ -s subdomainizer/raw_output.txt ]] || [[ -s subdomainizer/stdout.log ]]; then
             local sd_hosts
             sd_hosts=$(wc -l < live_subdomains_round2.txt | tr -d ' ')
@@ -597,13 +533,22 @@ WORDBASE
                 cat subdomainizer/stdout.log 2>/dev/null
             } > /tmp/sd_combined.txt
             extract_domains /tmp/sd_combined.txt subdomainizer/all_domains.txt
-            grep -E "(^|\.)${domain//./\\.}$" subdomainizer/all_domains.txt | sort -u > subdomainizer_subdomains.txt || true
+            local escaped_domain="${domain//./\\.}"
+            grep -E "(^|\.)${escaped_domain}$" subdomainizer/all_domains.txt | sort -u > subdomainizer_subdomains.txt || true
             rm -f /tmp/sd_combined.txt
-            if [[ -s subdomainizer_subdomains.txt ]]; then
-                log_success "Subdomainizer subdomains (${sd_hosts} hosts scanned): $(wc -l < subdomainizer_subdomains.txt)"
-            else
-                log_info "Subdomainizer: ran on ${sd_hosts} hosts, no $domain subdomains discovered"
+
+            # Preserve JavaScript assets separately
+            if [[ -s subdomainizer/stdout.log ]]; then
+                grep -oE 'https?://[^"'"'"' \)]+\.js[^"'"'"' \)]*' subdomainizer/stdout.log 2>/dev/null | \
+                    sort -u > subdomainizer/javascript_assets.txt || true
             fi
+
+            local sd_count=0
+            [[ -s subdomainizer_subdomains.txt ]] && sd_count=$(wc -l < subdomainizer_subdomains.txt)
+            log_success "Subdomainizer subdomains (${sd_hosts} hosts scanned): $sd_count"
+
+            # Add newly discovered hosts to canonical DNS dataset
+            [[ -s subdomainizer_subdomains.txt ]] && canonical_dns_add_sources "subdomainizer" "subdomainizer_subdomains.txt"
         else
             local sd_hosts
             sd_hosts=$(wc -l < live_subdomains_round2.txt | tr -d ' ')
@@ -613,12 +558,12 @@ WORDBASE
         log_skip "Subdomainizer skipped (tool missing or no live hosts)"
     fi
 
-    # ── Stage 6: Final Consolidation & HTTPx Round 3 ───────────────────────
-    log_info "Stage 6: Final consolidation + HTTPx Round 3"
+    # ── Stage 7: Final Consolidation + DNSx Delta + HTTPx Round 3 ──────────
+    log_info "Stage 7: Final consolidation + DNSx delta resolution + HTTPx Round 3"
 
     cat \
         all_subdomains_round2.txt \
-        gospider_subdomains.txt \
+        katana/discovered_hosts.txt \
         subdomainizer_subdomains.txt \
         2>/dev/null | sort -u > all_subdomains_final.txt || true
 
@@ -626,9 +571,15 @@ WORDBASE
     [[ -s all_subdomains_final.txt ]] && total_subs=$(wc -l < all_subdomains_final.txt)
     log_success "Total unique subdomains for $domain: $total_subs"
 
-    # Probe ONLY the subdomains discovered since Round 2 (i.e., crawling
-    # candidates that aren't already in all_subdomains_round2.txt). Merge
-    # their live URLs with the Round 2 live set.
+    # Add any newly discovered subdomains from crawling to the canonical dataset
+    [[ -s all_subdomains_final.txt ]] && canonical_dns_add_sources "final" "all_subdomains_final.txt"
+
+    # Resolve any remaining pending hostnames
+    canonical_dns_resolve_pending
+
+    # Probe ONLY the subdomains discovered since Round 2 (crawling
+    # candidates that aren't already probed). Merge their live URLs with
+    # the Round 2 live set.
     : > new_subdomains_final.txt
     if [[ -s all_subdomains_round2.txt ]]; then
         comm -13 all_subdomains_round2.txt all_subdomains_final.txt \
@@ -647,8 +598,7 @@ WORDBASE
         fi
         cat live_subdomains_round2.txt new_live_subdomains_final.txt 2>/dev/null | \
             sort -u > live_subdomains_final.txt || true
-        # Merge JSON for downstream/debug consumers. Same redirect-safety
-        # caveat as Stage 4: write to a tmp file first, then atomic-rename.
+        # Merge JSON for downstream/debug consumers.
         cat httpx_results_round2.json httpx_results_final.json 2>/dev/null \
             > httpx_results_final.json.tmp || true
         mv -f httpx_results_final.json.tmp httpx_results_final.json
