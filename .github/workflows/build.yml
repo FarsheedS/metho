@@ -2,6 +2,16 @@ name: build-docker
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'Dockerfile'
+      - 'lib/**'
+      - 'config/**'
+      - 'wordlists/**'
+      - 'recon.sh'
+      - 'entrypoint.sh'
 
 jobs:
   build:
@@ -20,10 +30,42 @@ jobs:
 
       - name: Build Docker image
         run: |
-          IMAGE_NAME=ghcr.io/${{ github.repository_owner }}/metho:latest
-          docker build -t $IMAGE_NAME .
+          docker build -t ghcr.io/${{ github.repository_owner }}/metho:latest \
+                       -t ghcr.io/${{ github.repository_owner }}/metho:${{ github.sha }} \
+                       .
+
+      - name: Verify runtime binaries
+        run: |
+          docker run --rm ghcr.io/${{ github.repository_owner }}/metho:latest \
+            sh -c 'subfaster -h 2>/dev/null | head -1 && \
+                   httpx -h 2>/dev/null | head -1 && \
+                   katana -h 2>/dev/null | head -1 && \
+                   dnsx -h 2>/dev/null | head -1 && \
+                   shuffledns -h 2>/dev/null | head -1 && \
+                   massdns --help 2>/dev/null | head -1 && \
+                   waymore --help 2>/dev/null | head -1 && \
+                   echo "All runtime binaries OK"'
+
+      - name: Verify pipeline scripts
+        run: |
+          docker run --rm ghcr.io/${{ github.repository_owner }}/metho:latest \
+            sh -c 'bash -n /opt/scripts/recon.sh && \
+                   bash -n /opt/scripts/lib/utils.sh && \
+                   bash -n /opt/scripts/lib/phase1.sh && \
+                   bash -n /opt/scripts/lib/phase2.sh && \
+                   bash -n /opt/scripts/lib/phase3.sh && \
+                   bash -n /opt/scripts/lib/consolidate.sh && \
+                   bash -n /opt/scripts/lib/canonical_dns.sh && \
+                   bash -n /opt/scripts/lib/classify.sh && \
+                   bash -n /opt/scripts/config/asn_providers.sh && \
+                   echo "All scripts OK"'
+
+      - name: Print image size
+        run: |
+          IMAGE_SIZE=$(docker images ghcr.io/${{ github.repository_owner }}/metho:latest --format "{{.Size}}")
+          echo "Image size: ${IMAGE_SIZE}"
 
       - name: Push image
         run: |
-          IMAGE_NAME=ghcr.io/${{ github.repository_owner }}/metho:latest
-          docker push $IMAGE_NAME
+          docker push ghcr.io/${{ github.repository_owner }}/metho:latest
+          docker push ghcr.io/${{ github.repository_owner }}/metho:${{ github.sha }}
