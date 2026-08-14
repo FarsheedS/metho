@@ -18,26 +18,24 @@
 # Names are matched case-insensitively as substrings of the ASN org field.
 
 # ── CDN ────────────────────────────────────────────────────────────────────────
-# Content Delivery Networks and reverse-proxy/WAF providers.
-# IPs behind these ASNs are almost always shared-edge nodes, not origin servers.
+# Content Delivery Networks, reverse-proxy and WAF/edge providers.
+# IPs behind these ASNs are almost always shared-edge nodes, not origin
+# servers. Broad hyperscaler ASNs (e.g. Azure AS8075, AWS, Alibaba) are
+# intentionally NOT listed here even though those providers also operate CDN
+# services — they are classified as "cloud" instead. Actual CDN/WAF/edge
+# endpoints are still caught by Rule 1 when HTTPX reports CDN=true, regardless
+# of which ASN they live on.
 CDN_ASNS=(
     "AS13335"    # Cloudflare
     "AS54113"    # Fastly
     "AS20940"    # Akamai Technologies
     "AS16625"    # Akamai Technologies (Prolexic)
     "AS12222"    # Akamai Technologies
-    "AS53913"    # Akamai Technologies (Tencent cloud)
-    "AS8075"     # Microsoft/Azure CDN (also Azure cloud; CDN takes priority)
-    "AS7604"     # Alibaba CDN
-    "AS20446"    # Highwinds/StackPath
+    "AS20446"    # Highwinds / StackPath
     "AS30081"    # CacheNetworks
-    "AS8001"     # Netrail/Akamai
-    "AS46606"    # Tumblr (Verizon Media CDN)
-    "AS19551"    # Incapsula/Imperva CDN
-    "AS53667"    # FranTech (VPN/proxy hosting)
+    "AS19551"    # Incapsula / Imperva
     "AS62597"    # Nexusguard (DDoS protection CDN)
     "AS200023"   # Qrator (DDoS protection CDN)
-    "AS16265"    # Leaseweb CDN
 )
 
 CDN_PROVIDER_NAMES=(
@@ -52,7 +50,6 @@ CDN_PROVIDER_NAMES=(
     "verizon digital media"
     "cedexis"
     "chinanetcenter"
-    "qrcode"
     "nexusguard"
     "qrator"
     "arvancloud"
@@ -63,13 +60,16 @@ CDN_PROVIDER_NAMES=(
 )
 
 # ── Cloud Providers ───────────────────────────────────────────────────────────
-# Major cloud hosting providers (AWS, GCP, Azure, etc.).
-# These ASNs host actual customer infrastructure, not CDN edge nodes.
+# Major cloud / hyperscaler hosting providers (AWS, GCP, Azure, etc.).
+# These ASNs host actual customer infrastructure, not CDN edge nodes. Broad
+# hyperscaler ASNs live here even when the provider also offers CDN services —
+# CDN classification for those is left to HTTPX's explicit CDN detection
+# (Rule 1), not to the ASN.
 CLOUD_ASNS=(
     "AS14618"    # Amazon/AWS
     "AS16509"    # Amazon/AWS
     "AS15169"    # Google Cloud
-    "AS8075"     # Microsoft/Azure (also CDN; CDN takes priority)
+    "AS8075"     # Microsoft/Azure
     "AS14061"    # DigitalOcean
     "AS20473"    # Vultr
     "AS63949"    # Linode (Akamai)
@@ -87,6 +87,8 @@ CLOUD_ASNS=(
     "AS37963"    # Alibaba Cloud
     "AS45090"    # Alibaba Cloud (CN)
     "AS7552"     # Alibaba Cloud (AP)
+    "AS7604"     # Alibaba (US) — hyperscaler, not CDN edge
+    "AS53913"    # Tencent Cloud — hyperscaler, not CDN edge
 )
 
 CLOUD_PROVIDER_NAMES=(
@@ -122,48 +124,28 @@ CLOUD_PROVIDER_NAMES=(
 )
 
 # ── Dedicated Hosting ──────────────────────────────────────────────────────────
-# Hosting providers that typically offer dedicated servers or VPS.
-# These are not CDNs and not hyperscale clouds — they're single-tenant servers.
+# Providers that typically offer dedicated servers or bare-metal/VPS hosting
+# and are NOT already covered by the cloud category. Generic ISP/carrier ASNs
+# (Comcast, Charter/Spectrum, China Telecom/Unicom/Mobile, etc.) are
+# intentionally excluded — they are transit/access networks, not hosting
+# providers. Providers that are already classified as cloud (Hetzner, OVH,
+# Vultr, Contabo, Leaseweb, Scaleway, IONOS, …) are omitted here too: cloud is
+# checked before dedicated, so those entries were dead weight. "unknown"
+# remains the fallback rather than guessing.
 DEDICATED_ASNS=(
-    "AS24940"    # Hetzner (also in cloud; cloud takes priority for overlap)
-    "AS16276"    # OVH (also in cloud; cloud takes priority for overlap)
-    "AS20473"    # Vultr (also in cloud; cloud takes priority for overlap)
-    "AS62041"    # Contabo (also in cloud; cloud takes priority for overlap)
-    "AS60626"    # Leaseweb (also in cloud; cloud takes priority for overlap)
-    "AS12876"    # Online SAS / Scaleway (also in cloud; cloud takes priority)
-    "AS8560"     # IONOS / 1&1 (also in cloud; cloud takes priority for overlap)
-    "AS51167"    # Contabo
-    "AS213230"   # Datacamp/PYTHON
-    "AS212238"   # Datacamp/PYTHON
-    "AS7922"     # Comcast
-    "AS11427"    # Charter/Spectrum
-    "AS20001"    # Charter/Spectrum
-    "AS10796"    # Charter/Spectrum
-    "AS10318"    # China Telecom
-    "AS4134"     # China Telecom
-    "AS4837"     # China Unicom
-    "AS9808"     # China Mobile
-    "AS58466"    # China Mobile
+    "AS53667"    # FranTech / BuyVM (Choopa) — VPS/bare-metal
+    "AS51167"    # Contabo (secondary)
+    "AS213230"   # Datacamp / PYTHON
+    "AS212238"   # Datacamp / PYTHON
 )
 
 DEDICATED_PROVIDER_NAMES=(
-    "hetzner"
-    "ovh"
-    "contabo"
-    "leaseweb"
-    "scaleway"
-    "online sas"
-    "ionos"
-    "1and1"
-    "godaddy"
-    "digitalocean"
-    "vultr"
-    "linode"
     "datacamp"
     "choopa"
+    "buyvm"
+    "fran tech"
     "m247"
     "psychz"
-    "buyvm"
     "hostwinds"
     "hostinger"
     "dreamhost"
@@ -172,10 +154,4 @@ DEDICATED_PROVIDER_NAMES=(
     "bluehost"
     "siteground"
     "namecheap"
-    "comcast"
-    "charter"
-    "spectrum"
-    "china telecom"
-    "china unicom"
-    "china mobile"
 )

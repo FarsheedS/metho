@@ -156,7 +156,12 @@ run_phase3() {
         log_info "Stage 4: Port scanning ${nmap_count} nmap candidates (non-CDN IPs)"
 
         if command -v nmap &>/dev/null; then
-            nmap -iL "${pdir}/nmap_candidates.txt" \
+            # -Pn skips Nmap's default host-discovery (ICMP/ping) phase and
+            # treats every target IP as up. Metho already obtained valid IPs
+            # from DNS, so a host that simply doesn't answer ICMP must NOT be
+            # discarded — otherwise known candidates get silently skipped.
+            # Port-selection policy is unchanged.
+            nmap -Pn -iL "${pdir}/nmap_candidates.txt" \
                 -p 21,22,23,25,53,80,110,111,135,139,143,443,445,993,995,1433,1521,2049,3306,3389,5432,5900,5985,5986,6379,6443,8080,8443,8888,9090,9200,9443,27017 \
                 --open --min-rate 500 \
                 -oG "${pdir}/port_scan_results.txt" 2>/dev/null || true

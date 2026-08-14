@@ -18,6 +18,13 @@ run_phase1() {
     domain_count=$(wc -l < "$root_domains_file")
     log_info "═══ PHASE 1: Root Domains → Subdomains (${domain_count} domains) ═══"
 
+    # Seed every user-supplied root domain itself into the canonical dataset
+    # so the apex/root application is not missed simply because no discovery
+    # tool returns it. The apex must subsequently go through the normal DNSX
+    # and HTTPX processing like any other hostname. Its source is recorded as
+    # `root`; match_root_domain resolves each apex to itself (exact match).
+    canonical_dns_add_sources "root" "$root_domains_file"
+
     while read -r DOMAIN; do
         [[ -z "$DOMAIN" ]] && continue
         process_domain "$DOMAIN" "$pdir"
@@ -105,8 +112,8 @@ process_domain() {
     crtname_query "$domain" crtname_results.txt crtname_raw.json
 
     # Add all Stage 1 discoveries to the canonical DNS dataset
-    [[ -s subfaster_results.txt ]] && canonical_dns_add_sources "subfaster" "subfaster_results.txt"
-    [[ -s crtname_results.txt ]] && canonical_dns_add_sources "crt.name" "crtname_results.txt"
+    [[ -s subfaster_results.txt ]] && canonical_dns_add_sources "subfaster" "subfaster_results.txt" "$domain"
+    [[ -s crtname_results.txt ]] && canonical_dns_add_sources "crt.name" "crtname_results.txt" "$domain"
 
     # ── Stage 2: Historical Recon (Waymore) ─────────────────────────────────
     # Waymore operates on ROOT DOMAINS ONLY — it fetches historical URLs and
@@ -138,7 +145,7 @@ process_domain() {
             log_success "Waymore: found $wm_count in-scope subdomains from $(wc -l < "$wm_urls") URLs"
 
             # Add newly discovered subdomains to canonical DNS dataset
-            [[ -s waymore_subdomains.txt ]] && canonical_dns_add_sources "waymore" "waymore_subdomains.txt"
+            [[ -s waymore_subdomains.txt ]] && canonical_dns_add_sources "waymore" "waymore_subdomains.txt" "$domain"
         else
             log_info "Waymore: no URLs discovered for $domain"
         fi
@@ -366,7 +373,7 @@ WORDBASE
     fi
 
     # Add ShuffleDNS results to canonical DNS dataset
-    [[ -s shuffledns_results.txt ]] && canonical_dns_add_sources "shuffledns" "shuffledns_results.txt"
+    [[ -s shuffledns_results.txt ]] && canonical_dns_add_sources "shuffledns" "shuffledns_results.txt" "$domain"
 
     # ── Stage 5: Consolidate + DNSx Delta Resolution + HTTPx Round 2 ───────
     log_info "Stage 5: Consolidate + DNSx delta resolution + HTTPx Round 2"
@@ -484,7 +491,7 @@ WORDBASE
             log_success "Katana: ${ka_lines} JSON lines, ${ka_sub_count} in-scope subdomains, $(wc -l < katana/discovered_urls.txt 2>/dev/null || echo 0) URLs, $(wc -l < katana/javascript_assets.txt 2>/dev/null || echo 0) JS assets across ${ka_hosts_count} hosts"
 
             # Add newly discovered hosts to canonical DNS dataset
-            [[ -s katana/discovered_hosts.txt ]] && canonical_dns_add_sources "katana" "katana/discovered_hosts.txt"
+            [[ -s katana/discovered_hosts.txt ]] && canonical_dns_add_sources "katana" "katana/discovered_hosts.txt" "$domain"
         else
             local ka_hosts_count
             ka_hosts_count=$(wc -l < live_subdomains_round2.txt | tr -d ' ')
@@ -548,7 +555,7 @@ WORDBASE
             log_success "Subdomainizer subdomains (${sd_hosts} hosts scanned): $sd_count"
 
             # Add newly discovered hosts to canonical DNS dataset
-            [[ -s subdomainizer_subdomains.txt ]] && canonical_dns_add_sources "subdomainizer" "subdomainizer_subdomains.txt"
+            [[ -s subdomainizer_subdomains.txt ]] && canonical_dns_add_sources "subdomainizer" "subdomainizer_subdomains.txt" "$domain"
         else
             local sd_hosts
             sd_hosts=$(wc -l < live_subdomains_round2.txt | tr -d ' ')
@@ -572,7 +579,7 @@ WORDBASE
     log_success "Total unique subdomains for $domain: $total_subs"
 
     # Add any newly discovered subdomains from crawling to the canonical dataset
-    [[ -s all_subdomains_final.txt ]] && canonical_dns_add_sources "final" "all_subdomains_final.txt"
+    [[ -s all_subdomains_final.txt ]] && canonical_dns_add_sources "final" "all_subdomains_final.txt" "$domain"
 
     # Resolve any remaining pending hostnames
     canonical_dns_resolve_pending

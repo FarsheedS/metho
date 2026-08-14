@@ -34,16 +34,56 @@ normalize_hostname() {
     echo "$1" | sed 's/^\*\.//; s/\.$//' | tr '[:upper:]' '[:lower:]'
 }
 
+# ── Match a hostname to a known root domain ───────────────────────────────────
+# match_root_domain <hostname>
+#
+# Returns the known root domain that <hostname> belongs to: either an exact
+# match or a suffix match (".root_domain"). Reads the list of user-supplied
+# root domains from ROOT_DOMAINS_FILE. Returns empty string if no known root
+# domain matches.
+#
+# We deliberately do NOT infer the root domain from the hostname's last two
+# labels — that breaks ccTLDs such as "example.co.uk" (→ "co.uk") and
+# "example.com.au" (→ "com.au"). The root domain is taken from the set
+# supplied to Metho instead.
+match_root_domain() {
+    local host="$1"
+    [[ -z "$host" ]] && { echo ""; return; }
+    [[ -z "${ROOT_DOMAINS_FILE:-}" || ! -s "$ROOT_DOMAINS_FILE" ]] && { echo ""; return; }
+
+    local rd
+    while IFS= read -r rd; do
+        [[ -z "$rd" ]] && continue
+        rd=$(normalize_hostname "$rd")
+        [[ -z "$rd" ]] && continue
+        # Exact match (the root domain itself) or suffix match (a subdomain).
+        if [[ "$host" == "$rd" || "$host" == *".${rd}" ]]; then
+            echo "$rd"
+            return
+        fi
+    done < "$ROOT_DOMAINS_FILE"
+
+    echo ""
+}
+
 # ── Add hostnames with their source ───────────────────────────────────────────
 # canonical_dns_add_sources <source_name> <hostnames_file> [root_domain]
 #
 # Reads hostnames from <hostnames_file> (one per line, already filtered to
 # in-scope), normalizes them, and adds them to the canonical TSV.
 #   - New hostnames get resolution_status=pending and the given source.
-#   - Existing hostnames get the source appended to discovery_sources (deduped).
-#   - If root_domain is not given, it is derived from the hostname.
+#   - Existing hostnames get the source appended to discovery_sources (deduped)
+#     — the source is retained and merged, never overwritten.
+#   - If <root_domain> is given, every hostname is assigned to it. This is the
+#     preferred path when the caller already knows the root domain (e.g. inside
+#     process_domain, where it is the domain being processed).
+#   - Otherwise the root domain is matched against the known root domains
+#     supplied to Metho (see match_root_domain). A hostname that matches no
+#     known root domain (e.g. an out-of-scope cloud CNAME target) is still
+#     added but with an empty root_domain — the root domain is NEVER inferred
+#     from the hostname's labels.
 canonical_dns_add_sources() {
-    local source="$1" hostnames_file="$2"
+    local source="$1" hostnames_file="$2" explicit_root="${3:-}"
     local tsv="${OUTPUT_DIR}/canonical_dns.tsv"
 
     if [[ ! -s "$hostnames_file" ]]; then
@@ -64,27 +104,49 @@ canonical_dns_add_sources() {
         host=$(normalize_hostname "$raw_host")
         [[ -z "$host" ]] && continue
 
-        # Derive root_domain: the last two labels of the hostname.
-        # This works for e.g. "sub.example.com" → "example.com".
-        # For single-label hosts (rare), use the host itself.
-        local root_domain
-        root_domain=$(echo "$host" | awk -F. '{if(NF>=2) print $(NF-1)"."$NF; else print $0}')
+        # Resolve the root domain: explicit argument wins, otherwise match
+        # against the known root domains supplied to Metho. We never derive
+        # it from the hostname's last two labels (breaks ccTLDs).
+        local root_domain="$explicit_root"
+        if [[ -z "$root_domain" ]]; then
+            root_domain=$(match_root_domain "$host")
+        fi
+        # root_domain may legitimately be empty for out-of-scope cloud hosts;
+        # such hosts are still tracked so their IPs get resolved/classified.
 
         # Check if hostname already exists in the TSV
         local existing_line
         existing_line=$(awk -F'\t' -v h="$host" '$1 == h {print NR; exit}' "$tsv" 2>/dev/null || true)
 
         if [[ -n "$existing_line" ]]; then
-            # Hostname exists — append source to discovery_sources if not already present
-            local current_sources
+            # Hostname exists — append source to discovery_sources if not
+            # already present (sources are retained and merged, never
+            # overwritten). Also back-fill root_domain if it was previously
+            # empty (e.g. an out-of-scope cloud host later identified as
+            # in-scope); an existing non-empty root_domain is preserved.
+            local current_sources current_root
             current_sources=$(awk -F'\t' -v h="$host" '$1 == h {print $3; exit}' "$tsv")
+            current_root=$(awk -F'\t' -v h="$host" '$1 == h {print $2; exit}' "$tsv")
+
+            local source_changed=0 root_changed=0
+            local new_sources="$current_sources"
             if [[ ";${current_sources};" != *";${source};"* ]]; then
-                # Append the new source
-                local new_sources="${current_sources};${source}"
-                # Use a temp file for safe in-place editing
+                new_sources="${current_sources};${source}"
+                source_changed=1
+            fi
+            if [[ -z "$current_root" && -n "$root_domain" ]]; then
+                root_changed=1
+            fi
+
+            if (( source_changed || root_changed )); then
                 local tmp="${tsv}.tmp"
-                awk -F'\t' -v h="$host" -v s="$new_sources" -v OFS='\t' '
-                    $1 == h { $3 = s }
+                awk -F'\t' -v h="$host" -v s="$new_sources" \
+                    -v rd="$root_domain" -v rd_set="$root_changed" \
+                    -v OFS='\t' '
+                    $1 == h {
+                        $3 = s
+                        if (rd_set) $2 = rd
+                    }
                     { print }
                 ' "$tsv" > "$tmp" && mv "$tmp" "$tsv"
             fi
