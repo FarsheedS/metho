@@ -149,75 +149,42 @@ run_phase2() {
         log_warn "Cloud_Enum not found — skipping cloud brute force"
     fi
 
-    # ── Stage 3: Katana Crawling for Cloud Assets ───────────────────────────
-    # Uses Katana to crawl web apps and find cloud-hosted endpoints and URLs.
-    # Preserves discovered_urls, discovered_hosts, and javascript_assets separately.
-    if command -v katana &>/dev/null && [[ -s "$live_web_file" ]]; then
-        log_info "Stage 3: Katana crawling for cloud assets (per-host cap ${KATANA_CRAWL_DURATION:-30m})"
-        local katana_start=$(_now)
-        mkdir -p "${pdir}/katana"
-        : > "${pdir}/katana.stderr.log"
+    # ── Stage 3: Cloud Asset Extraction from Phase 1 Katana ──────────────────
+    # Instead of re-crawling the same live web servers with Katana (which Phase 1
+    # already crawled), we filter Phase 1's Katana URLs for cloud-hosted endpoints.
+    # This avoids a redundant second crawl and saves significant wall-clock time.
+    log_info "Stage 3: Extracting cloud assets from Phase 1 Katana crawl data"
+    local katana_start=$(_now)
 
-        local ka_tmp="${pdir}/katana/.perhost"
-        mkdir -p "$ka_tmp"; rm -f "$ka_tmp"/*
+    # Collect Katana URLs from all Phase 1 domain directories
+    local p1_katana_urls="${pdir}/.katana_urls.tmp"
+    : > "$p1_katana_urls"
 
-        _katana_one_host() {
-            local url="$1" tag
-            tag="$(_safe_name "$url")"
-            katana -u "$url" -d 3 -jc -j \
-                -ob -or \
-                -timeout 30 -c 20 -p 1 \
-                -retry 2 -rd 1 -rl 10 \
-                -ct "${KATANA_CRAWL_DURATION:-30m}" \
-                -silent \
-                < /dev/null > "${ka_tmp}/${tag}.jsonl" 2>>"${pdir}/katana.stderr.log" || true
-        }
-
-        log_info "  Katana: crawling $(wc -l < "$live_web_file") hosts (per-host cap ${KATANA_CRAWL_DURATION:-30m}, ${PARALLEL_HOSTS:-5} in parallel)..."
-        bounded_parallel "${PARALLEL_HOSTS:-5}" "$live_web_file" _katana_one_host
-
-        local ka_hosts
-        ka_hosts=$(wc -l < "$live_web_file" | tr -d ' ')
-
-        # Merge per-host JSONL and extract data
-        cat "$ka_tmp"/*.jsonl 2>/dev/null > "${ka_tmp}/_combined.jsonl" || : > "${ka_tmp}/_combined.jsonl"
-        rm -f "$ka_tmp"/*.jsonl
-
-        if [[ -s "${ka_tmp}/_combined.jsonl" ]]; then
-            local ka_lines ka_cloud
-            ka_lines=$(wc -l < "${ka_tmp}/_combined.jsonl" | tr -d ' ')
-
-            # Extract URLs
-            grep -oE 'https?://[^"'"'"' ]+' "${ka_tmp}/_combined.jsonl" 2>/dev/null | \
-                sort -u > "${pdir}/katana/all_urls.txt" || true
-
-            # Extract hosts
-            extract_domains "${ka_tmp}/_combined.jsonl" "${pdir}/katana/all_domains.txt" || true
-
-            # Extract JavaScript assets
-            jq -r 'select(.javascript != null) | .javascript[]? | select(. != null)' "${ka_tmp}/_combined.jsonl" 2>/dev/null | \
-                sort -u > "${pdir}/katana/javascript_assets.txt" || true
-
-            rm -f "${ka_tmp}/_combined.jsonl"
-            rmdir "$ka_tmp" 2>/dev/null || rm -rf "$ka_tmp"
-
-            filter_cloud_domains "${pdir}/katana/all_urls.txt" "${pdir}/katana_cloud_assets.txt"
-            [[ -s "${pdir}/katana_cloud_assets.txt" ]] && ka_cloud=$(wc -l < "${pdir}/katana_cloud_assets.txt") || ka_cloud=0
-
-            # Add newly discovered hosts to canonical dataset
-            [[ -s "${pdir}/katana/all_domains.txt" ]] && canonical_dns_add_sources "katana-cloud" "${pdir}/katana/all_domains.txt"
-            canonical_dns_resolve_pending
-
-            log_success "Katana: ${ka_lines} JSON lines, ${ka_cloud} cloud-related on ${ka_hosts} hosts ($(_format_duration $(($(_now) - katana_start))) total)"
-        elif [[ -s "${pdir}/katana.stderr.log" ]]; then
-            rm -rf "$ka_tmp"
-            log_warn "Katana produced no output. Last stderr lines:"
-            tail -5 "${pdir}/katana.stderr.log" | sed 's/^/    /'
-        else
-            rm -rf "$ka_tmp"
-            log_warn "Katana produced no output and no stderr"
+    for ddir in "${OUTPUT_DIR}"/phase1/*/; do
+        [[ -d "$ddir" ]] || continue
+        if [[ -s "${ddir}katana/discovered_urls.txt" ]]; then
+            cat "${ddir}katana/discovered_urls.txt" >> "$p1_katana_urls"
         fi
+    done
+
+    if [[ -s "$p1_katana_urls" ]]; then
+        sort -u "$p1_katana_urls" -o "$p1_katana_urls"
+        local katana_url_count
+        katana_url_count=$(wc -l < "$p1_katana_urls")
+
+        # Filter for cloud domains
+        filter_cloud_domains "$p1_katana_urls" "${pdir}/katana_cloud_assets.txt"
+
+        local ka_cloud=0
+        [[ -s "${pdir}/katana_cloud_assets.txt" ]] && ka_cloud=$(wc -l < "${pdir}/katana_cloud_assets.txt")
+
+        log_success "Katana cloud assets: ${ka_cloud} from ${katana_url_count} Phase 1 URLs ($(_format_duration $(($(_now) - katana_start))) total)"
+    else
+        log_info "No Katana URLs from Phase 1 — skipping cloud asset extraction"
+        : > "${pdir}/katana_cloud_assets.txt"
     fi
+
+    rm -f "$p1_katana_urls"
 
     # ── Stage 4: Consolidate Cloud Assets ───────────────────────────────────
     log_info "Consolidating cloud assets"

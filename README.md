@@ -67,13 +67,13 @@ Each domain gets its own output subdirectory: `phase1/example.com/`.
 
 ### Phase 2: Cloud Asset Discovery
 
-Discovers AWS, Azure, and GCP assets associated with the root domains.
+Discovers AWS, Azure, and GCP assets associated with the root domains. Katana is not re-run here — cloud assets from Phase 1's Katana crawl are filtered and reused.
 
 | Stage | What Happens | Tool(s) |
 |-------|-------------|---------|
 | 1 | Advanced DNS queries for cloud infrastructure | dnsx |
 | 2 | Brute force cloud storage buckets and services | Cloud_Enum |
-| 3 | Crawl web apps for cloud URL references | Katana |
+| 3 | Extract cloud assets from Phase 1 Katana data | filter_cloud_domains |
 | 4 | Consolidate all cloud assets | — |
 
 ### Phase 3: IP → Classification → Port Scan
@@ -241,7 +241,7 @@ Some tools can stall on misbehaving hosts. Each one has a configurable wall-cloc
 |----------|---------|----------------------|
 | `SHUFFLEDNS_TIMEOUT` | `900` | ShuffleDNS brute force (per root domain) |
 | `KATANA_TIMEOUT` | `600` | Katana crawl in Phase 1 (per live host) |
-| `KATANA_CRAWL_DURATION` | `30m` | Katana per-host wall-clock cap (Phase 2) |
+| `KATANA_CRAWL_DURATION` | `30m` | Katana per-host wall-clock cap (Phase 1) |
 | `SUBDOMAINIZER_TIMEOUT` | `300` | SubDomainizer JS scan (per live host) |
 | `DNSX_TIMEOUT` | `600` | DNSx bulk resolution |
 | `CLOUD_ENUM_TIMEOUT` | `1800` | Cloud_Enum keyword mutation (single call per Phase 2 run) |
@@ -419,7 +419,6 @@ Every tool below is wired into the pipeline (see `lib/phase1.sh`, `lib/phase2.sh
 |------|------|
 | **dnsx** | Bulk DNS queries for cloud CNAME/A records |
 | **Cloud_Enum** | AWS / Azure / GCP bucket and service brute force |
-| **Katana** | Web crawling for cloud-hosted endpoints |
 
 #### IP / Classification / Port Scan — Phase 3
 
