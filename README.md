@@ -10,23 +10,18 @@ The pipeline is built on the work of many open-source projects. Every tool
 below is wired into one or more phases (see [Installed Tools](#installed-tools)
 for the per-phase breakdown):
 
-- [Cero](https://github.com/glebarez/cero)
-- [Subfinder](https://github.com/projectdiscovery/subfinder)
-- [Assetfinder](https://github.com/tomnomnom/assetfinder)
-- [GAU](https://github.com/lc/gau)
-- [Sublist3r](https://github.com/aboul3la/Sublist3r)
-- [github-subdomains](https://github.com/gwen001/github-subdomains)
-- [CeWL](https://github.com/digininja/CeWL)
-- [ShuffleDNS](https://github.com/projectdiscovery/shuffledns)
-- [massdns](https://github.com/blechschmidt/massdns)
-- [GoSpider](https://github.com/jaeles-project/gospider)
-- [Subdomainizer](https://github.com/nsonaniya2010/SubDomainizer)
-- [httpx](https://github.com/projectdiscovery/httpx)
-- [Amass](https://github.com/owasp-amass/amass)
-- [dnsx](https://github.com/projectdiscovery/dnsx)
-- [Cloud_Enum](https://github.com/initstring/cloud_enum)
-- [Katana](https://github.com/projectdiscovery/katana)
-- [nmap](https://github.com/nmap/nmap)
+- [Subfaster](https://github.com/melvinsh/subfaster) — Passive subdomain enumeration (Subfinder fork, faster defaults)
+- [crt.name](https://crt.name) — Certificate Transparency log lookup
+- [Waymore](https://github.com/xnl-h4ck3r/waymore) — Historical URL/subdomain discovery from Wayback/CommonCrawl/OTX/URLScan/VirusTotal
+- [CeWL](https://github.com/digininja/CeWL) — Custom wordlist generation via web spidering
+- [ShuffleDNS](https://github.com/projectdiscovery/shuffledns) — DNS brute force with CeWL-derived wordlists
+- [massdns](https://github.com/blechschmidt/massdns) — High-performance DNS resolver (required by ShuffleDNS)
+- [Katana](https://github.com/projectdiscovery/katana) — Web crawler and JavaScript discovery
+- [Subdomainizer](https://github.com/nsonaniya2010/SubDomainizer) — JavaScript subdomain and secret extraction
+- [httpx](https://github.com/projectdiscovery/httpx) — HTTP probing with CDN detection, tech fingerprinting, and metadata
+- [dnsx](https://github.com/projectdiscovery/dnsx) — Canonical DNS resolution layer
+- [Cloud_Enum](https://github.com/initstring/cloud_enum) — AWS/Azure/GCP bucket and service brute force
+- [nmap](https://github.com/nmap/nmap) — Port scanning of non-CDN IPs
 
 ---
 
@@ -56,16 +51,17 @@ The pipeline has three phases that run sequentially.
 
 ### Phase 1: Root Domains → All Subdomains
 
-For each root domain, discovers every subdomain through multiple complementary techniques.
+For each root domain, discovers subdomains through passive enumeration, historical recon, DNS brute force, and web crawling.
 
 | Stage | What Happens | Tool(s) |
 |-------|-------------|---------|
-| 1 | Certificate transparency, OSINT scraping | Cero, Subfinder, Assetfinder, GAU, Sublist3r, github-subdomains |
-| 2 | Consolidate + HTTPx probe (Round 1) | httpx |
-| 3 | Custom wordlist generation + DNS brute force | CeWL, ShuffleDNS |
-| 4 | Consolidate + HTTPx probe (Round 2) | httpx |
-| 5 | Web crawling + JavaScript analysis | GoSpider, Subdomainizer |
-| 6 | Final consolidation + HTTPx probe (Round 3) | httpx |
+| 1 | Passive subdomain enumeration | Subfaster, crt.name |
+| 2 | Historical URL/subdomain discovery | Waymore (root domains only) |
+| 3 | Consolidate + DNSx resolution + HTTPx Round 1 | dnsx, httpx |
+| 4 | Custom wordlist generation + DNS brute force | CeWL, ShuffleDNS |
+| 5 | Consolidate + DNSx delta resolution + HTTPx Round 2 | dnsx, httpx |
+| 6 | Web crawling + JavaScript analysis | Katana, SubDomainizer |
+| 7 | Final consolidation + DNSx delta + HTTPx Round 3 | dnsx, httpx |
 
 Each domain gets its own output subdirectory: `phase1/example.com/`.
 
@@ -75,22 +71,65 @@ Discovers AWS, Azure, and GCP assets associated with the root domains.
 
 | Stage | What Happens | Tool(s) |
 |-------|-------------|---------|
-| 1 | DNS enumeration for cloud CNAME/A records | Amass Enum |
-| 2 | Advanced DNS queries for cloud infrastructure | DNSx |
-| 3 | Brute force cloud storage buckets and services | Cloud_Enum |
-| 4 | Crawl web apps for cloud URL references | Katana |
-| 5 | Consolidate all cloud assets | — |
+| 1 | Advanced DNS queries for cloud infrastructure | dnsx |
+| 2 | Brute force cloud storage buckets and services | Cloud_Enum |
+| 3 | Crawl web apps for cloud URL references | Katana |
+| 4 | Consolidate all cloud assets | — |
 
-### Phase 3: IP Extraction → ASN Mapping → Port Scanning
+### Phase 3: IP → Classification → Port Scan
 
-Resolves all discovered domains to IPs, maps them to ASNs, and port scans non-CDN IPs.
+Resolves all discovered domains to IPs, performs deterministic IP classification, and port scans non-CDN IPs.
 
 | Stage | What Happens | Tool(s) |
 |-------|-------------|---------|
-| 1 | DNS resolution of all subdomains | dig, dnsx |
-| 2 | IP → ASN lookup sorted by occurrence | whois.cymru.com |
-| 3 | CDN IP filtering | built-in CDN ASN list |
-| 4 | Port scan on non-CDN IPs | nmap |
+| 1 | Extract IPs from canonical DNS dataset | dnsx (already resolved) |
+| 2 | IP → ASN lookup via whois.cymru.com | nc |
+| 3 | Deterministic IP classification (CDN/cloud/dedicated/unknown) | Built-in classification engine |
+| 4 | Port scan on nmap candidates (dedicated + cloud + unknown) | nmap |
+
+---
+
+## Canonical DNS Dataset
+
+After Phase 1 discovery, Metho maintains a **canonical hostname/DNS dataset** stored as a TSV file at `canonical_dns.tsv`. This is the single source of truth for hostname-to-IP mappings across all phases.
+
+Columns:
+
+| Column | Description |
+|--------|-------------|
+| `hostname` | FQDN being tracked |
+| `root_domain` | eTLD+1 root domain this hostname belongs to |
+| `discovery_sources` | Semicolon-separated list of tools that found this hostname |
+| `A` | Semicolon-separated IPv4 addresses |
+| `AAAA` | Semicolon-separated IPv6 addresses |
+| `CNAME` | Semicolon-separated CNAME targets |
+| `resolution_status` | `resolved`, `nxdomain`, `timeout`, or `pending` |
+
+Phases 2 and 3 never re-resolve the entire corpus — only newly discovered hosts are resolved through dnsx, and the results are merged incrementally.
+
+## Deterministic IP Classification
+
+IPs are classified using a strict priority order:
+
+1. **HTTPX CDN = true** → `cdn`
+2. **ASN matches CDN config** → `cdn`
+3. **ASN matches cloud config** → `cloud`
+4. **ASN matches dedicated hosting config** → `dedicated`
+5. **Otherwise** → `unknown`
+
+Each IP receives exactly one classification. CDN IPs are retained in results but excluded from nmap scanning. The classification rules and provider/ASN lists are in `config/asn_providers.sh` — edit this file to add or modify providers.
+
+## Nmap Candidate Selection
+
+By default, nmap scans IPs classified as `dedicated`, `cloud`, or `unknown`. CDN IPs are excluded from scanning but retained in the output. This produces:
+
+- `nmap_candidates.txt` — IPs to scan
+- `cdn_ips.txt` — CDN IPs (not scanned)
+- `non_cdn_ips.txt` — All non-CDN IPs
+
+## HTTPX Metadata
+
+HTTPX now collects CDN detection, technology fingerprinting, content length, and web server metadata using the flags `-cdn -tech-detect -web-server -content-length`. This metadata is preserved across all HTTPX rounds and merged into a companion file (`httpx_metadata.tsv`) linked to the canonical DNS dataset.
 
 ---
 
@@ -99,45 +138,14 @@ Resolves all discovered domains to IPs, maps them to ASNs, and port scans non-CD
 All stage output is logged to `recon.log` in the output directory with timestamps. Every tool invocation, result count, warning, and error is captured. This is useful for debugging or improving the pipeline later.
 
 ```
-2026-05-31 14:23:01 [*] Phase 1: Root Domains → Subdomains (3 domains)
-2026-05-31 14:23:01 [*] Processing domain: example.com
-2026-05-31 14:23:01 [*] Running Cero (certificate transparency)...
-2026-05-31 14:23:45 [+] Subdomains from scraping: 142
-2026-05-31 14:24:02 [*] Probing 142 targets with httpx...
-2026-05-31 14:24:18 [+] Live web servers found: 67
+2026-08-14 14:23:01 [*] Phase 1: Root Domains → Subdomains (3 domains)
+2026-08-14 14:23:01 [*] Processing domain: example.com
+2026-08-14 14:23:01 [*] Running Subfaster...
+2026-08-14 14:23:45 [+] Subfaster subdomains: 142
+2026-08-14 14:24:02 [*] Probing 142 targets with httpx...
+2026-08-14 14:24:18 [+] Live web servers found: 67
 ...
 ```
-
----
-
-## Manual Steps
-
-Some reconnaissance steps are best done manually before running the pipeline:
-
-### Pre-Pipeline: Google Dorking & Reverse WHOIS
-
-Before running the pipeline, do manual reconnaissance to find additional root domains:
-
-**Google Dorking:**
-```
-site:*.example.com
-"Example Corp" site:com
-inurl:examplecorp
-```
-
-**Reverse WHOIS:**
-1. Get WHOIS info: `whois example.com | grep -E 'Registrant|Admin'`
-2. Search the organization name or email on:
-   - https://viewdns.info/reversewhois/
-   - https://whoxy.com/
-3. Add discovered domains to your input file
-
-### Post-Pipeline: Review
-
-Always review after the pipeline completes:
-- `final/final_all_domains.txt` for false positives
-- `final/final_asn_summary.txt` for interesting low-count ASNs
-- `final/final_httpx_metadata.json` for technology detection results
 
 ---
 
@@ -149,23 +157,23 @@ Always review after the pipeline completes:
 Usage: recon.sh [options]
 
 Required (one of):
-  --domains d1,d2,...     Comma-separated root domains
-  --domains-file FILE     Line-separated root domains file
+  --domains d1,d2,...       Comma-separated root domains
+  --domains-file FILE       Line-separated root domains file
 
 Options:
-  --subfinder-config FILE Path to subfinder provider-config.yaml (API keys)
-  --amass-config FILE     Path to amass config.yaml (API keys -> fewer 403/429)
-  --auto                  Skip all checkpoint prompts
-  --skip-phase {1,2,3}    Skip specific phase(s)
-  --skip-cloud            Shorthand for --skip-phase 2
-  --no-port-scan          Skip port scanning phase
-  --threads N             Thread count (default: 50)
-  --parallel-hosts N      Hosts crawled in parallel per per-host tool (default: 5)
-  --rate-limit N          Requests/second (default: 100)
-  --timeout N             Checkpoint auto-continue timeout in seconds (default: 30)
-  --output DIR            Output directory (default: /output)
-  --github-tokens-file FILE  File with GitHub tokens (one per line) for github-subdomains
-  --cloud-enum-keywords KW   Keywords for cloud_enum brute force (comma-sep, auto-derived from domains)
+  --subfaster-config FILE   Path to subfaster provider-config.yaml (API keys)
+  --asn-config FILE         Path to ASN provider classification config (default: built-in)
+  --waymore-mode MODE       Waymore mode: U (URLs), R (responses), B (both, default)
+  --auto                    Skip all checkpoint prompts
+  --skip-phase {1,2,3}      Skip specific phase(s)
+  --skip-cloud              Shorthand for --skip-phase 2
+  --no-port-scan            Skip port scanning phase
+  --threads N               Thread count (default: 50)
+  --parallel-hosts N         Hosts crawled in parallel per per-host tool (default: 5)
+  --rate-limit N            Requests/second (default: 100)
+  --timeout N               Checkpoint auto-continue timeout in seconds (default: 30)
+  --output DIR              Output directory (default: /output)
+  --cloud-enum-keywords KW Keywords for cloud_enum brute force (comma-sep, auto-derived from domains)
 ```
 
 ### Examples
@@ -185,32 +193,7 @@ docker run --rm -it \
   --domains-file /input/domains.txt --auto
 ```
 
-The domains file is a plain text file with one root domain per line:
-```
-example.com
-example.org
-example-cdn.net
-```
-
-**With GitHub tokens for github-subdomains:**
-```bash
-docker run --rm -it \
-  -v $(pwd)/results:/output \
-  -v $(pwd)/targets.txt:/input/domains.txt:ro \
-  -v $(pwd)/github-tokens.txt:/input/github-tokens.txt:ro \
-  metho \
-  --domains-file /input/domains.txt \
-  --github-tokens-file /input/github-tokens.txt \
-  --auto
-```
-
-GitHub tokens file format (one token per line):
-```
-ghp_xxxxxxxxxxxxxxxxxxxx
-ghp_yyyyyyyyyyyyyyyyyyyy
-```
-
-**With subfinder provider config (API keys for Shodan, Censys, etc.):**
+**With subfaster provider config (API keys for Shodan, Censys, etc.):**
 ```bash
 docker run --rm -it \
   -v $(pwd)/results:/output \
@@ -218,27 +201,20 @@ docker run --rm -it \
   -v $(pwd)/provider-config.yaml:/input/provider-config.yaml:ro \
   metho \
   --domains-file /input/domains.txt \
-  --subfinder-config /input/provider-config.yaml \
+  --subfaster-config /input/provider-config.yaml \
   --auto
 ```
 
-**With an Amass config (API keys -> fewer 403/429 from passive sources):**
+**With custom ASN provider config:**
 ```bash
 docker run --rm -it \
   -v $(pwd)/results:/output \
-  -v $(pwd)/targets.txt:/input/domains.txt:ro \
-  -v $(pwd)/amass-config.yaml:/input/amass-config.yaml:ro \
+  -v $(pwd)/my-asn-providers.sh:/input/asn-providers.sh:ro \
   metho \
-  --domains-file /input/domains.txt \
-  --amass-config /input/amass-config.yaml \
+  --domains "example.com" \
+  --asn-config /input/asn-providers.sh \
   --auto
 ```
-Without a config, Amass runs passively but ~40 premium data sources
-(Shodan, Censys, SecurityTrails, URLScan, VirusTotal, ...) skip the auth
-check and you see a flood of "check callback failed" / `403` / `429` lines in
-`phase2/amass.stderr.log`. A `config.yaml` with those keys makes them answer.
-The remaining `403/429` from *free* sources are provider-side rate/geo blocks,
-not config issues.
 
 **Skip cloud discovery and port scanning:**
 ```bash
@@ -250,128 +226,38 @@ docker run --rm -it \
   --skip-cloud --no-port-scan --auto
 ```
 
-**Custom thread count and rate limit:**
-```bash
-docker run --rm -it -v $(pwd)/results:/output metho \
-  --domains "example.com" --threads 100 --rate-limit 200 --auto
-```
-
-**With cloud enum keywords (for bucket brute forcing):**
+**Waymore URLs-only mode (faster, no response downloading):**
 ```bash
 docker run --rm -it \
   -v $(pwd)/results:/output \
-  -v $(pwd)/targets.txt:/input/domains.txt:ro \
-  metho \
-  --domains-file /input/domains.txt \
-  --cloud-enum-keywords "example,examplecorp,example-corp" \
-  --auto
+  metho --domains "example.com" --waymore-mode U --auto
 ```
 
 ### Per-tool timeouts
 
-Some tools (gospider, subdomainizer, amass, shuffledns, dnsx, katana,
-cloud_enum) can stall on misbehaving hosts. Each one has a configurable
-wall-clock cap that prevents a single bad host from blocking the whole
-pipeline. Set the env var when you run the container:
+Some tools can stall on misbehaving hosts. Each one has a configurable wall-clock cap:
 
-| Variable                 | Default | Tool / What it bounds                                            |
-|--------------------------|---------|------------------------------------------------------------------|
-| `SHUFFLEDNS_TIMEOUT`     | `900`   | ShuffleDNS brute force (per root domain)                         |
-| `GOSPIDER_TIMEOUT`       | `600`   | GoSpider crawl (per live host)                                   |
-| `SUBDOMAINIZER_TIMEOUT`  | `300`   | SubDomainizer JS scan (per live host)                            |
-| `AMASS_TIMEOUT`          | `1800`  | Amass enum (per root domain, Phase 2 cloud)                      |
-| `DNSX_TIMEOUT`           | `600`   | DNSx bulk resolution (per Phase 2 / Phase 3 call)                |
-| `CLOUD_ENUM_TIMEOUT`     | `1800`  | Cloud_Enum keyword mutation (single call per Phase 2 run)        |
-| `KATANA_CRAWL_DURATION`  | `30m`   | Katana per-host wall-clock cap (uses Katana's `-ct` flag, s/m/h) |
-| `CEWL_TIMEOUT`           | `600`   | CeWL word-crawl (per live host)                                  |
-| `GAU_TIMEOUT`            | `300`   | GAU fetch (per root domain) -- archives can stall on some targets |
-| `CEWL_DEPTH`             | `2`     | CeWL spider depth on the first pass (retries at depth 1 on failure) |
-| `CEWL_MEM_LIMIT_MB`      | `1024`  | CeWL per-process address-space cap (`ulimit -v`, in MB) — stops CeWL from being OOM-killed on huge sites; on hitting the cap CeWL exits cleanly and the host is retried at depth 1 |
+| Variable | Default | Tool / What it bounds |
+|----------|---------|----------------------|
+| `SHUFFLEDNS_TIMEOUT` | `900` | ShuffleDNS brute force (per root domain) |
+| `KATANA_TIMEOUT` | `600` | Katana crawl in Phase 1 (per live host) |
+| `KATANA_CRAWL_DURATION` | `30m` | Katana per-host wall-clock cap (Phase 2) |
+| `SUBDOMAINIZER_TIMEOUT` | `300` | SubDomainizer JS scan (per live host) |
+| `DNSX_TIMEOUT` | `600` | DNSx bulk resolution |
+| `CLOUD_ENUM_TIMEOUT` | `1800` | Cloud_Enum keyword mutation (single call per Phase 2 run) |
+| `CEWL_TIMEOUT` | `600` | CeWL word-crawl (per live host) |
+| `CEWL_DEPTH` | `2` | CeWL spider depth on first pass (retries at depth 1 on failure) |
+| `CEWL_MEM_LIMIT_MB` | `1024` | CeWL per-process address-space cap (MB) |
+| `WAYMORE_TIMEOUT` | `1800` | Waymore historical recon (per root domain) |
 
 ```bash
 docker run --rm -it \
   -v $(pwd)/results:/output \
-  -e GOSPIDER_TIMEOUT=900 \
-  -e AMASS_TIMEOUT=2700 \
-  -e KATANA_CRAWL_DURATION=15m \
+  -e KATANA_TIMEOUT=900 \
+  -e WAYMORE_TIMEOUT=2700 \
   -e CEWL_MEM_LIMIT_MB=1536 \
   metho --domains "example.com" --parallel-hosts 8 --auto
 ```
-
-### Parallel host crawling
-
-The per-host stages (CeWL, GoSpider, SubDomainizer in Phase 1; Amass and
-Katana in Phase 2) crawl their host/domain lists **in parallel** instead of
-one at a time. These stages are where the pipeline spends the vast majority
-of its wall-clock (a serial crawl of ~60 live hosts took ~3h45m of a ~4h run;
-parallelizing ~5x drops that to ~45m). Control the pool size:
-
-```
---parallel-hosts N      Hosts crawled concurrently per per-host tool (default: 5)
-```
-
-Each host still runs the same tool with the same flags into its **own** temp
-file, merged after the pool finishes -- so there is no data loss and no
-shared-file contention. The pool is bounded on purpose: N concurrent hosts,
-each already using the tool's internal concurrency, multiplies the request
-rate, so keep N modest to avoid tripping the target's WAF/rate-limiter.
-Lower it (`--parallel-hosts 2`) for aggressive CDN/WAF targets; raise it
-(`--parallel-hosts 10`) on a beefy machine against a tolerant target.
-
-> **Memory note:** CeWL holds its crawl in RAM under a per-process `ulimit -v`
-> cap (`CEWL_MEM_LIMIT_MB`, default 1024 MB). With `--parallel-hosts 5` that is
-> up to ~5 GB of CeWL address space reserved at once -- fine on most machines,
-> but lower either knob if memory is tight.
-
-**Why the CeWL knobs exist:** CeWL holds the spider frontier and all
-collected words in RAM and has no built-in page/memory limit, so a `-d 2`
-crawl of a large docs/library site can be SIGKILLed by the kernel OOM
-killer (observed in real runs). The memory cap turns that into a clean,
-catchable failure, and the depth-1 retry still collects that host's words
-— breadth across all live hosts is preserved without unbounded RAM use.
-
-### Resolvers
-
-The pipeline uses a single resolvers file: `wordlists/resolvers.txt`,
-which is the **31-entry `resolvers-trusted.txt` from
-[trickest/resolvers](https://github.com/trickest/resolvers/blob/main/resolvers-trusted.txt)**
-(it contains vetted public resolvers from Cloudflare, Google, Quad9,
-OpenDNS, CleanBrowsing, Comodo, Yandex, SafeDNS, Verisign, Dyn, and
-others — the same resolver pool massdns/ShuffleDNS/Amass/dnsx expect).
-
-The file is mounted into the container at
-`/opt/scripts/wordlists/resolvers.txt` and is passed to:
-
-- **ShuffleDNS** via `-r resolvers.txt` (the only required consumer
-  — massdns needs a resolvers list to do its work at all)
-- **Amass** via `-trf resolvers.txt` (trusted-resolver file; passive mode
-  doesn't actually query DNS, but `-trf` keeps the resolver set consistent
-  if Amass ever falls back to active methods)
-- **DNSx** via `-r resolvers.txt` (ProjectDiscovery's dnsx accepts a
-  resolvers file or comma-separated list at the same `-r` flag)
-- **Cloud_Enum** via `-nsf resolvers.txt` (mirrors Ars0n v2's
-  default; without it, Cloud_Enum uses its own bundled resolvers
-  which are smaller)
-
-### Checkpoints
-
-When running without `--auto`, the pipeline pauses after each phase and shows:
-
-```
-════════════════════════════════════════════════════════════
-[CHECKPOINT] Phase 1 complete. Subdomains discovered for 3 domain(s).
-════════════════════════════════════════════════════════════
-
-  [C]ontinue  [S]kip next phase  [Q]uit  [R]eview results
-  > _
-```
-
-- **C** — Continue to the next phase
-- **S** — Skip the next phase
-- **Q** — Quit the pipeline
-- **R** — Review the output files before continuing
-
-If you don't respond within the timeout (default 30 seconds), it auto-continues.
 
 ---
 
@@ -383,56 +269,67 @@ Mount a local directory as `/output`. After the pipeline completes, it looks lik
 results/
 ├── RECON_SUMMARY.txt              # Final summary with all counts
 ├── recon.log                      # Timestamped log of all stages
+├── canonical_dns.tsv              # Canonical hostname→DNS dataset
+├── httpx_metadata.tsv             # HTTPX CDN/tech/webserver metadata per host
 ├── root_domains.txt               # Resolved input root domains
 │
 ├── phase1/
 │   ├── example.com/
 │   │   ├── all_subdomains_final.txt      # All subdomains discovered
 │   │   ├── live_subdomains_final.txt     # Live web server URLs
-│   │   ├── httpx_results_final.json      # Full HTTPx metadata (JSON)
-│   │   ├── httpx_results_final.httpx.log # Full HTTPx stderr log (for debugging)
-│   │   ├── cero_results.txt              # Cero (cert transparency) results
-│   │   ├── subfinder_results.txt         # Subfinder results
-│   │   ├── sublist3r_results.txt         # Sublist3r subdomains (captured despite engine errors)
-│   │   ├── sublist3r_full_output.txt     # Sublist3r complete raw output
-│   │   ├── github_subdomains_results.txt # GitHub subdomains
-│   │   └── ...
-│   ├── example.org/
+│   │   ├── httpx_results_final.json      # Full HTTPx JSON output
+│   │   ├── httpx_results_final.httpx.log # HTTPx debug log
+│   │   ├── subfaster_results.txt        # Subfaster (passive enum) results
+│   │   ├── crtname_results.txt           # crt.name (CT log) subdomains
+│   │   ├── crtname_raw.json              # Raw crt.name API response
+│   │   ├── waymore_subdomains.txt        # In-scope subdomains from Waymore
+│   │   ├── waymore_urls.txt              # All historical URLs from Waymore
+│   │   ├── waymore_output/               # Waymore response archive
+│   │   ├── katana/
+│   │   │   ├── discovered_urls.txt       # URLs discovered by Katana
+│   │   │   ├── discovered_hosts.txt      # In-scope hosts from Katana
+│   │   │   └── javascript_assets.txt     # JavaScript assets from Katana
+│   │   ├── subdomainizer_subdomains.txt  # SubDomainizer subdomains
 │   │   └── ...
 │   └── ...
 │
 ├── phase2/
-│   ├── final_cloud_assets.txt     # All cloud assets consolidated
-│   ├── amass_cloud_domains.txt
+│   ├── final_cloud_assets.txt            # All cloud assets consolidated
 │   ├── dnsx_cloud_domains.txt
 │   ├── cloud_enum_assets.txt
 │   ├── katana_cloud_assets.txt
 │   └── ...
 │
 ├── phase3/
-│   ├── all_ips.txt                # All resolved IPs
-│   ├── asn_list.txt               # All ASNs
-│   ├── asn_summary.txt            # ASNs sorted by IP count (descending)
-│   ├── network_ranges.txt         # CIDR blocks from ASNs
-│   ├── cdn_ips.txt                # CDN-associated IPs
-│   ├── non_cdn_ips.txt            # Non-CDN IPs
-│   ├── ip_port_pairs.txt          # Open port scan results
-│   ├── domain_ip_map.txt          # Domain → IP mapping
-│   └── ip_asn_map.txt             # IP → ASN mapping
+│   ├── all_resolved_ips.txt              # All unique resolved IPs
+│   ├── ip_classification.tsv            # IP → classification (cdn/cloud/dedicated/unknown)
+│   ├── cdn_ips.txt                       # CDN-classified IPs
+│   ├── non_cdn_ips.txt                   # Non-CDN IPs (cloud + dedicated + unknown)
+│   ├── nmap_candidates.txt               # IPs targeted for port scanning
+│   ├── asn_list.txt                      # All ASNs
+│   ├── asn_summary.txt                   # ASNs sorted by IP count
+│   ├── network_ranges.txt                # CIDR blocks
+│   ├── domain_ip_map.txt                 # Domain → IP mapping
+│   ├── ip_asn_map.txt                    # IP → ASN mapping
+│   └── ip_port_pairs.txt                 # IP:port from port scan
 │
 └── final/
-    ├── final_all_domains.txt          # Every subdomain across all root domains
-    ├── final_live_web_servers.txt     # Every live URL across all root domains
-    ├── final_httpx_metadata.json      # Full httpx JSON output (tech, title, status)
-    ├── final_cloud_assets.txt         # Every cloud asset
-    ├── final_asn_list.txt             # All ASNs
-    ├── final_asn_summary.txt          # ASNs sorted by occurrence count
-    ├── final_network_ranges.txt       # All network ranges
-    ├── final_ip_addresses.txt         # All IPs
-    ├── final_ip_port_pairs.txt        # IP:port from non-CDN scan
-    ├── final_cdn_ips.txt              # CDN IPs
-    ├── final_non_cdn_ips.txt          # Non-CDN IPs
-    └── final_domain_ip_map.txt        # Domain→IP mapping
+    ├── final_all_domains.txt             # Every subdomain across all root domains
+    ├── final_live_web_servers.txt        # Every live URL across all root domains
+    ├── final_httpx_metadata.json          # Full httpx JSON output (CDN, tech, etc.)
+    ├── canonical_dns.tsv                  # Canonical hostname→DNS dataset
+    ├── final_waymore_urls.txt             # All historical URLs from Waymore
+    ├── final_cloud_assets.txt             # Every cloud asset
+    ├── final_asn_list.txt                 # All ASNs
+    ├── final_asn_summary.txt             # ASNs sorted by occurrence count
+    ├── final_network_ranges.txt           # All network ranges
+    ├── final_ip_addresses.txt             # All IPs
+    ├── final_ip_classification.tsv       # IP classification (cdn/cloud/dedicated/unknown)
+    ├── final_ip_port_pairs.txt            # IP:port from non-CDN scan
+    ├── final_cdn_ips.txt                  # CDN IPs
+    ├── final_non_cdn_ips.txt              # Non-CDN IPs
+    ├── final_nmap_candidates.txt          # IPs targeted for port scanning
+    └── final_domain_ip_map.txt            # Domain→IP mapping
 ```
 
 ### The `final/` Directory
@@ -440,9 +337,11 @@ results/
 This is the one you care about. It contains deduplicated, consolidated lists ready for the next stage of your bug bounty workflow.
 
 Key files:
-- **`final_asn_summary.txt`** — ASNs sorted by how many IPs map to them. ASNs with only 1-2 IPs are more interesting targets (less infrastructure, more likely misconfigured).
-- **`final_httpx_metadata.json`** — Full HTTPx output with status codes, titles, tech detection, TLS info for every live web server.
-- **`final_ip_port_pairs.txt`** — Open ports on non-CDN IPs, ready for vulnerability scanning.
+- **`canonical_dns.tsv`** — The single source of truth for hostname→DNS mappings. Every hostname discovered by any tool is tracked here with its resolution status and discovery sources.
+- **`final_ip_classification.tsv`** — Deterministic IP classification with CDN/cloud/dedicated/unknown labels, associated hostnames, root domains, ASN, and ASN org.
+- **`final_nmap_candidates.txt`** — IPs that were actually port-scanned (excludes CDN IPs).
+- **`final_httpx_metadata.json`** — Full HTTPx output with CDN detection, tech fingerprinting, web server, and content length for every live host.
+- **`final_waymore_urls.txt`** — All historical URLs discovered by Waymore across all root domains.
 
 ### RECON_SUMMARY.txt
 
@@ -458,11 +357,18 @@ Root Domains Provided: 3
 ASSETS DISCOVERED:
 - All Subdomains:     1,247
 - Live Web Servers:   389
+- Waymore URLs:       12,456
 - Cloud Assets:       23
 - ASNs:               15
 - Network Ranges:     28
 - IP Addresses:       456
 - IP:Port Pairs:      1,102
+
+IP CLASSIFICATION:
+- CDN IPs:            187
+- Cloud IPs:          134
+- Dedicated IPs:      89
+- Unknown IPs:        46
 
 FILES CREATED IN final/:
 ...
@@ -472,6 +378,7 @@ LOG FILE:
 
 NEXT STEPS:
 Proceed to vulnerability scanning / enumeration on live web servers.
+
 ========================================
 ```
 
@@ -483,51 +390,44 @@ Proceed to vulnerability scanning / enumeration on live web servers.
 docker build -t metho .
 ```
 
+The build uses a multi-stage Dockerfile:
+- **Builder stage** (`debian:13-slim`): Compiles Go binaries (subfaster, httpx, katana, dnsx, shuffledns), massdns, and installs Ruby gems for CeWL. All build-only dependencies (Go compiler, git, build-essential, ruby-dev, etc.) stay in this stage.
+- **Runtime stage** (`debian:13-slim`): Copies only the compiled binaries and runtime dependencies. No compilers, Go SDK, Python headers, or build tools in the final image.
+
 ### Installed Tools
 
-Every tool listed below is wired into the pipeline (see `lib/phase1.sh`,
-`lib/phase2.sh`, `lib/phase3.sh`). Optional tools are skipped cleanly when
-not configured.
+Every tool below is wired into the pipeline (see `lib/phase1.sh`, `lib/phase2.sh`, `lib/phase3.sh`).
 
 #### Subdomain Discovery — Phase 1
 
-| Tool | Repo | Role |
-|------|------|------|
-| **Cero** | [glebarez/cero](https://github.com/glebarez/cero) | TLS certificate transparency scraper |
-| **Subfinder** | [projectdiscovery/subfinder](https://github.com/projectdiscovery/subfinder) | Passive subdomain enumeration across 30+ OSINT sources |
-| **Assetfinder** | [tomnomnom/assetfinder](https://github.com/tomnomnom/assetfinder) | Find subdomains via web crawling and OSINT |
-| **GAU** | [lc/gau](https://github.com/lc/gau) | Fetch known URLs from Wayback, CommonCrawl, OTX, URLScan |
-| **Sublist3r** | [aboul3la/Sublist3r](https://github.com/aboul3la/Sublist3r) | Multi-engine subdomain brute-forcer |
-| **github-subdomains** | [gwen001/github-subdomains](https://github.com/gwen001/github-subdomains) | Find subdomains mentioned in GitHub code (requires `--github-tokens-file`) |
-| **CeWL** | [digininja/CeWL](https://github.com/digininja/CeWL) | Spider live web servers → custom wordlist for DNS brute force |
-| **ShuffleDNS** | [projectdiscovery/shuffledns](https://github.com/projectdiscovery/shuffledns) | Active DNS brute force using the CeWL-derived wordlist |
-| **massdns** | [blechschmidt/massdns](https://github.com/blechschmidt/massdns) | High-performance DNS resolver used by ShuffleDNS (compiled from source) |
-| **GoSpider** | [jaeles-project/gospider](https://github.com/jaeles-project/gospider) | Web crawler — finds links, JS endpoints, and archived URLs |
-| **Subdomainizer** | [nsonaniya2010/SubDomainizer](https://github.com/nsonaniya2010/SubDomainizer) | Extract subdomains and secrets from JavaScript files |
-| **httpx** | [projectdiscovery/httpx](https://github.com/projectdiscovery/httpx) | Probe HTTP/HTTPS servers (3 rounds: scrape → brute → crawl) |
+| Tool | Role |
+|------|------|
+| **Subfaster** | Passive subdomain enumeration (fast Subfinder fork) |
+| **crt.name** | Certificate Transparency log lookup |
+| **Waymore** | Historical URL/subdomain discovery (Wayback, CommonCrawl, etc.) |
+| **CeWL** | Spider live hosts → custom wordlist for DNS brute force |
+| **ShuffleDNS** | DNS brute force using CeWL-derived wordlist |
+| **massdns** | High-performance DNS resolver (required by ShuffleDNS) |
+| **Katana** | Web crawler — finds URLs, JS endpoints, and new subdomains |
+| **SubDomainizer** | Extract subdomains and secrets from JavaScript files |
+| **httpx** | HTTP/HTTPS probing with CDN detection and tech fingerprinting (3 rounds) |
+| **dnsx** | Canonical DNS resolution layer |
 
 #### Cloud Asset Discovery — Phase 2
 
-| Tool | Repo | Role |
-|------|------|------|
-| **Amass** | [owasp-amass/amass](https://github.com/owasp-amass/amass) | Passive subdomain enumeration focused on cloud infrastructure |
-| **dnsx** | [projectdiscovery/dnsx](https://github.com/projectdiscovery/dnsx) | Bulk DNS queries for A/AAAA/CNAME/MX/NS/TXT/PTR/SRV records → cloud chain discovery |
-| **Cloud_Enum** | [initstring/cloud_enum](https://github.com/initstring/cloud_enum) | AWS / Azure / GCP bucket and service brute force |
-| **Katana** | [projectdiscovery/katana](https://github.com/projectdiscovery/katana) | Modern web crawler for JS-heavy sites — finds cloud-hosted endpoints |
+| Tool | Role |
+|------|------|
+| **dnsx** | Bulk DNS queries for cloud CNAME/A records |
+| **Cloud_Enum** | AWS / Azure / GCP bucket and service brute force |
+| **Katana** | Web crawling for cloud-hosted endpoints |
 
-#### IP / ASN / Port Scan — Phase 3
+#### IP / Classification / Port Scan — Phase 3
 
-| Tool | Repo | Role |
-|------|------|------|
-| **nmap** | [nmap/nmap](https://github.com/nmap/nmap) | Port scanning of discovered IPs (skippable via `--no-port-scan`) |
-
-#### HTTP Helpers
-
-| Tool | Repo | Role |
-|------|------|------|
-| **curl / wget** | — | Used by recon.sh and the various scrapers for direct HTTP fetches |
-| **jq** | — | Parses JSONL output from httpx, dnsx, etc. |
-| **whois / host / dig** | — | DNS / ASN / ownership lookups |
+| Tool | Role |
+|------|------|
+| **dnsx** | DNS resolution (data already in canonical dataset) |
+| **nc** (netcat) | whois.cymru.com ASN lookup |
+| **nmap** | Port scanning of nmap candidates (dedicated + cloud + unknown IPs) |
 
 ---
 
@@ -541,8 +441,8 @@ not configured.
 │                                                          │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐              │
 │  │ Phase 1   │─▶│ Phase 2   │─▶│ Phase 3   │             │
-│  │ Subdomain │  │ Cloud     │  │ IP/ASN    │              │
-│  │ Discovery │  │ Assets    │  │ Port Scan │              │
+│  │ Subdomain │  │ Cloud     │  │ Classify  │              │
+│  │ Discovery │  │ Assets    │  │ & Ports   │              │
 │  │ lib/      │  │ lib/      │  │ lib/      │               │
 │  │ phase1.sh │  │ phase2.sh │  │ phase3.sh │              │
 │  └──────────┘  └──────────┘  └──────────┘              │
@@ -553,8 +453,14 @@ not configured.
 │  │    Merge → final/ → RECON_SUMMARY.txt    │            │
 │  └──────────────────────────────────────────┘            │
 │                                                          │
-│  lib/utils.sh — logging (stdout + recon.log), CLI,       │
-│                 checkpoints, httpx, CDN ASN detection     │
+│  ┌──────────────────────────────────────────┐            │
+│  │  lib/canonical_dns.sh                    │             │
+│  │  Canonical DNS TSV (source of truth)     │             │
+│  └──────────────────────────────────────────┘            │
+│                                                          │
+│  lib/utils.sh — logging, CLI, httpx, cloud domain filter  │
+│  lib/classify.sh — deterministic IP/CDN/ASN classification │
+│  config/asn_providers.sh — ASN/provider lists (editable)   │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -564,9 +470,9 @@ not configured.
 
 - **Rate limiting matters.** If you're getting timeouts or empty results, lower `--rate-limit` (e.g., 50 or 25).
 - **ASN occurrence matters.** In `final_asn_summary.txt`, ASNs with fewer IPs are more interesting — they may represent niche hosting or forgotten infrastructure.
-- **GitHub tokens increase coverage.** Without `--github-tokens-file`, the github-subdomains stage is skipped.
 - **Cloud enum keywords.** By default, the base name of each root domain is used as a keyword. Use `--cloud-enum-keywords` to add extra keywords.
+- **Check canonical_dns.tsv.** The canonical DNS dataset tracks every hostname, its resolution status, and which tools discovered it. Useful for debugging and understanding coverage gaps.
+- **IP classification is configurable.** Edit `config/asn_providers.sh` to add or remove CDN, cloud, and dedicated hosting providers and ASNs.
+- **Waymore modes.** Use `--waymore-mode U` for URLs only (faster) or `--waymore-mode B` for both URLs and archived responses (slower, richer data).
 - **Check recon.log.** The timestamped log file captures everything — useful for debugging or tuning the pipeline.
 - **Do manual recon first.** Google dorking and reverse WHOIS can find additional root domains. Add them to your input file before running the pipeline.
-
----

@@ -11,6 +11,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Source all library scripts
 source "${SCRIPT_DIR}/lib/utils.sh"
+source "${SCRIPT_DIR}/lib/canonical_dns.sh"
+source "${SCRIPT_DIR}/lib/classify.sh"
 source "${SCRIPT_DIR}/lib/phase1.sh"
 source "${SCRIPT_DIR}/lib/phase2.sh"
 source "${SCRIPT_DIR}/lib/phase3.sh"
@@ -24,6 +26,12 @@ validate_args
 validate_deps
 setup_dirs
 init_log
+
+# Initialize the canonical DNS dataset
+init_canonical_dns
+
+# Load the ASN provider configuration for deterministic IP classification
+load_asn_config
 
 # Banner
 echo ""
@@ -39,9 +47,9 @@ log_info "Threads:    ${THREADS}"
 log_info "Rate limit: ${RATE_LIMIT}/s"
 log_info "Parallel hosts (per-tool): ${PARALLEL_HOSTS}"
 log_info "Port scan:  ${PORT_SCAN}"
-[[ -n "$GITHUB_TOKENS_FILE" ]] && log_info "GitHub tokens: ${GITHUB_TOKENS_FILE}"
-[[ -n "$SUBFINDER_PROVIDER_CONFIG" ]] && log_info "Subfinder config: ${SUBFINDER_PROVIDER_CONFIG}"
-[[ -n "$AMASS_CONFIG" ]] && log_info "Amass config: ${AMASS_CONFIG}"
+[[ -n "$SUBFASTER_PROVIDER_CONFIG" ]] && log_info "Subfaster config: ${SUBFASTER_PROVIDER_CONFIG}"
+[[ -n "$ASN_CONFIG_FILE" ]] && log_info "ASN config: ${ASN_CONFIG_FILE}"
+log_info "Waymore mode: ${WAYMORE_MODE}"
 [[ -n "$CLOUD_ENUM_KEYWORDS" ]] && log_info "Cloud enum keywords: ${CLOUD_ENUM_KEYWORDS}"
 echo ""
 
@@ -82,11 +90,11 @@ else
     log_info "Skipping Phase 2 (--skip-phase / --skip-cloud)"
 fi
 
-# ── Phase 3: IP → ASN → Port Scan ──────────────────────────────────────────
+# ── Phase 3: IP → Classification → Port Scan ────────────────────────────────
 if ! should_skip_phase 3; then
     run_phase3
 
-    checkpoint "Phase 3 complete. IPs: $(wc -l < "${OUTPUT_DIR}/phase3/all_ips.txt" 2>/dev/null || echo '?') | ASNs: $(wc -l < "${OUTPUT_DIR}/phase3/asn_list.txt" 2>/dev/null || echo '?')" || true
+    checkpoint "Phase 3 complete. IPs: $(wc -l < "${OUTPUT_DIR}/phase3/all_resolved_ips.txt" 2>/dev/null || echo '?') | ASNs: $(wc -l < "${OUTPUT_DIR}/phase3/asn_list.txt" 2>/dev/null || echo '?')" || true
 else
     log_info "Skipping Phase 3 (--skip-phase)"
 fi
