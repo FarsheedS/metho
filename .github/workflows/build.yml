@@ -25,8 +25,7 @@ jobs:
 
       - name: Verify runtime binaries
         run: |
-          docker run --rm ghcr.io/${{ github.repository_owner }}/metho:latest \
-            sh -c 'subfaster -h 2>&1 | grep -q . && \
+          docker run --rm --entrypoint sh ghcr.io/${{ github.repository_owner }}/metho:latest -c 'subfaster -h 2>&1 | grep -q . && \
                    httpx -h 2>&1 | grep -q . && \
                    katana -h 2>&1 | grep -q . && \
                    dnsx -h 2>&1 | grep -q . && \
@@ -40,8 +39,7 @@ jobs:
 
       - name: Verify pipeline scripts
         run: |
-          docker run --rm ghcr.io/${{ github.repository_owner }}/metho:latest \
-            sh -c 'bash -n /opt/scripts/recon.sh && \
+          docker run --rm --entrypoint sh ghcr.io/${{ github.repository_owner }}/metho:latest -c 'bash -n /opt/scripts/recon.sh && \
                    bash -n /opt/scripts/lib/utils.sh && \
                    bash -n /opt/scripts/lib/phase1.sh && \
                    bash -n /opt/scripts/lib/phase2.sh && \
