@@ -67,11 +67,11 @@ Each domain gets its own output subdirectory: `phase1/example.com/`.
 
 ### Phase 2: Cloud Asset Discovery
 
-Discovers AWS, Azure, and GCP assets associated with the root domains. Katana is not re-run here — cloud assets from Phase 1's Katana crawl are filtered and reused.
+Discovers AWS, Azure, and GCP assets associated with the root domains. This phase does **not** re-resolve the entire hostname corpus — it uses the canonical DNS dataset from Phase 1 and only queries additional record types (CNAME, MX, NS, TXT) specifically for cloud discovery. Katana is not re-run here — cloud assets from Phase 1's Katana crawl are filtered and reused.
 
 | Stage | What Happens | Tool(s) |
 |-------|-------------|---------|
-| 1 | Advanced DNS queries for cloud infrastructure | dnsx |
+| 1 | Cloud DNS record queries (CNAME/MX/NS/TXT) from canonical dataset | dnsx |
 | 2 | Brute force cloud storage buckets and services | Cloud_Enum |
 | 3 | Extract cloud assets from Phase 1 Katana data | filter_cloud_domains |
 | 4 | Consolidate all cloud assets | — |

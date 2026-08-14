@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Phase 2: Cloud Asset Discovery
 # Discovers AWS, Azure, and GCP assets associated with root domains.
+#
+# This phase does NOT re-resolve the entire hostname corpus. Instead, it uses
+# the canonical DNS dataset (populated in Phase 1) as the source of truth and
+# only queries DNS for cloud-specific record types (CNAME, MX, NS, TXT) that
+# reveal cloud infrastructure. Any newly discovered hostnames are merged into
+# the canonical dataset and resolved incrementally.
 
 run_phase2() {
     local pdir="${OUTPUT_DIR}/phase2"
@@ -13,62 +19,72 @@ run_phase2() {
 
     log_info "═══ PHASE 2: Cloud Asset Discovery ═══"
 
-    # ── Stage 1: DNSx for Cloud Domains ─────────────────────────────────────
-    # Per https://github.com/projectdiscovery/dnsx README: dnsx is a
-    # multi-purpose DNS toolkit. Here we use it to bulk-resolve every
-    # subdomain Phase 1 found against A/AAAA/CNAME/MX/NS/TXT/PTR/SRV
-    # records. Cloud assets leak through CNAME chains to
-    # *.cloudfront.net, *.amazonaws.com, etc., and through TXT/MX
-    # records pointing to cloud-hosted email / verification services —
-    # these would never be discovered by a simple A-record lookup.
+    # ── Stage 1: Cloud DNS Record Discovery ──────────────────────────────────
+    # Query CNAME, MX, NS, and TXT records for all hostnames in the canonical
+    # dataset to discover cloud infrastructure. CNAME chains pointing to
+    # *.cloudfront.net, *.amazonaws.com, etc. and TXT/MX records pointing to
+    # cloud-hosted services would never be discovered by a simple A-record
+    # lookup.
     #
-    # Flags (verified against the dnsx README):
-    #   -a -aaaa -cname -mx -ns -txt -ptr -srv  record types to query
-    #   -re        display full DNS response (not just the answer field)
-    #   -json      NDJSON output (NOT -j; -j is also accepted as alias)
-    #   -retry N   retries per host before giving up (default 2)
-    #   -r FILE    resolver list — file or comma-separated IPs.
-    #   -timeout N DNS query timeout in seconds (default 3)
-    #
-    # Wrapped in `timeout` so a stuck resolver can't hang the phase
-    # forever; DNSX_TIMEOUT default 600s.
-    if command -v dnsx &>/dev/null && [[ -s "$all_subdomains_file" ]]; then
-        log_info "Stage 1: DNSx for cloud domains"
+    # We do NOT re-resolve the entire corpus — we use the canonical DNS dataset
+    # as the source of truth and only query these additional record types to
+    # find cloud-specific patterns. Any new hostnames discovered in CNAME chains
+    # are added to the canonical dataset and resolved incrementally.
+    if command -v dnsx &>/dev/null; then
+        log_info "Stage 1: DNSx cloud record discovery"
         local dnsx_start=$(_now)
         local dnsx_log="${pdir}/dnsx.stderr.log"
         : > "$dnsx_log"
 
-        cat "$all_subdomains_file" \
-            | timeout "${DNSX_TIMEOUT:-600}" dnsx -a -aaaa -cname -mx -ns -txt -ptr -srv \
-                -re -json -retry 3 \
-                -r /opt/scripts/wordlists/resolvers.txt \
-                -timeout 5 \
-                2>>"$dnsx_log" \
-            | tee "${pdir}/dnsx_output.json" >/dev/null || \
-                log_warn "DNSx exited non-zero (or was killed by DNSX_TIMEOUT) — see ${dnsx_log}"
+        # Extract resolved hostnames from the canonical DNS dataset rather than
+        # re-reading the Phase 1 output files. This ensures we only query hosts
+        # that actually resolved, and avoids re-resolving the entire corpus.
+        local canonical_hosts="${pdir}/.canonical_hosts.txt"
+        canonical_dns_extract_resolved > "$canonical_hosts"
 
-        if [[ -s "${pdir}/dnsx_output.json" ]]; then
-            jq -r '.cname[]?, .a[]?, .aaaa[]?, .mx[]?, .ns[]?, .txt[]?, .ptr[]?, .srv[]?' \
-                "${pdir}/dnsx_output.json" 2>/dev/null > "${pdir}/dnsx_all_records.txt" || true
-            filter_cloud_domains "${pdir}/dnsx_all_records.txt" "${pdir}/dnsx_cloud_domains.txt"
-            local dnsx_cloud_count=0
-            [[ -s "${pdir}/dnsx_cloud_domains.txt" ]] && dnsx_cloud_count=$(wc -l < "${pdir}/dnsx_cloud_domains.txt")
+        if [[ -s "$canonical_hosts" ]]; then
+            log_info "  Querying $(wc -l < "$canonical_hosts") resolved hosts for cloud record types (CNAME/MX/NS/TXT)"
 
-            # Extract newly discovered hostnames from DNS records and add to canonical dataset
-            extract_domains "${pdir}/dnsx_all_records.txt" "${pdir}/dnsx_all_domains.txt" || true
-            [[ -s "${pdir}/dnsx_all_domains.txt" ]] && canonical_dns_add_sources "dnsx-cloud" "${pdir}/dnsx_all_domains.txt"
-            # Resolve any new hostnames discovered by DNSx
-            canonical_dns_resolve_pending
+            cat "$canonical_hosts" \
+                | timeout "${DNSX_TIMEOUT:-600}" dnsx -cname -mx -ns -txt \
+                    -re -json -retry 3 \
+                    -r /opt/scripts/wordlists/resolvers.txt \
+                    -timeout 5 \
+                    2>>"$dnsx_log" \
+                | tee "${pdir}/dnsx_output.json" >/dev/null || \
+                    log_warn "DNSx exited non-zero (or was killed by DNSX_TIMEOUT) — see ${dnsx_log}"
 
-            log_success "DNSx: $(wc -l < "${pdir}/dnsx_all_records.txt") records, $dnsx_cloud_count cloud-related ($(_format_duration $(($(_now) - dnsx_start))) elapsed)"
-        elif [[ -s "$dnsx_log" ]]; then
-            log_warn "DNSx produced no output. Last stderr lines:"
-            tail -5 "$dnsx_log" | sed 's/^/    /'
+            if [[ -s "${pdir}/dnsx_output.json" ]]; then
+                # Extract all DNS records for cloud domain filtering
+                jq -r '.cname[]?, .mx[]?, .ns[]?, .txt[]?' \
+                    "${pdir}/dnsx_output.json" 2>/dev/null > "${pdir}/dnsx_all_records.txt" || true
+                filter_cloud_domains "${pdir}/dnsx_all_records.txt" "${pdir}/dnsx_cloud_domains.txt"
+                local dnsx_cloud_count=0
+                [[ -s "${pdir}/dnsx_cloud_domains.txt" ]] && dnsx_cloud_count=$(wc -l < "${pdir}/dnsx_cloud_domains.txt")
+
+                # Extract newly discovered hostnames from CNAME chains and add
+                # to the canonical dataset. CNAME targets (e.g. s3-bucket.s3.amazonaws.com)
+                # are the primary source of new cloud hosts.
+                extract_domains "${pdir}/dnsx_all_records.txt" "${pdir}/dnsx_all_domains.txt" || true
+                [[ -s "${pdir}/dnsx_all_domains.txt" ]] && canonical_dns_add_sources "dnsx-cloud" "${pdir}/dnsx_all_domains.txt"
+
+                # Resolve any newly discovered hostnames incrementally
+                canonical_dns_resolve_pending
+
+                log_success "DNSx: $(wc -l < "${pdir}/dnsx_all_records.txt") records, $dnsx_cloud_count cloud-related ($(_format_duration $(($(_now) - dnsx_start))) elapsed)"
+            elif [[ -s "$dnsx_log" ]]; then
+                log_warn "DNSx produced no output. Last stderr lines:"
+                tail -5 "$dnsx_log" | sed 's/^/    /'
+            else
+                log_warn "DNSx produced no output and no stderr — tool may have been killed"
+            fi
         else
-            log_warn "DNSx produced no output and no stderr — tool may have been killed"
+            log_warn "No resolved hosts in canonical DNS dataset — skipping DNSx cloud scan"
         fi
+
+        rm -f "$canonical_hosts"
     else
-        log_warn "DNSx not available or no subdomains — skipping DNSx cloud scan"
+        log_warn "DNSx not available — skipping cloud DNS record discovery"
     fi
 
     # ── Stage 2: Cloud_Enum Brute Force ─────────────────────────────────────
