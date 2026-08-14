@@ -17,16 +17,17 @@ jobs:
       - name: Verify runtime binaries
         run: |
           docker run --rm metho \
-            sh -c 'subfaster -h 2>/dev/null | grep -q . && \
-                   httpx -h 2>/dev/null | grep -q . && \
-                   katana -h 2>/dev/null | grep -q . && \
-                   dnsx -h 2>/dev/null | grep -q . && \
-                   shuffledns -h 2>/dev/null | grep -q . && \
-                   massdns --help 2>/dev/null | grep -q . && \
-                   waymore --help 2>/dev/null | grep -q . && \
+            sh -c 'subfaster -h 2>&1 | grep -q . && \
+                   httpx -h 2>&1 | grep -q . && \
+                   katana -h 2>&1 | grep -q . && \
+                   dnsx -h 2>&1 | grep -q . && \
+                   shuffledns -h 2>&1 | grep -q . && \
+                   massdns 2>&1 | grep -q . && \
+                   waymore --help 2>&1 | grep -q . && \
                    test -f /opt/tools/SubDomainizer/SubDomainizer.py && \
                    test -f /opt/tools/cloud_enum/cloud_enum.py && \
-                   echo "All runtime binaries OK"'
+                   python3 -c "import bs4, requests, termcolor, colorama, tldextract, cffi, dns.resolver, requests_futures" && \
+                   echo "All runtime tools OK"'
 
       - name: Verify pipeline scripts
         run: |

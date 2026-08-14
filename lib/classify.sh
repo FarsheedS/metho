@@ -165,18 +165,19 @@ write_ip_datasets() {
     fi
 
     # Step 2: Build a file of IP → ASN and ASN_org from ip_asn_map
-    # ip_asn_map format: IP|ASN|Org|Prefix (pipe-separated)
+    # ip_asn_map format: IP|ASN|Org|Prefix (pipe-separated, ASN already "AS"-prefixed
+    # by Phase 3's awk). We trim whitespace and skip the header line only.
     local ip_asn="${pdir}/.ip_asn_lookup.tmp"
     : > "$ip_asn"
     if [[ -s "$ip_asn_map" ]]; then
         awk -F'|' 'NR>1 || $1 != "IP" {
-            gsub(/^[ \t]+|[ \t]+$/, "", $1)
-            gsub(/^[ \t]+|[ \t]+$/, "", $2)
-            gsub(/^[ \t]+|[ \t]+$/, "", $3)
+            gsub(/^[ \t]+|[ \t]+$/, "", $1)   # IP
+            gsub(/^[ \t]+|[ \t]+$/, "", $2)   # ASN (already "AS" + number)
+            gsub(/^[ \t]+|[ \t]+$/, "", $3)   # Org name (may contain spaces, no pipes)
             # Skip header-like lines
             if ($1 == "IP" || $1 == "") next
-            asn = ($2 != "") ? "AS" $2 : ""
-            printf "%s\t%s\t%s\n", $1, asn, $3
+            # ASN is already prefixed with "AS" by Phase 3 — do NOT prepend again.
+            printf "%s\t%s\t%s\n", $1, $2, $3
         }' "$ip_asn_map" > "$ip_asn"
     fi
 

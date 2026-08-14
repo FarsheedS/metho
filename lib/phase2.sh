@@ -47,7 +47,7 @@ run_phase2() {
 
             cat "$canonical_hosts" \
                 | timeout "${DNSX_TIMEOUT:-600}" dnsx -cname -mx -ns -txt \
-                    -re -json -retry 3 \
+                    -json -retry 3 \
                     -r /opt/scripts/wordlists/resolvers.txt \
                     -timeout 5 \
                     2>>"$dnsx_log" \

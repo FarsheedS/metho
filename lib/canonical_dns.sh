@@ -240,9 +240,12 @@ canonical_dns_merge_httpx() {
         host=$(normalize_hostname "$host")
 
         cdn=$(echo "$line" | jq -r 'if .cdn != null then (.cdn | tostring) else "" end' 2>/dev/null)
-        # technologies is an array — join with semicolons
-        tech=$(echo "$line" | jq -r 'if .tech then (.tech | map(.name // .) | join(";")) else "" end' 2>/dev/null)
-        webserver=$(echo "$line" | jq -r '.server // ""' 2>/dev/null)
+        # httpx "tech" is a JSON array of STRINGS (not objects), per the
+        # Result struct in runner/types.go: `Technologies []string json:"tech"`.
+        # Join directly — no per-element .name extraction needed.
+        tech=$(echo "$line" | jq -r 'if .tech then (.tech | join(";")) else "" end' 2>/dev/null)
+        # httpx web-server field is "webserver" (json tag), NOT "server".
+        webserver=$(echo "$line" | jq -r '.webserver // ""' 2>/dev/null)
         content_length=$(echo "$line" | jq -r '.content_length // ""' 2>/dev/null)
         status_code=$(echo "$line" | jq -r '.status_code // ""' 2>/dev/null)
         title=$(echo "$line" | jq -r '.title // ""' 2>/dev/null)

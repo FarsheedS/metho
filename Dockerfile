@@ -148,17 +148,25 @@ RUN chmod +x /opt/scripts/recon.sh /opt/scripts/entrypoint.sh
 
 # ── Verify Runtime Tools ───────────────────────────────────────────────────
 # Every binary and Python package must actually work in the final image.
-# NOTE: `cmd | grep -q .` (NOT `| head -1`) -- a pipeline's exit status is
-# the LAST command's, so `missing-binary | head -1` would falsely pass.
-# grep -q . fails when the binary is absent or prints nothing, which is
-# exactly the failure mode we need to catch at build time.
-RUN subfaster -h 2>/dev/null | grep -q . && \
-    httpx -h 2>/dev/null | grep -q . && \
-    katana -h 2>/dev/null | grep -q . && \
-    dnsx -h 2>/dev/null | grep -q . && \
-    shuffledns -h 2>/dev/null | grep -q . && \
-    massdns --help 2>/dev/null | grep -q . && \
-    waymore --help 2>/dev/null | grep -q . && \
+#
+# Two stream-behavior subtleties make `cmd -h 2>/dev/null | grep -q .` fragile:
+#   1. projectdiscovery Go tools (httpx, dnsx, katana, shuffledns, subfaster)
+#      print -h usage to STDOUT — `2>/dev/null` is harmless and stdout is non-empty.
+#   2. massdns has NO -h/--help flag. It prints usage to STDERR and exits 1.
+#      `massdns --help 2>/dev/null | grep -q .` → empty stdout → grep fails → build breaks.
+#      Fix: invoke massdns with no args (usage → stderr) and capture BOTH streams.
+#   3. waymore --help goes to stdout — fine.
+#
+# Pattern: `cmd <args> 2>&1 | grep -q .` — redirect stderr into stdout so
+# grep sees the output regardless of which stream the tool chose, and fails
+# only when the binary is truly absent or silent. This is robust for all tools.
+RUN subfaster -h 2>&1 | grep -q . && \
+    httpx -h 2>&1 | grep -q . && \
+    katana -h 2>&1 | grep -q . && \
+    dnsx -h 2>&1 | grep -q . && \
+    shuffledns -h 2>&1 | grep -q . && \
+    massdns 2>&1 | grep -q . && \
+    waymore --help 2>&1 | grep -q . && \
     test -f /opt/tools/SubDomainizer/SubDomainizer.py && \
     test -f /opt/tools/cloud_enum/cloud_enum.py && \
     python3 -c "import bs4, requests, termcolor, colorama, tldextract, cffi, dns.resolver, requests_futures" && \

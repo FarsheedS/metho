@@ -71,15 +71,26 @@ run_phase3() {
         echo "end"
     } | nc whois.cymru.com 43 2>/dev/null > "$_cymru_cache" || true
 
-    # View 1: ASN|Prefix|Name -> per-(asn,prefix) IP count.
+    # Cymru "verbose" output format (pipe-separated, with leading/trailing spaces):
+    #   AS | IP | BGP-Prefix | CC | Registry | Allocated | AS Name ...
+    # The AS Name field ($7..$NF) contains spaces, so we must join $7 through
+    # the last field, NOT just take $7 (which would truncate to the first word).
+    # Field map: $1=AS, $2=IP, $3=Prefix, $4=CC, $5=Registry, $6=Allocated, $7..=AS Name
+
+    # View 1: per-(asn,prefix) IP count → asn_raw.txt as "ASN|Name|Prefix|count"
     awk -F'|' '
     NR>1 {
-        gsub(/^[ \t]+|[ \t]+$/, "", $1);
-        gsub(/^[ \t]+|[ \t]+$/, "", $3);
-        gsub(/^[ \t]+|[ \t]+$/, "", $7);
-
-        asn="AS"$1
-        key=asn "|" $7 "|" $3
+        gsub(/^[ \t]+|[ \t]+$/, "", $1);  # AS
+        gsub(/^[ \t]+|[ \t]+$/, "", $3);  # BGP prefix
+        # AS Name = $7 through $NF joined (it contains spaces)
+        name = ""
+        for (i = 7; i <= NF; i++) {
+            t = $i
+            gsub(/^[ \t]+|[ \t]+$/, "", t)
+            name = (name == "") ? t : name " " t
+        }
+        asn = "AS" $1
+        key = asn "|" name "|" $3
         count[key]++
     }
     END {
@@ -89,16 +100,22 @@ run_phase3() {
         }
     }' "$_cymru_cache" > "${pdir}/asn_raw.txt" || true
 
-    # View 2: per-IP IP|ASN|Name|Prefix mapping.
+    # View 2: per-IP mapping → ip_asn_map.txt as "IP|ASN|OrgName|Prefix"
+    # OrgName is the full AS Name ($7..$NF), NOT $3 (which is the prefix).
     awk -F'|' '
     NR>1 {
-        gsub(/^[ \t]+|[ \t]+$/, "", $1);
-        gsub(/^[ \t]+|[ \t]+$/, "", $2);
-        gsub(/^[ \t]+|[ \t]+$/, "", $3);
-        gsub(/^[ \t]+|[ \t]+$/, "", $7);
-
-        asn="AS"$1
-        print $2 "|" asn "|" $3 "|" $7
+        gsub(/^[ \t]+|[ \t]+$/, "", $1);  # AS
+        gsub(/^[ \t]+|[ \t]+$/, "", $2);  # IP
+        gsub(/^[ \t]+|[ \t]+$/, "", $3);  # BGP prefix
+        # AS Name = $7 through $NF joined
+        name = ""
+        for (i = 7; i <= NF; i++) {
+            t = $i
+            gsub(/^[ \t]+|[ \t]+$/, "", t)
+            name = (name == "") ? t : name " " t
+        }
+        asn = "AS" $1
+        print $2 "|" asn "|" name "|" $3
     }' "$_cymru_cache" > "${pdir}/ip_asn_map.txt" || true
 
     rm -f "$_cymru_cache"
