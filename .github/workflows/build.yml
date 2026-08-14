@@ -26,13 +26,15 @@ jobs:
       - name: Verify runtime binaries
         run: |
           docker run --rm ghcr.io/${{ github.repository_owner }}/metho:latest \
-            sh -c 'subfaster -h 2>/dev/null | head -1 && \
-                   httpx -h 2>/dev/null | head -1 && \
-                   katana -h 2>/dev/null | head -1 && \
-                   dnsx -h 2>/dev/null | head -1 && \
-                   shuffledns -h 2>/dev/null | head -1 && \
-                   massdns --help 2>/dev/null | head -1 && \
-                   waymore --help 2>/dev/null | head -1 && \
+            sh -c 'subfaster -h 2>/dev/null | grep -q . && \
+                   httpx -h 2>/dev/null | grep -q . && \
+                   katana -h 2>/dev/null | grep -q . && \
+                   dnsx -h 2>/dev/null | grep -q . && \
+                   shuffledns -h 2>/dev/null | grep -q . && \
+                   massdns --help 2>/dev/null | grep -q . && \
+                   waymore --help 2>/dev/null | grep -q . && \
+                   test -f /opt/tools/SubDomainizer/SubDomainizer.py && \
+                   test -f /opt/tools/cloud_enum/cloud_enum.py && \
                    echo "All runtime binaries OK"'
 
       - name: Verify pipeline scripts

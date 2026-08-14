@@ -326,7 +326,7 @@ setup_dirs() {
 # (dnsx, shuffledns, katana, etc.) are validated lazily, per-stage, with
 # `command -v` so any missing tool is skipped cleanly instead of failing
 # the whole run.
-REQUIRED_TOOLS=(jq curl wget)
+REQUIRED_TOOLS=(jq curl)
 
 validate_deps() {
     local missing=()
