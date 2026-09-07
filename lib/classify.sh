@@ -141,18 +141,24 @@ write_ip_datasets() {
         # First, get hostname→root_domain mapping from canonical DNS
         local dns_tsv="${OUTPUT_DIR}/canonical_dns.tsv"
         # Join domain_ip_map with canonical_dns on hostname to get root_domain
-        # domain_ip_map: hostname IP
-        # canonical_dns.tsv: hostname\troot_domain\t...
+        # domain_ip_map: hostname<space>IP (written by phase3 with a single
+        # space separator — NOT a tab). The earlier -F"\t" here never split
+        # it, silently producing empty hosts/root_domains downstream.
         # Output: IP hostname root_domain
-        awk -F'\t' 'NR==FNR { h2rd[$1] = $2; next }
+        awk 'NR==FNR { h2rd[$1] = $2; next }
         { print $2, $1, h2rd[$1] }' "$dns_tsv" "$domain_ip_map" > "${ip_hosts}.raw"
-        # Aggregate: for each IP, collect all hostnames and root_domains
+        # Aggregate: for each IP, collect all hostnames and root_domains.
+        # NOTE: do NOT use `(ip in hosts)` in a ternary — mawk (Debian's
+        # default awk) CREATES the array element when testing `in` on some
+        # paths, so every first host got a spurious leading ";". Test the
+        # accumulated string length instead.
         awk '{
             ip = $1; host = $2; rd = $3
             if (ip == "" || ip == "hostname") next
-            hosts[ip] = (ip in hosts) ? hosts[ip] ";" host : host
+            if (length(hosts[ip]) > 0) hosts[ip] = hosts[ip] ";" host
+            else hosts[ip] = host
             if (rd != "") {
-                if (!(ip in rds)) rds[ip] = rd
+                if (length(rds[ip]) == 0) rds[ip] = rd
                 else if (index(rds[ip], rd) == 0) rds[ip] = rds[ip] ";" rd
             }
         }
@@ -182,30 +188,29 @@ write_ip_datasets() {
     fi
 
     # Step 3: Build IP → HTTPX CDN lookup from httpx_metadata.tsv
-    # For each IP, check if ANY of its associated hostnames has CDN=true in HTTPX
+    # For each IP, true if ANY associated hostname has CDN=true in HTTPX.
+    # Single awk pass (was: one awk spawn per hostname per IP).
     local ip_httpx_cdn="${pdir}/.ip_httpx_cdn.tmp"
     : > "$ip_httpx_cdn"
     if [[ -s "$meta_tsv" ]] && [[ -s "$ip_hosts" ]]; then
-        # First build hostname→cdn lookup from httpx metadata
-        local host_cdn="${pdir}/.host_cdn.tmp"
-        awk -F'\t' 'NR>1 { print $1 "\t" $2 }' "$meta_tsv" > "$host_cdn"
-
-        # For each IP, check all its hostnames for CDN=true
-        while IFS=$'\t' read -r ip hosts rest; do
-            [[ -z "$ip" ]] && continue
-            local cdn_found="false"
-            IFS=';' read -ra host_arr <<< "$hosts"
-            for h in "${host_arr[@]}"; do
-                local h_cdn
-                h_cdn=$(awk -F'\t' -v hh="$h" '$1 == hh {print $2; exit}' "$host_cdn" 2>/dev/null)
-                if [[ "$h_cdn" == "true" ]]; then
-                    cdn_found="true"
-                    break
-                fi
-            done
-            printf '%s\t%s\n' "$ip" "$cdn_found" >> "$ip_httpx_cdn"
-        done < "$ip_hosts"
-        rm -f "$host_cdn"
+        awk -F'\t' -v OFS='\t' -v META="$meta_tsv" '
+            BEGIN {
+                while ((getline ml < META) > 0) {
+                    split(ml, mm, "\t")
+                    if (mm[1] != "" && mm[1] != "hostname" && mm[2] == "true")
+                        cdn_host[mm[1]] = 1
+                }
+                close(META)
+            }
+            FNR == 1 { next }
+            {
+                n = split($2, hh, ";")
+                found = "false"
+                for (i = 1; i <= n; i++)
+                    if (hh[i] in cdn_host) { found = "true"; break }
+                print $1, found
+            }
+        ' "$ip_hosts" > "$ip_httpx_cdn"
     fi
 
     # Step 4: For each IP, classify and write to ip_classification.tsv
@@ -222,55 +227,74 @@ write_ip_datasets() {
 
     local cdn_count=0 cloud_count=0 dedicated_count=0 unknown_count=0
 
-    while IFS= read -r ip; do
-        [[ -z "$ip" ]] && continue
+    # Batch classification: one awk pass applies the SAME rule order as
+    # classify_ip (httpx cdn → cdn asn → cdn org-substring → cloud asn →
+    # cloud org-substring → dedicated asn → dedicated org-substring →
+    # unknown). The previous per-IP bash loop (an echo + substring scan per
+    # IP) ran at ~100 IPs/s — minutes for a large corpus; this is seconds.
+    # The ASN/provider arrays are passed as files to keep the awk program
+    # free of shell-quoting hazards.
+    local _cd="${pdir}/.cfg_cdn_asn"    _cn="${pdir}/.cfg_cdn_names"
+    local _cl="${pdir}/.cfg_cloud_asn"  _cln="${pdir}/.cfg_cloud_names"
+    local _de="${pdir}/.cfg_ded_asn"    _den="${pdir}/.cfg_ded_names"
+    printf '%s\n' "${CDN_ASNS[@]:-}"        > "$_cd"
+    printf '%s\n' "${CDN_PROVIDER_NAMES[@]:-}"   > "$_cn"
+    printf '%s\n' "${CLOUD_ASNS[@]:-}"      > "$_cl"
+    printf '%s\n' "${CLOUD_PROVIDER_NAMES[@]:-}" > "$_cln"
+    printf '%s\n' "${DEDICATED_ASNS[@]:-}"  > "$_de"
+    printf '%s\n' "${DEDICATED_PROVIDER_NAMES[@]:-}" > "$_den"
 
-        # Look up associated hostnames and root domains
-        local hosts="" root_domains=""
-        if [[ -s "$ip_hosts" ]]; then
-            local line
-            line=$(awk -F'\t' -v i="$ip" '$1 == i {print $0; exit}' "$ip_hosts" 2>/dev/null)
-            if [[ -n "$line" ]]; then
-                hosts=$(echo "$line" | cut -f2)
-                root_domains=$(echo "$line" | cut -f3)
-            fi
-        fi
+    awk -F'\t' -v OFS='\t' \
+        -v out="$class_tsv" \
+        -v f_hosts="$ip_hosts" -v f_asn="$ip_asn" -v f_cdn="$ip_httpx_cdn" \
+        -v f_cdn_asn="$_cd" -v f_cdn_nm="$_cn" \
+        -v f_cloud_asn="$_cl" -v f_cloud_nm="$_cln" \
+        -v f_ded_asn="$_de" -v f_ded_nm="$_den" '
+        function load_keys(f,   l) { while ((getline l < f) > 0) if (l != "") cfg[f, l] = 1; close(f) }
+        function load_map(f, m,   l, p) {
+            while ((getline l < f) > 0) {
+                split(l, p, "\t")
+                if (p[1] != "") m[p[1]] = p[2] "\t" p[3]
+            }
+            close(f)
+        }
+        # Substring org-name match against a provider-name set file.
+        function org_match(nmf, org_l,   l) {
+            if (org_l == "") return 0
+            while ((getline l < nmf) > 0)
+                if (l != "" && index(org_l, l) > 0) { close(nmf); return 1 }
+            close(nmf)
+            return 0
+        }
+        BEGIN {
+            load_keys(f_cdn_asn); load_keys(f_cloud_asn); load_keys(f_ded_asn)
+            load_map(f_hosts, hosts_map)   # ip \t hosts \t root_domains
+            load_map(f_asn, asn_map)       # ip \t asn \t org
+            load_map(f_cdn, cdn_map)       # ip \t true/false
+        }
+        {
+            ip = $1
+            split(hosts_map[ip], hh, "\t"); hosts = hh[1]; rds = hh[2]
+            split(asn_map[ip], aa, "\t");   asn = aa[1];   org = aa[2]
+            org_l = tolower(org)
+            hcdn = (cdn_map[ip] == "true") ? "true" : "false"
+            cls = "unknown"
+            if (hcdn == "true") cls = "cdn"
+            else if ((f_cdn_asn, asn) in cfg) cls = "cdn"
+            else if (org_match(f_cdn_nm, org_l)) cls = "cdn"
+            else if ((f_cloud_asn, asn) in cfg) cls = "cloud"
+            else if (org_match(f_cloud_nm, org_l)) cls = "cloud"
+            else if ((f_ded_asn, asn) in cfg) cls = "dedicated"
+            else if (org_match(f_ded_nm, org_l)) cls = "dedicated"
+            printf "%s\t%s\t%s\t%s\t%s\t%s\n", ip, cls, hosts, rds, asn, org >> out
+        }
+    ' "$all_ips"
 
-        # Look up ASN and org
-        local asn="" asn_org=""
-        if [[ -s "$ip_asn" ]]; then
-            local line
-            line=$(awk -F'\t' -v i="$ip" '$1 == i {print $0; exit}' "$ip_asn" 2>/dev/null)
-            if [[ -n "$line" ]]; then
-                asn=$(echo "$line" | cut -f2)
-                asn_org=$(echo "$line" | cut -f3)
-            fi
-        fi
-
-        # Look up HTTPX CDN flag
-        local httpx_cdn="false"
-        if [[ -s "$ip_httpx_cdn" ]]; then
-            local line
-            line=$(awk -F'\t' -v i="$ip" '$1 == i {print $2; exit}' "$ip_httpx_cdn" 2>/dev/null)
-            [[ "$line" == "true" ]] && httpx_cdn="true"
-        fi
-
-        # Classify
-        local classification
-        classification=$(classify_ip "$ip" "$asn" "$asn_org" "$httpx_cdn")
-
-        # Write to classification TSV
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "$ip" "$classification" "$hosts" "$root_domains" "$asn" "$asn_org" >> "$class_tsv"
-
-        # Count
-        case "$classification" in
-            cdn)       ((cdn_count++)) || true ;;
-            cloud)     ((cloud_count++)) || true ;;
-            dedicated) ((dedicated_count++)) || true ;;
-            unknown)   ((unknown_count++)) || true ;;
-        esac
-    done < "$all_ips"
+    cdn_count=$(awk -F'\t' 'FNR>1 && $2=="cdn" {n++} END{print n+0}' "$class_tsv")
+    cloud_count=$(awk -F'\t' 'FNR>1 && $2=="cloud" {n++} END{print n+0}' "$class_tsv")
+    dedicated_count=$(awk -F'\t' 'FNR>1 && $2=="dedicated" {n++} END{print n+0}' "$class_tsv")
+    unknown_count=$(awk -F'\t' 'FNR>1 && $2=="unknown" {n++} END{print n+0}' "$class_tsv")
+    rm -f "$_cd" "$_cn" "$_cl" "$_cln" "$_de" "$_den"
 
     # Step 5: Produce the separate IP files
     if [[ -s "$class_tsv" ]]; then

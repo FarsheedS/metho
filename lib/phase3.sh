@@ -71,6 +71,14 @@ run_phase3() {
         echo "end"
     } | nc whois.cymru.com 43 2>/dev/null > "$_cymru_cache" || true
 
+    # Validate the response: cymru bulk mode answers with a "Bulk mode;"
+    # banner line before the data rows. Without this check, a failed nc
+    # (firewall, DNS hiccup, transient outage) leaves an empty cache that
+    # silently degrades EVERY IP to classification "unknown".
+    if ! grep -q "^Bulk mode" "$_cymru_cache" 2>/dev/null; then
+        log_warn "ASN lookup via whois.cymru.com failed or returned no data — all IPs will classify as 'unknown'. Check network egress to whois.cymru.com:43."
+    fi
+
     # Cymru "verbose" output format (pipe-separated, with leading/trailing spaces):
     #   AS | IP | BGP-Prefix | CC | Registry | Allocated | AS Name ...
     # The AS Name field ($7..$NF) contains spaces, so we must join $7 through
@@ -180,9 +188,7 @@ run_phase3() {
             if [[ -s "${pdir}/ip_port_pairs.txt" ]]; then
                 log_success "IP:Port pairs discovered: $(wc -l < "${pdir}/ip_port_pairs.txt")"
             else
-                grep '/open/' "${pdir}/port_scan_results.txt" 2>/dev/null | \
-                    awk '{print $2}' | sort -u > "${pdir}/non_cdn_live_ips.txt" || true
-                log_warn "Detailed port parsing had issues, saved live IPs instead"
+                log_warn "No open ports found in nmap output (or parsing found no /open/ lines)"
             fi
         else
             log_warn "nmap not available, skipping port scan"

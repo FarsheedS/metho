@@ -20,12 +20,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Go-based Recon Tools ───────────────────────────────────────────────────
-# Pinned release versions (latest at time of build). No @master branches.
-RUN go install -v github.com/melvinsh/subfaster/v2/cmd/subfaster@latest && \
-    go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest && \
-    go install -v github.com/projectdiscovery/katana/cmd/katana@latest && \
-    go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest && \
-    go install -v github.com/projectdiscovery/shuffledns/cmd/shuffledns@latest
+# Pinned release versions — bump deliberately, never @latest. An unpinned
+# install makes the CI build hostage to upstream releases: a renamed flag or
+# breaking change in a new httpx/katana release breaks the build (or worse,
+# the pipeline at runtime) with no change on our side.
+RUN go install -v github.com/melvinsh/subfaster/v2/cmd/subfaster@v2.20.0 && \
+    go install -v github.com/projectdiscovery/httpx/cmd/httpx@v1.11.0 && \
+    go install -v github.com/projectdiscovery/katana/cmd/katana@v1.7.0 && \
+    go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@v1.3.1 && \
+    go install -v github.com/projectdiscovery/shuffledns/cmd/shuffledns@v1.2.1
 
 # massdns -- required by shuffledns for DNS brute force. It does NOT ship
 # with shuffledns and shuffledns will silently produce no output if it

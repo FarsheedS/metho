@@ -41,6 +41,12 @@ jobs:
                    bash -n /opt/scripts/config/asn_providers.sh && \
                    echo "All scripts OK"'
 
+      - name: Run unit tests
+        run: |
+          docker run --rm --entrypoint bash \
+            -v "$PWD/tests:/opt/scripts/tests:ro" \
+            metho /opt/scripts/tests/run_tests.sh
+
       - name: Print image size
         run: |
           IMAGE_SIZE=$(docker images metho --format "{{.Size}}")

@@ -115,7 +115,10 @@ bounded_parallel() {
     case $- in *e*) _prev_errexit=1; set +e;; *) _prev_errexit=0;; esac
     while read -r line; do
         [[ -z "$line" ]] && continue
-        ( "$func" "$line" "$@" || true ) &
+        # Workers read from /dev/null: a tool that ignores the caller's
+        # stdin redirections (katana historically did) must not swallow the
+        # remaining input lines this loop is still reading.
+        ( "$func" "$line" "$@" || true ) < /dev/null &
         running=$((running + 1))
         if (( running >= concurrency )); then
             if [[ "$_METHO_HAS_WAIT_N" == 1 ]]; then
@@ -132,11 +135,16 @@ bounded_parallel() {
     [[ "$_prev_errexit" == 1 ]] && set -e
 }
 
-log_info()    { local msg="[*] $*"; echo -e "${CYAN}${msg}${NC}"; [[ -n "$LOG_FILE" ]] && echo "$(_log_ts) ${msg}" >> "$LOG_FILE"; }
-log_success() { local msg="[+] $*"; echo -e "${GREEN}${msg}${NC}"; [[ -n "$LOG_FILE" ]] && echo "$(_log_ts) ${msg}" >> "$LOG_FILE"; }
-log_warn()    { local msg="[!] $*"; echo -e "${YELLOW}${msg}${NC}"; [[ -n "$LOG_FILE" ]] && echo "$(_log_ts) ${msg}" >> "$LOG_FILE"; }
-log_error()   { local msg="[-] $*"; echo -e "${RED}${msg}${NC}"; [[ -n "$LOG_FILE" ]] && echo "$(_log_ts) ${msg}" >> "$LOG_FILE"; }
-log_skip()    { local msg="[SKIP] $*"; echo -e "${YELLOW}${msg}${NC}"; [[ -n "$LOG_FILE" ]] && echo "$(_log_ts) ${msg}" >> "$LOG_FILE"; }
+# NOTE: each logger must return 0 unconditionally. Before init_log runs,
+# LOG_FILE is empty and the `[[ -n "$LOG_FILE" ]] && ...` guard would leave
+# the function with status 1 — under `set -e` (recon.sh) that silently kills
+# the whole pipeline the first time a logger fires pre-init (e.g. the
+# --subfaster-config message in validate_args).
+log_info()    { local msg="[*] $*"; echo -e "${CYAN}${msg}${NC}"; { [[ -n "$LOG_FILE" ]] && echo "$(_log_ts) ${msg}" >> "$LOG_FILE"; } || true; }
+log_success() { local msg="[+] $*"; echo -e "${GREEN}${msg}${NC}"; { [[ -n "$LOG_FILE" ]] && echo "$(_log_ts) ${msg}" >> "$LOG_FILE"; } || true; }
+log_warn()    { local msg="[!] $*"; echo -e "${YELLOW}${msg}${NC}"; { [[ -n "$LOG_FILE" ]] && echo "$(_log_ts) ${msg}" >> "$LOG_FILE"; } || true; }
+log_error()   { local msg="[-] $*"; echo -e "${RED}${msg}${NC}"; { [[ -n "$LOG_FILE" ]] && echo "$(_log_ts) ${msg}" >> "$LOG_FILE"; } || true; }
+log_skip()    { local msg="[SKIP] $*"; echo -e "${YELLOW}${msg}${NC}"; { [[ -n "$LOG_FILE" ]] && echo "$(_log_ts) ${msg}" >> "$LOG_FILE"; } || true; }
 
 # ── CLI Argument Parsing ────────────────────────────────────────────────────
 DOMAINS=""
@@ -160,6 +168,17 @@ ASN_CONFIG_FILE=""
 # Waymore mode: U (URLs only), R (responses only), B (both, default)
 WAYMORE_MODE="B"
 
+# Numeric-argument guard: rejects non-integer values up-front so a typo like
+# `--threads abc` fails immediately with a clear message instead of deep inside
+# shuffledns/cloud_enum at runtime.
+_require_int() {
+    local flag="$1" val="$2"
+    if ! [[ "$val" =~ ^[0-9]+$ ]]; then
+        log_error "$flag requires a positive integer, got: $val"
+        exit 1
+    fi
+}
+
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -169,13 +188,16 @@ parse_args() {
             --asn-config)     ASN_CONFIG_FILE="$2"; shift 2 ;;
             --waymore-mode)   WAYMORE_MODE="$2"; shift 2 ;;
             --auto)           AUTO=true; shift ;;
-            --skip-phase)     SKIP_PHASES+=("$2"); shift 2 ;;
+            --skip-phase)     case "$2" in
+                                  1|2|3) SKIP_PHASES+=("$2") ;;
+                                  *) log_error "Invalid --skip-phase value: $2 (must be 1, 2, or 3)"; exit 1 ;;
+                              esac; shift 2 ;;
             --skip-cloud)     SKIP_PHASES+=("2"); shift ;;
             --no-port-scan)   PORT_SCAN=false; shift ;;
-            --threads)        THREADS="$2"; shift 2 ;;
-            --parallel-hosts) PARALLEL_HOSTS="$2"; shift 2 ;;
-            --rate-limit)     RATE_LIMIT="$2"; shift 2 ;;
-            --timeout)        CHECKPOINT_TIMEOUT="$2"; shift 2 ;;
+            --threads)        _require_int "$1" "$2"; THREADS="$2"; shift 2 ;;
+            --parallel-hosts) _require_int "$1" "$2"; PARALLEL_HOSTS="$2"; shift 2 ;;
+            --rate-limit)     _require_int "$1" "$2"; RATE_LIMIT="$2"; shift 2 ;;
+            --timeout)        _require_int "$1" "$2"; CHECKPOINT_TIMEOUT="$2"; shift 2 ;;
             --output)         OUTPUT_DIR="$2"; shift 2 ;;
             --cloud-enum-keywords) CLOUD_ENUM_KEYWORDS="$2"; shift 2 ;;
             -h|--help)
@@ -188,7 +210,7 @@ parse_args() {
                 echo "Options:"
                 echo "  --subfaster-config FILE   Path to subfaster provider-config.yaml (API keys)"
                 echo "  --asn-config FILE         Path to ASN provider classification config (default: built-in)"
-                echo "  --waymore-mode MODE       Waymore mode: U (URLs), R (responses), B (both, default)"
+                echo "  --waymore-mode MODE       Waymore mode: U (URLs) or B (both, default)"
                 echo "  --auto                    Skip all checkpoint prompts"
                 echo "  --skip-phase {1,2,3}      Skip specific phase(s)"
                 echo "  --skip-cloud              Shorthand for --skip-phase 2"
@@ -232,8 +254,11 @@ validate_args() {
     fi
     # Validate waymore mode
     case "$WAYMORE_MODE" in
-        U|R|B) ;;
-        *) log_error "Invalid --waymore-mode: $WAYMORE_MODE (must be U, R, or B)"; exit 1 ;;
+        # R (responses only) is deliberately NOT accepted: Phase 1 extracts
+        # subdomains from waymore's -oU URL output, which responses-only mode
+        # does not produce — a mode-R run would silently discover nothing.
+        U|B) ;;
+        *) log_error "Invalid --waymore-mode: $WAYMORE_MODE (must be U or B; R is not supported because the pipeline consumes URL output)"; exit 1 ;;
     esac
 }
 
@@ -332,7 +357,7 @@ checkpoint() {
 # host user read, modify, and delete results without "permission denied".
 setup_dirs() {
     mkdir -p "${OUTPUT_DIR}"/{phase1,phase2,phase3,final,config}
-    chmod -R 777 "$OUTPUT_DIR" 2>/dev/null
+    chmod -R 777 "$OUTPUT_DIR" 2>/dev/null || true
 }
 
 # ── Dependency Check ────────────────────────────────────────────────────────

@@ -43,6 +43,11 @@ run_consolidation() {
         log_info "Canonical DNS dataset: $(tail -n +2 "${fdir}/canonical_dns.tsv" | wc -l) entries"
     fi
 
+    # ── HTTPX Metadata TSV (per-host CDN/tech/webserver companion) ──────────
+    if [[ -s "${OUTPUT_DIR}/httpx_metadata.tsv" ]]; then
+        cp "${OUTPUT_DIR}/httpx_metadata.tsv" "${fdir}/httpx_metadata.tsv"
+    fi
+
     # ── Waymore URLs ─────────────────────────────────────────────────────────
     # Merge all per-domain waymore URL outputs into one file
     cat "${OUTPUT_DIR}"/phase1/*/waymore_urls.txt 2>/dev/null | sort -u > "${fdir}/final_waymore_urls.txt" || true
@@ -134,6 +139,7 @@ FILES CREATED IN final/:
 - final_all_domains.txt          (all subdomains)
 - final_live_web_servers.txt     (live web server URLs)
 - final_httpx_metadata.json       (full httpx JSON with CDN/tech/webserver)
+- httpx_metadata.tsv              (per-host HTTPX metadata companion to canonical_dns.tsv)
 - canonical_dns.tsv               (canonical hostname→DNS dataset)
 - final_waymore_urls.txt          (historical URLs from Waymore)
 - final_cloud_assets.txt         (cloud assets)

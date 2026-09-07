@@ -78,93 +78,107 @@ match_root_domain() {
 #     preferred path when the caller already knows the root domain (e.g. inside
 #     process_domain, where it is the domain being processed).
 #   - Otherwise the root domain is matched against the known root domains
-#     supplied to Metho (see match_root_domain). A hostname that matches no
-#     known root domain (e.g. an out-of-scope cloud CNAME target) is still
-#     added but with an empty root_domain — the root domain is NEVER inferred
-#     from the hostname's labels.
+#     (same matching rules as match_root_domain: exact or .suffix, first
+#     root in ROOT_DOMAINS_FILE wins — never derived from hostname labels).
+#
+# Performance: the merge is a SINGLE awk pass (batch loaded into an in-memory
+# array, TSV streamed once). The previous implementation re-scanned — and for
+# changes rewrote — the ENTIRE TSV once per input hostname, making a 25k-line
+# passive-enum merge for one domain take ~30 minutes (O(N²) in file rewrites).
 canonical_dns_add_sources() {
     local source="$1" hostnames_file="$2" explicit_root="${3:-}"
     local tsv="${OUTPUT_DIR}/canonical_dns.tsv"
 
-    if [[ ! -s "$hostnames_file" ]]; then
-        log_warn "canonical_dns_add_sources: $hostnames_file is empty or missing, skipping"
-        return
-    fi
-
-    # Ensure the TSV exists with a header
-    if [[ ! -s "$tsv" ]]; then
+    if [[ ! -f "$tsv" ]]; then
         init_canonical_dns
     fi
 
+    # Normalize the whole batch up-front (trim, strip *. and trailing dot,
+    # lowercase, drop empties, dedupe). One pipeline, not one per hostname.
+    local norm="${tsv}.add_norm"
+    grep -v '^[[:space:]]*$' "$hostnames_file" 2>/dev/null \
+        | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^\*\.//;s/\.$//' \
+        | tr '[:upper:]' '[:lower:]' \
+        | grep -v '^$' \
+        | sort -u > "$norm" || true
+
     local added=0 skipped=0
 
-    while IFS= read -r raw_host; do
-        [[ -z "$raw_host" ]] && continue
-        local host
-        host=$(normalize_hostname "$raw_host")
-        [[ -z "$host" ]] && continue
+    if [[ -s "$norm" ]]; then
+        local norm_root=""
+        [[ -n "$explicit_root" ]] && norm_root=$(normalize_hostname "$explicit_root")
 
-        # Resolve the root domain: explicit argument wins, otherwise match
-        # against the known root domains supplied to Metho. We never derive
-        # it from the hostname's last two labels (breaks ccTLDs).
-        local root_domain="$explicit_root"
-        if [[ -z "$root_domain" ]]; then
-            root_domain=$(match_root_domain "$host")
-        else
-            # Normalize the explicit root domain so the value stored in the
-            # root_domain column is canonical (lowercase, no trailing dot).
-            # A root domain stored in original case was later matched
-            # case-sensitively by the per-root slice, silently emptying that
-            # root's results.
-            root_domain=$(normalize_hostname "$root_domain")
-        fi
-        # root_domain may legitimately be empty for out-of-scope cloud hosts;
-        # such hosts are still tracked so their IPs get resolved/classified.
+        local counts="${tsv}.add_counts"
+        local tmp="${tsv}.add_tmp"
 
-        # Check if hostname already exists in the TSV
-        local existing_line
-        existing_line=$(awk -F'\t' -v h="$host" '$1 == h {print NR; exit}' "$tsv" 2>/dev/null || true)
-
-        if [[ -n "$existing_line" ]]; then
-            # Hostname exists — append source to discovery_sources if not
-            # already present (sources are retained and merged, never
-            # overwritten). Also back-fill root_domain if it was previously
-            # empty (e.g. an out-of-scope cloud host later identified as
-            # in-scope); an existing non-empty root_domain is preserved.
-            local current_sources current_root
-            current_sources=$(awk -F'\t' -v h="$host" '$1 == h {print $3; exit}' "$tsv")
-            current_root=$(awk -F'\t' -v h="$host" '$1 == h {print $2; exit}' "$tsv")
-
-            local source_changed=0 root_changed=0
-            local new_sources="$current_sources"
-            if [[ ";${current_sources};" != *";${source};"* ]]; then
-                new_sources="${current_sources};${source}"
-                source_changed=1
-            fi
-            if [[ -z "$current_root" && -n "$root_domain" ]]; then
-                root_changed=1
-            fi
-
-            if (( source_changed || root_changed )); then
-                local tmp="${tsv}.tmp"
-                awk -F'\t' -v h="$host" -v s="$new_sources" \
-                    -v rd="$root_domain" -v rd_set="$root_changed" \
-                    -v OFS='\t' '
-                    $1 == h {
-                        $3 = s
-                        if (rd_set) $2 = rd
+        # File 1 ($norm): normalized new hostnames, one per line.
+        # File 2 ($tsv):  the canonical TSV (header on line 1).
+        awk -F'\t' -v OFS='\t' -v src="$source" -v xr="$norm_root" \
+            -v roots_file="${ROOT_DOMAINS_FILE:-}" -v counts_file="$counts" '
+            # Load the root-domain list once for suffix matching.
+            BEGIN {
+                nroots = 0
+                if (roots_file != "") {
+                    while ((getline rl < roots_file) > 0) {
+                        rl = tolower(rl)
+                        sub(/^[[:space:]]+/, "", rl); sub(/[[:space:]]+$/, "", rl)
+                        sub(/^\*\./, "", rl); sub(/\.$/, "", rl)
+                        if (rl != "") roots[++nroots] = rl
                     }
-                    { print }
-                ' "$tsv" > "$tmp" && mv "$tmp" "$tsv"
-            fi
-            ((skipped++)) || true
-        else
-            # New hostname — add as pending
-            printf '%s\t%s\t%s\t\t\t\tpending\n' "$host" "$root_domain" "$source" >> "$tsv"
-            ((added++)) || true
-        fi
-    done < "$hostnames_file"
+                    close(roots_file)
+                }
+            }
+            # Exact match, or ".<root>" suffix — index arithmetic avoids
+            # regex-escaping the dots in root domains.
+            function match_root(h,    i, suf) {
+                for (i = 1; i <= nroots; i++) {
+                    if (h == roots[i]) return roots[i]
+                    suf = "." roots[i]
+                    if (substr(h, length(h) - length(suf) + 1) == suf) return roots[i]
+                }
+                return ""
+            }
+            NR == FNR {
+                if (!($0 in new_root)) order[++n] = $0
+                rd = (xr != "") ? xr : match_root($0)
+                if (!($0 in new_root) || (new_root[$0] == "" && rd != "")) new_root[$0] = rd
+                next
+            }
+            # The TSV header (line 1 of file 2) must be preserved in the
+            # output — dropping it here turned every later call into seeing
+            # the first data row as the "header" (silently skipped),
+            # corrupting the dataset. Print it, then process data rows.
+            FNR == 1 { print; next }
+            {
+                if ($1 in new_root) {
+                    consumed[$1] = 1
+                    if (index(";" $3 ";", ";" src ";") == 0)
+                        $3 = ($3 == "" ? src : $3 ";" src)
+                    if ($2 == "" && new_root[$1] != "") $2 = new_root[$1]
+                    updated++
+                }
+                print
+            }
+            END {
+                for (i = 1; i <= n; i++) {
+                    h = order[i]
+                    if (!(h in consumed)) {
+                        printf "%s\t%s\t%s\t\t\t\tpending\n", h, new_root[h], src
+                        added++
+                    }
+                }
+                printf "ADDED=%d\nUPDATED=%d\n", added, updated > counts_file
+            }
+        ' "$norm" "$tsv" > "$tmp" && mv "$tmp" "$tsv"
 
+        if [[ -s "$counts" ]]; then
+            added=$(sed -n 's/^ADDED=//p' "$counts")
+            skipped=$(sed -n 's/^UPDATED=//p' "$counts")
+        fi
+        rm -f "$counts"
+    fi
+
+    rm -f "$norm"
     log_info "Canonical DNS: added $added new hostnames from $source, updated $skipped existing"
 }
 
@@ -210,62 +224,77 @@ canonical_dns_resolve_pending() {
         -silent -a -aaaa -cname -json -retry 2 \
         -r /opt/scripts/wordlists/resolvers.txt \
         -timeout 5 \
-        2>/dev/null > "$dnsx_json" || true
+        2>"${dnsx_json}.stderr" > "$dnsx_json" || true
 
-    # Build a lookup of hostname → DNS results from dnsx JSONL
-    local dnsx_tmp="${tsv}.dnsx_tmp"
+    # Resolver-health check: dnsx's [WRN] line is the only signal that the
+    # RESOLVERS (not the domains) are failing — e.g. a network that blocks
+    # outbound UDP/53 to public resolvers makes the entire shipped list dead
+    # while dnsx still exits 0. Surface it loudly instead of letting every
+    # host silently become "timeout".
+    if grep -q "domains failed to resolve" "${dnsx_json}.stderr" 2>/dev/null; then
+        local _failed_n
+        _failed_n=$(grep -oE "[0-9]+ domains failed" "${dnsx_json}.stderr" | head -1 | grep -oE "^[0-9]+")
+        if [[ -n "$_failed_n" && "$_failed_n" -ge "$pending_count" ]]; then
+            log_warn "dnsx failed to resolve ${_failed_n}/${pending_count} hosts — if this is ALL of them, the resolvers list (wordlists/resolvers.txt) is likely unreachable from this network"
+        fi
+    fi
+    rm -f "${dnsx_json}.stderr"
 
-    # Mark all pending hosts as "timeout" initially (will be overridden if dnsx resolves them)
-    local tmp="${tsv}.resolve_tmp"
-
-    # Start with a copy
-    cp "$tsv" "$tmp"
-
-    # First, mark all pending hosts as timeout (default — overridden if dnsx resolves them)
+    # Single-pass merge: stream the TSV once, applying the dnsx results held
+    # in an in-memory map. The previous implementation re-rewrote the whole
+    # TSV once per dnsx JSON line (O(N×M) full-file rewrites — tens of
+    # minutes on a large corpus). jq pre-parses the JSONL ONCE into a flat
+    # host\tA\tAAAA\tCNAME\tstatus map; awk then joins in one pass.
     awk -F'\t' -v OFS='\t' '
         $7 == "pending" { $7 = "timeout" }
         { print }
-    ' "$tmp" > "${tmp}.2" && mv "${tmp}.2" "$tmp"
+    ' "$tsv" > "${tsv}.pre_resolve"
 
-    # Then update from dnsx results
     if [[ -s "$dnsx_json" ]]; then
-        # Parse dnsx JSONL: for each record, extract host, A, AAAA, CNAME
-        # dnsx JSON fields: .host, .a[], .aaaa[], .cname[]
-        while IFS= read -r line; do
-            local host a_records aaaa_records cname_records
-            host=$(echo "$line" | jq -r '.host // empty' 2>/dev/null)
-            [[ -z "$host" ]] && continue
-            host=$(normalize_hostname "$host")
+        local dnsx_map="${tsv}.dnsx_map"
+        # dnsx JSON fields: .host, .a[], .aaaa[], .cname[]. A record with
+        # empty A/AAAA/CNAME is ambiguous (SERVFAIL/timeout vs no-answer) —
+        # we keep it as "timeout": mislabeling a timeout as "nxdomain" would
+        # permanently write off a host that may actually be live, while
+        # "timeout" honestly signals "unresolved — retry if you care".
+        jq -r '
+            (.host | ascii_downcase | sub("^[*][.]"; "") | sub("[.]$"; "")) as $h
+            | [$h,
+               (if .a then (.a | join(";")) else "" end),
+               (if .aaaa then (.aaaa | join(";")) else "" end),
+               (if .cname then (.cname | join(";")) else "" end),
+               (if (.a // [] | length) == 0 and (.aaaa // [] | length) == 0 and (.cname // [] | length) == 0
+                then "timeout" else "resolved" end)]
+            | @tsv
+        ' "$dnsx_json" > "$dnsx_map" 2>/dev/null || : > "$dnsx_map"
 
-            a_records=$(echo "$line" | jq -r 'if .a then (.a | join(";")) else "" end' 2>/dev/null)
-            aaaa_records=$(echo "$line" | jq -r 'if .aaaa then (.aaaa | join(";")) else "" end' 2>/dev/null)
-            cname_records=$(echo "$line" | jq -r 'if .cname then (.cname | join(";")) else "" end' 2>/dev/null)
-
-            local status="resolved"
-            # If we have no A, AAAA, or CNAME records, check if it's an nxdomain
-            if [[ -z "$a_records" && -z "$aaaa_records" && -z "$cname_records" ]]; then
-                # dnsx returns the host with empty records for timeouts;
-                # nxdomain typically produces no output at all.
-                # If we got here with empty records, it's likely a timeout.
-                status="nxdomain"
-            fi
-
-            # Update the TSV row for this hostname
-            awk -F'\t' -v h="$host" -v a="$a_records" -v aaaa="$aaaa_records" \
-                -v cname="$cname_records" -v st="$status" -v OFS='\t' '
-                $1 == h {
-                    if (a != "") $4 = a
-                    if (aaaa != "") $5 = aaaa
-                    if (cname != "") $6 = cname
-                    $7 = st
+        awk -F'\t' -v OFS='\t' -v NR_FILE="$dnsx_map" '
+            BEGIN {
+                while ((getline dl < NR_FILE) > 0) {
+                    split(dl, d, "\t")
+                    if (d[1] == "" || d[1] == "host") continue
+                    da[d[1]] = d[2]; daaaa[d[1]] = d[3]
+                    dcname[d[1]] = d[4];    dst[d[1]] = d[5]
                 }
-                { print }
-            ' "$tmp" > "${tmp}.3" && mv "${tmp}.3" "$tmp"
-        done < "$dnsx_json"
+                close(NR_FILE)
+            }
+            FNR == 1 { next }
+            {
+                if ($1 in dst) {
+                    if (da[$1]    != "") $4 = da[$1]
+                    if (daaaa[$1] != "") $5 = daaaa[$1]
+                    if (dcname[$1]!= "") $6 = dcname[$1]
+                    $7 = dst[$1]
+                }
+                print
+            }
+        ' "${tsv}.pre_resolve" > "${tsv}.resolved" \
+            && mv "${tsv}.resolved" "$tsv" \
+            || mv "${tsv}.pre_resolve" "$tsv"
+        rm -f "${tsv}.pre_resolve" "$dnsx_map"
+    else
+        mv "${tsv}.pre_resolve" "$tsv"
     fi
-
-    # Replace the original TSV with the updated one
-    mv "$tmp" "$tsv"
 
     # Report
     local resolved=0 nxdomain=0 timeout=0 still_pending=0
@@ -301,45 +330,53 @@ canonical_dns_merge_httpx() {
         printf 'hostname\tcdn\ttechnologies\twebserver\tcontent_length\tstatus_code\ttitle\turl\n' > "$meta_tsv"
     fi
 
-    # Parse each JSONL line and extract metadata
-    while IFS= read -r line; do
-        local host cdn tech webserver content_length status_code title url
-        host=$(echo "$line" | jq -r '.host // empty' 2>/dev/null)
-        [[ -z "$host" ]] && continue
-        host=$(normalize_hostname "$host")
+    # Single-pass merge (was: one full-file awk rewrite per JSONL line —
+    # O(N×M)). jq flattens the whole JSONL once; awk streams the TSV once,
+    # updating existing rows and appending new ones in the same pass.
+    local flat="${meta_tsv}.flat"
+    # httpx "tech" is a JSON array of STRINGS (not objects), per the Result
+    # struct in runner/types.go — join directly. webserver field is
+    # "webserver" (json tag), NOT "server".
+    jq -r '
+        (.host | ascii_downcase | sub("^[*][.]"; "") | sub("[.]$"; "")) as $h
+        | [$h,
+           (if .cdn != null then (.cdn | tostring) else "" end),
+           (if .tech then (.tech | join(";")) else "" end),
+           (.webserver // ""),
+           (.content_length // ""),
+           (.status_code // ""),
+           (.title // ""),
+           (.url // "")]
+        | @tsv
+    ' "$httpx_json" > "$flat" 2>/dev/null || : > "$flat"
 
-        cdn=$(echo "$line" | jq -r 'if .cdn != null then (.cdn | tostring) else "" end' 2>/dev/null)
-        # httpx "tech" is a JSON array of STRINGS (not objects), per the
-        # Result struct in runner/types.go: `Technologies []string json:"tech"`.
-        # Join directly — no per-element .name extraction needed.
-        tech=$(echo "$line" | jq -r 'if .tech then (.tech | join(";")) else "" end' 2>/dev/null)
-        # httpx web-server field is "webserver" (json tag), NOT "server".
-        webserver=$(echo "$line" | jq -r '.webserver // ""' 2>/dev/null)
-        content_length=$(echo "$line" | jq -r '.content_length // ""' 2>/dev/null)
-        status_code=$(echo "$line" | jq -r '.status_code // ""' 2>/dev/null)
-        title=$(echo "$line" | jq -r '.title // ""' 2>/dev/null)
-        url=$(echo "$line" | jq -r '.url // ""' 2>/dev/null)
-
-        # Check if host already exists in metadata — if so, update; if not, append
-        local existing
-        existing=$(awk -F'\t' -v h="$host" '$1 == h {print NR; exit}' "$meta_tsv" 2>/dev/null || true)
-        if [[ -n "$existing" ]]; then
-            # Update existing row — prefer the richer record (more fields filled)
-            local tmp="${meta_tsv}.tmp"
-            awk -F'\t' -v h="$host" -v c="$cdn" -v t="$tech" -v w="$webserver" \
-                -v cl="$content_length" -v sc="$status_code" -v ti="$title" -v u="$url" \
-                -v OFS='\t' '
-                $1 == h {
-                    $2 = c; $3 = t; $4 = w; $5 = cl; $6 = sc; $7 = ti; $8 = u
-                }
-                { print }
-            ' "$meta_tsv" > "$tmp" && mv "$tmp" "$meta_tsv"
-        else
-            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-                "$host" "$cdn" "$tech" "$webserver" "$content_length" "$status_code" "$title" "$url" \
-                >> "$meta_tsv"
-        fi
-    done < "$httpx_json"
+    local tmp="${meta_tsv}.tmp"
+    awk -F'\t' -v OFS='\t' -v FLAT="$flat" '
+        BEGIN {
+            while ((getline fl < FLAT) > 0) {
+                split(fl, f, "\t")
+                if (f[1] == "" || f[1] == "hostname") continue
+                # Last record per host wins (later rounds overwrite earlier).
+                m_host[++n] = f[1]
+                m[f[1]] = fl
+            }
+            close(FLAT)
+        }
+        FNR == 1 { print; next }
+        {
+            if ($1 in m) {
+                print m[$1]
+                seen[$1] = 1
+            } else {
+                print
+            }
+        }
+        END {
+            for (i = 1; i <= n; i++)
+                if (!(m_host[i] in seen)) print m[m_host[i]]
+        }
+    ' "$meta_tsv" > "$tmp" && mv "$tmp" "$meta_tsv"
+    rm -f "$flat"
 
     log_info "Canonical DNS: merged HTTPX metadata from $httpx_json"
 }

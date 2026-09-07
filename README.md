@@ -78,14 +78,14 @@ Discovers AWS, Azure, and GCP assets associated with the root domains. This phas
 
 ### Phase 3: IP → Classification → Port Scan
 
-Resolves all discovered domains to IPs, performs deterministic IP classification, and port scans non-CDN IPs.
+Resolves any still-pending hostnames from the canonical DNS dataset, performs deterministic IP classification, and port scans non-CDN IPs.
 
 | Stage | What Happens | Tool(s) |
 |-------|-------------|---------|
-| 1 | Extract IPs from canonical DNS dataset | dnsx (already resolved) |
+| 1 | Extract IPs from canonical DNS dataset (pending hosts resolved first) | dnsx |
 | 2 | IP → ASN lookup via whois.cymru.com | nc |
 | 3 | Deterministic IP classification (CDN/cloud/dedicated/unknown) | Built-in classification engine |
-| 4 | Port scan on nmap candidates (dedicated + cloud + unknown) | nmap |
+| 4 | Port scan on nmap candidates (dedicated + cloud + unknown) — skipped with `--no-port-scan` | nmap |
 
 ---
 
@@ -109,12 +109,13 @@ Phases 2 and 3 never re-resolve the entire corpus — only newly discovered host
 
 ## Deterministic IP Classification
 
-IPs are classified using a strict priority order:
+IPs are classified using a strict priority order. Each ASN rule matches on the
+ASN number **or** a case-insensitive substring of the ASN organization name:
 
 1. **HTTPX CDN = true** → `cdn`
-2. **ASN matches CDN config** → `cdn`
-3. **ASN matches cloud config** → `cloud`
-4. **ASN matches dedicated hosting config** → `dedicated`
+2. **ASN number or org name matches CDN config** → `cdn`
+3. **ASN number or org name matches cloud config** → `cloud`
+4. **ASN number or org name matches dedicated hosting config** → `dedicated`
 5. **Otherwise** → `unknown`
 
 Each IP receives exactly one classification. CDN IPs are retained in results but excluded from nmap scanning. The classification rules and provider/ASN lists are in `config/asn_providers.sh` — edit this file to add or modify providers.
@@ -161,20 +162,39 @@ Required (one of):
   --domains-file FILE       Line-separated root domains file
 
 Options:
+  -h, --help                Show this help and exit
   --subfaster-config FILE   Path to subfaster provider-config.yaml (API keys)
   --asn-config FILE         Path to ASN provider classification config (default: built-in)
-  --waymore-mode MODE       Waymore mode: U (URLs), R (responses), B (both, default)
+  --waymore-mode MODE       Waymore mode: U (URLs) or B (both, default). R (responses
+                            only) is not supported — the pipeline consumes URL output
   --auto                    Skip all checkpoint prompts
-  --skip-phase {1,2,3}      Skip specific phase(s)
+  --skip-phase {1,2,3}      Skip specific phase(s) — value is validated
   --skip-cloud              Shorthand for --skip-phase 2
-  --no-port-scan            Skip port scanning phase
-  --threads N               Thread count (default: 50)
-  --parallel-hosts N         Hosts crawled in parallel per per-host tool (default: 5)
-  --rate-limit N            Requests/second (default: 100)
-  --timeout N               Checkpoint auto-continue timeout in seconds (default: 30)
+  --no-port-scan            Skip the port-scan stage inside Phase 3 (classification still runs)
+  --threads N               Threads for ShuffleDNS and Cloud_Enum (default: 50)
+  --parallel-hosts N        Hosts crawled in parallel per per-host tool (default: 5)
+  --rate-limit N            httpx requests/second (default: 100)
+  --timeout N               Checkpoint auto-continue timeout in seconds; 0 = wait forever (default: 30)
   --output DIR              Output directory (default: /output)
   --cloud-enum-keywords KW Keywords for cloud_enum brute force (comma-sep, auto-derived from domains)
 ```
+
+> **Flag scope notes:** `--rate-limit` applies only to httpx (Waymore, Katana, and the DNS tools use their own fixed/internal limits); `--threads` applies only to ShuffleDNS and Cloud_Enum.
+
+### Checkpoints
+
+Without `--auto`, the pipeline pauses after each phase with a menu:
+
+```
+[CHECKPOINT] Phase 1 complete. ...
+
+  [C]ontinue  [S]kip next phase  [Q]uit  [R]eview results
+  >
+```
+
+- `C`/Enter continues; `S` skips the next phase; `Q` exits cleanly; `R` lists the phase's output files.
+- On a non-TTY run (e.g. `docker run` without `-it`), checkpoints auto-continue — `--auto` and `--timeout` only matter on an interactive terminal.
+- With `--timeout N` (default 30s), an unanswered prompt auto-continues after N seconds; `--timeout 0` waits forever.
 
 ### Examples
 
@@ -271,7 +291,7 @@ results/
 ├── recon.log                      # Timestamped log of all stages
 ├── canonical_dns.tsv              # Canonical hostname→DNS dataset
 ├── httpx_metadata.tsv             # HTTPX CDN/tech/webserver metadata per host
-├── root_domains.txt               # Resolved input root domains
+├── root_domains.txt               # Normalized, deduplicated input root domains
 │
 ├── phase1/
 │   ├── example.com/
@@ -333,6 +353,7 @@ results/
     ├── final_all_domains.txt             # Every subdomain across all root domains
     ├── final_live_web_servers.txt        # Every live URL across all root domains
     ├── final_httpx_metadata.json          # Full httpx JSON output (CDN, tech, etc.)
+    ├── httpx_metadata.tsv                 # Per-host HTTPX metadata (companion to canonical_dns.tsv)
     ├── canonical_dns.tsv                  # Canonical hostname→DNS dataset
     ├── final_waymore_urls.txt             # All historical URLs from Waymore
     ├── final_cloud_assets.txt             # Every cloud asset
@@ -404,8 +425,6 @@ How it works:
 
 A human-readable summary printed at the end of every run:
 
-A human-readable summary printed at the end of every run:
-
 ```
 ========================================
 RECONNAISSANCE PHASE COMPLETE
@@ -450,8 +469,8 @@ docker build -t metho .
 ```
 
 The build uses a multi-stage Dockerfile:
-- **Builder stage** (`debian:13-slim`): Compiles Go binaries (subfaster, httpx, katana, dnsx, shuffledns), massdns, and installs Ruby gems for CeWL. All build-only dependencies (Go compiler, git, build-essential, ruby-dev, etc.) stay in this stage.
-- **Runtime stage** (`debian:13-slim`): Copies only the compiled binaries and runtime dependencies. No compilers, Go SDK, Python headers, or build tools in the final image.
+- **Builder stage** (`debian:13-slim`): Compiles the Go binaries (subfaster, httpx, katana, dnsx, shuffledns — all pinned to exact release versions), builds massdns, and clones the git-hosted tools (CeWL, SubDomainizer, cloud_enum). Go compiler, git, and build-essential stay in this stage.
+- **Runtime stage** (`debian:13-slim`): Copies the compiled binaries and cloned tools, installs runtime interpreters/packages, and installs the Ruby gems CeWL needs (native gems must compile against the runtime's libc, so they are built here — their build deps are purged in the same layer). No compilers, Go SDK, or git in the final image.
 
 ### Installed Tools
 
@@ -532,11 +551,25 @@ Every tool below is wired into the pipeline (see `lib/phase1.sh`, `lib/phase2.sh
 
 ## Tips
 
-- **Rate limiting matters.** If you're getting timeouts or empty results, lower `--rate-limit` (e.g., 50 or 25).
+- **Rate limiting matters.** If httpx is getting timeouts or empty results, lower `--rate-limit` (e.g., 50 or 25) — note this flag affects httpx only.
 - **ASN occurrence matters.** In `final_asn_summary.txt`, ASNs with fewer IPs are more interesting — they may represent niche hosting or forgotten infrastructure.
 - **Cloud enum keywords.** By default, the base name of each root domain is used as a keyword. Use `--cloud-enum-keywords` to add extra keywords.
 - **Check canonical_dns.tsv.** The canonical DNS dataset tracks every hostname, its resolution status, and which tools discovered it. Useful for debugging and understanding coverage gaps.
 - **IP classification is configurable.** Edit `config/asn_providers.sh` to add or remove CDN, cloud, and dedicated hosting providers and ASNs.
-- **Waymore modes.** Use `--waymore-mode U` for URLs only (faster) or `--waymore-mode B` for both URLs and archived responses (slower, richer data).
+- **Waymore modes.** Use `--waymore-mode U` for URLs only (faster) or `--waymore-mode B` for both URLs and archived responses (slower, richer data). Mode `R` (responses without the URL file) is not supported — the pipeline extracts subdomains from the URL output.
 - **Check recon.log.** The timestamped log file captures everything — useful for debugging or tuning the pipeline.
 - **Do manual recon first.** Google dorking and reverse WHOIS can find additional root domains. Add them to your input file before running the pipeline.
+
+---
+
+## Testing
+
+Unit tests for the pipeline's pure functions (hostname normalization, ccTLD-safe
+root matching, classification priority, canonical-DNS lifecycle, cloud-domain
+filtering) live in `tests/run_tests.sh` and run as part of both GitHub build
+workflows. To run them locally against a built image:
+
+```bash
+docker run --rm --entrypoint bash -v $(pwd)/tests:/opt/scripts/tests:ro \
+  metho /opt/scripts/tests/run_tests.sh
+```
