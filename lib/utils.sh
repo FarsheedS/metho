@@ -149,7 +149,10 @@ log_skip()    { local msg="[SKIP] $*"; echo -e "${YELLOW}${msg}${NC}"; { [[ -n "
 # ── CLI Argument Parsing ────────────────────────────────────────────────────
 DOMAINS=""
 DOMAINS_FILE=""
-SUBFASTER_PROVIDER_CONFIG=""
+# Preserve an env-var-supplied config (e.g. -e SUBFASTER_PROVIDER_CONFIG=...).
+# Previously this was hardcoded to "" which silently overwrote the env var;
+# users had to pass --subfaster-config on the CLI to get it recognized.
+SUBFASTER_PROVIDER_CONFIG="${SUBFASTER_PROVIDER_CONFIG:-}"
 AUTO=false
 SKIP_PHASES=()
 THREADS=50
@@ -175,6 +178,12 @@ WAYMORE_MODE="U"
 # than mode B (which downloads archived response bodies), so 600s is a sane
 # default; override with WAYMORE_TIMEOUT for very large domains.
 WAYMORE_TIMEOUT=600
+# Cloud_Enum wall-clock cap. The fuzz list checks most common bucket names
+# first (dev, staging, test, prod, …), so the highest-value permutations
+# happen early. 900s (15 min) covers the vast majority of useful checks;
+# the previous 1800s default spent the second 15 min on low-probability
+# mutations that rarely yield findings.
+CLOUD_ENUM_TIMEOUT=900
 
 # Numeric-argument guard: rejects non-integer values up-front so a typo like
 # `--threads abc` fails immediately with a clear message instead of deep inside

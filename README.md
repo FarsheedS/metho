@@ -266,10 +266,10 @@ Some tools can stall on misbehaving hosts. Each one has a configurable wall-cloc
 |----------|---------|----------------------|
 | `SHUFFLEDNS_TIMEOUT` | `900` | ShuffleDNS brute force (per root domain) |
 | `KATANA_TIMEOUT` | `600` | Katana crawl in Phase 1 (per live host) |
-| `KATANA_CRAWL_DURATION` | `30m` | Katana per-host wall-clock cap (Phase 1) |
+| `KATANA_CRAWL_DURATION` | `15m` | Katana per-host wall-clock cap (Phase 1) |
 | `SUBDOMAINIZER_TIMEOUT` | `300` | SubDomainizer JS scan (per live host) |
 | `DNSX_TIMEOUT` | `600` | DNSx bulk resolution |
-| `CLOUD_ENUM_TIMEOUT` | `1800` | Cloud_Enum keyword mutation (single call per Phase 2 run) |
+| `CLOUD_ENUM_TIMEOUT` | `900` | Cloud_Enum keyword mutation (single call per Phase 2 run) |
 | `CEWL_TIMEOUT` | `600` | CeWL word-crawl (per live host) |
 | `CEWL_DEPTH` | `2` | CeWL spider depth on first pass (retries at depth 1 on failure) |
 | `CEWL_MEM_LIMIT_MB` | `1024` | CeWL per-process address-space cap (MB) |

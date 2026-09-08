@@ -598,12 +598,12 @@ WORDBASE
                 -ob -or \
                 -timeout 30 -c 20 -p 1 \
                 -retry 2 -rd 1 -rl 10 \
-                -ct "${KATANA_CRAWL_DURATION:-30m}" \
+                -ct "${KATANA_CRAWL_DURATION:-15m}" \
                 -silent \
                 < /dev/null > "${ka_tmp}/${tag}.jsonl" 2>/dev/null || true
         }
 
-        log_info "Katana: crawling $(wc -l < live_subdomains_round2.txt) hosts (per-host cap ${KATANA_CRAWL_DURATION:-30m}, ${PARALLEL_HOSTS:-5} in parallel)..."
+        log_info "Katana: crawling $(wc -l < live_subdomains_round2.txt) hosts (per-host cap ${KATANA_CRAWL_DURATION:-15m}, ${PARALLEL_HOSTS:-5} in parallel)..."
         bounded_parallel "${PARALLEL_HOSTS:-5}" live_subdomains_round2.txt _katana_one_host
 
         cat "$ka_tmp"/*.jsonl 2>/dev/null > katana/raw_output.jsonl || : > katana/raw_output.jsonl
