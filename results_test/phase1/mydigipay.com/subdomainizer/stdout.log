@@ -1,0 +1,1015 @@
+
+   _____       __    ____                        _       _
+  / ___/__  __/ /_  / __ \____  ____ ___  ____ _(_)___  (_)___  ___  _____
+  \__ \/ / / / __ \/ / / / __ \/ __ `__ \/ __ `/ / __ \/ /_  / / _ \/ ___/
+ ___/ / /_/ / /_/ / /_/ / /_/ / / / / / / /_/ / / / / / / / /_/  __/ /
+/____/\__,_/_.___/_____/\____/_/ /_/ /_/\__,_/_/_/ /_/_/ /___/\___/_/
+
+                                                              [ v3.0 ]
+    Passive DNS  •  JS Secrets  •  GitHub Scan  •  Cloud URLs  •  Python API
+    ─────────────────────────────────────────────────────────────────────────
+
+Disabled SSL Certificate Checking...
+Fetching page and searching for Javascripts...
+
+Running passive subdomain enumeration (crt.sh / Wayback / HudsonRock)...
+  [crt.sh] 15 subdomain(s) for mydigipay.com
+  [HudsonRock] 7 subdomain(s) for mydigipay.com
+Got all the important, printing and/or saving...
+
+______________________Start of Results______________________
+
+Writing all the subdomains to given file...
+
+
+Writing Done..
+
+____________________________________________________________
+
+Got some subdomains...
+Total Subdomains: 22
+mydigipay.com
+dp-ise.ad.mydigipay.com
+www.dp-ise.ad.mydigipay.com
+api.mydigipay.com
+app.mydigipay.com
+appsec.mydigipay.com
+business.mydigipay.com
+dc-ise.mydigipay.com
+www.dc-ise.mydigipay.com
+dc-psn1.mydigipay.com
+www.dc-psn1.mydigipay.com
+dpo-ise.mydigipay.com
+www.dpo-ise.mydigipay.com
+dpo-psn1.mydigipay.com
+www.dpo-psn1.mydigipay.com
+drtest.mydigipay.com
+insurance-internal.mydigipay.com
+mail.mydigipay.com
+merchant.mydigipay.com
+portal.mydigipay.com
+web.mydigipay.com
+webmail.mydigipay.com
+____________________________________________________________
+
+Passive DNS breakdown...
+  [crt.sh] 15 subdomain(s):
+    api.mydigipay.com
+    appsec.mydigipay.com
+    dc-ise.mydigipay.com
+    dc-psn1.mydigipay.com
+    dp-ise.ad.mydigipay.com
+    dpo-ise.mydigipay.com
+    dpo-psn1.mydigipay.com
+    drtest.mydigipay.com
+    mydigipay.com
+    portal.mydigipay.com
+    www.dc-ise.mydigipay.com
+    www.dc-psn1.mydigipay.com
+    www.dp-ise.ad.mydigipay.com
+    www.dpo-ise.mydigipay.com
+    www.dpo-psn1.mydigipay.com
+  [HudsonRock] 7 subdomain(s):
+    app.mydigipay.com
+    business.mydigipay.com
+    insurance-internal.mydigipay.com
+    mail.mydigipay.com
+    merchant.mydigipay.com
+    web.mydigipay.com
+    webmail.mydigipay.com
+
+_______________________End of Results_______________________
+
+
+   _____       __    ____                        _       _
+  / ___/__  __/ /_  / __ \____  ____ ___  ____ _(_)___  (_)___  ___  _____
+  \__ \/ / / / __ \/ / / / __ \/ __ `__ \/ __ `/ / __ \/ /_  / / _ \/ ___/
+ ___/ / /_/ / /_/ / /_/ / /_/ / / / / / / /_/ / / / / / / / /_/  __/ /
+/____/\__,_/_.___/_____/\____/_/ /_/ /_/\__,_/_/_/ /_/_/ /___/\___/_/
+
+                                                              [ v3.0 ]
+    Passive DNS  •  JS Secrets  •  GitHub Scan  •  Cloud URLs  •  Python API
+    ─────────────────────────────────────────────────────────────────────────
+
+Disabled SSL Certificate Checking...
+Fetching page and searching for Javascripts...
+
+Running passive subdomain enumeration (crt.sh / Wayback / HudsonRock)...
+  [crt.sh] 15 subdomain(s) for mydigipay.com
+  [HudsonRock] 7 subdomain(s) for mydigipay.com
+Got all the important, printing and/or saving...
+
+______________________Start of Results______________________
+
+Writing all the subdomains to given file...
+
+
+Writing Done..
+
+____________________________________________________________
+
+Got some subdomains...
+Total Subdomains: 23
+mydigipay.com
+dp-ise.ad.mydigipay.com
+www.dp-ise.ad.mydigipay.com
+api.mydigipay.com
+app.mydigipay.com
+appsec.mydigipay.com
+business.mydigipay.com
+dc-ise.mydigipay.com
+www.dc-ise.mydigipay.com
+dc-psn1.mydigipay.com
+www.dc-psn1.mydigipay.com
+dpo-ise.mydigipay.com
+www.dpo-ise.mydigipay.com
+dpo-psn1.mydigipay.com
+www.dpo-psn1.mydigipay.com
+drtest.mydigipay.com
+insurance-internal.mydigipay.com
+mail.mydigipay.com
+merchant.mydigipay.com
+mx02.mydigipay.com
+portal.mydigipay.com
+web.mydigipay.com
+webmail.mydigipay.com
+____________________________________________________________
+
+Passive DNS breakdown...
+  [crt.sh] 15 subdomain(s):
+    api.mydigipay.com
+    appsec.mydigipay.com
+    dc-ise.mydigipay.com
+    dc-psn1.mydigipay.com
+    dp-ise.ad.mydigipay.com
+    dpo-ise.mydigipay.com
+    dpo-psn1.mydigipay.com
+    drtest.mydigipay.com
+    mydigipay.com
+    portal.mydigipay.com
+    www.dc-ise.mydigipay.com
+    www.dc-psn1.mydigipay.com
+    www.dp-ise.ad.mydigipay.com
+    www.dpo-ise.mydigipay.com
+    www.dpo-psn1.mydigipay.com
+  [HudsonRock] 7 subdomain(s):
+    app.mydigipay.com
+    business.mydigipay.com
+    insurance-internal.mydigipay.com
+    mail.mydigipay.com
+    merchant.mydigipay.com
+    web.mydigipay.com
+    webmail.mydigipay.com
+
+_______________________End of Results_______________________
+
+
+   _____       __    ____                        _       _
+  / ___/__  __/ /_  / __ \____  ____ ___  ____ _(_)___  (_)___  ___  _____
+  \__ \/ / / / __ \/ / / / __ \/ __ `__ \/ __ `/ / __ \/ /_  / / _ \/ ___/
+ ___/ / /_/ / /_/ / /_/ / /_/ / / / / / / /_/ / / / / / / / /_/  __/ /
+/____/\__,_/_.___/_____/\____/_/ /_/ /_/\__,_/_/_/ /_/_/ /___/\___/_/
+
+                                                              [ v3.0 ]
+    Passive DNS  •  JS Secrets  •  GitHub Scan  •  Cloud URLs  •  Python API
+    ─────────────────────────────────────────────────────────────────────────
+
+Disabled SSL Certificate Checking...
+Fetching page and searching for Javascripts...
+Successfully got inline and external JS links.
+Finding secrets, cloud URLs, subdomains in all Javascript files...
+Searching completed...
+
+Running passive subdomain enumeration (crt.sh / Wayback / HudsonRock)...
+  [HudsonRock] 7 subdomain(s) for mydigipay.com
+Got all the important, printing and/or saving...
+
+______________________Start of Results______________________
+
+Writing all the subdomains to given file...
+
+
+Writing Done..
+
+____________________________________________________________
+
+Got some subdomains...
+Total Subdomains: 8
+analytics.mydigipay.com
+app.mydigipay.com
+business.mydigipay.com
+insurance-internal.mydigipay.com
+mail.mydigipay.com
+merchant.mydigipay.com
+web.mydigipay.com
+webmail.mydigipay.com
+____________________________________________________________
+
+Some cloud services urls are found...
+Total Cloud URLs: 1
+materializecss.github.io
+____________________________________________________________
+
+Found some secrets(might be false positive)...
+Total Possible Secrets: 3
+"General_WarningPasswordStored":"%1$sWarning | Inline
+token_auth='+encodeURIComponent | https://analytics.mydigipay.com/index.php?module=Proxy&action=getCoreJs&cb=b2721b3480e2ba9eb21f474b340df5d3
+toPasswordInputId=toFormSelector+' | https://analytics.mydigipay.com/index.php?module=Proxy&action=getCoreJs&cb=b2721b3480e2ba9eb21f474b340df5d3
+____________________________________________________________
+
+Passive DNS breakdown...
+  [HudsonRock] 7 subdomain(s):
+    app.mydigipay.com
+    business.mydigipay.com
+    insurance-internal.mydigipay.com
+    mail.mydigipay.com
+    merchant.mydigipay.com
+    web.mydigipay.com
+    webmail.mydigipay.com
+
+_______________________End of Results_______________________
+
+
+   _____       __    ____                        _       _
+  / ___/__  __/ /_  / __ \____  ____ ___  ____ _(_)___  (_)___  ___  _____
+  \__ \/ / / / __ \/ / / / __ \/ __ `__ \/ __ `/ / __ \/ /_  / / _ \/ ___/
+ ___/ / /_/ / /_/ / /_/ / /_/ / / / / / / /_/ / / / / / / / /_/  __/ /
+/____/\__,_/_.___/_____/\____/_/ /_/ /_/\__,_/_/_/ /_/_/ /___/\___/_/
+
+                                                              [ v3.0 ]
+    Passive DNS  •  JS Secrets  •  GitHub Scan  •  Cloud URLs  •  Python API
+    ─────────────────────────────────────────────────────────────────────────
+
+Disabled SSL Certificate Checking...
+Fetching page and searching for Javascripts...
+
+Running passive subdomain enumeration (crt.sh / Wayback / HudsonRock)...
+  [HudsonRock] 7 subdomain(s) for mydigipay.com
+Got all the important, printing and/or saving...
+
+______________________Start of Results______________________
+
+Writing all the subdomains to given file...
+
+
+Writing Done..
+
+____________________________________________________________
+
+Got some subdomains...
+Total Subdomains: 7
+app.mydigipay.com
+business.mydigipay.com
+insurance-internal.mydigipay.com
+mail.mydigipay.com
+merchant.mydigipay.com
+web.mydigipay.com
+webmail.mydigipay.com
+____________________________________________________________
+
+Passive DNS breakdown...
+  [HudsonRock] 7 subdomain(s):
+    app.mydigipay.com
+    business.mydigipay.com
+    insurance-internal.mydigipay.com
+    mail.mydigipay.com
+    merchant.mydigipay.com
+    web.mydigipay.com
+    webmail.mydigipay.com
+
+_______________________End of Results_______________________
+
+
+   _____       __    ____                        _       _
+  / ___/__  __/ /_  / __ \____  ____ ___  ____ _(_)___  (_)___  ___  _____
+  \__ \/ / / / __ \/ / / / __ \/ __ `__ \/ __ `/ / __ \/ /_  / / _ \/ ___/
+ ___/ / /_/ / /_/ / /_/ / /_/ / / / / / / /_/ / / / / / / / /_/  __/ /
+/____/\__,_/_.___/_____/\____/_/ /_/ /_/\__,_/_/_/ /_/_/ /___/\___/_/
+
+                                                              [ v3.0 ]
+    Passive DNS  •  JS Secrets  •  GitHub Scan  •  Cloud URLs  •  Python API
+    ─────────────────────────────────────────────────────────────────────────
+
+Disabled SSL Certificate Checking...
+Fetching page and searching for Javascripts...
+Successfully got inline and external JS links.
+Finding secrets, cloud URLs, subdomains in all Javascript files...
+Searching completed...
+
+Running passive subdomain enumeration (crt.sh / Wayback / HudsonRock)...
+  [HudsonRock] 7 subdomain(s) for mydigipay.com
+Got all the important, printing and/or saving...
+
+______________________Start of Results______________________
+
+Writing all the subdomains to given file...
+
+
+Writing Done..
+
+____________________________________________________________
+
+Got some subdomains...
+Total Subdomains: 8
+api.mydigipay.com
+app.mydigipay.com
+business.mydigipay.com
+insurance-internal.mydigipay.com
+mail.mydigipay.com
+merchant.mydigipay.com
+web.mydigipay.com
+webmail.mydigipay.com
+____________________________________________________________
+
+Passive DNS breakdown...
+  [HudsonRock] 7 subdomain(s):
+    app.mydigipay.com
+    business.mydigipay.com
+    insurance-internal.mydigipay.com
+    mail.mydigipay.com
+    merchant.mydigipay.com
+    web.mydigipay.com
+    webmail.mydigipay.com
+
+_______________________End of Results_______________________
+
+
+   _____       __    ____                        _       _
+  / ___/__  __/ /_  / __ \____  ____ ___  ____ _(_)___  (_)___  ___  _____
+  \__ \/ / / / __ \/ / / / __ \/ __ `__ \/ __ `/ / __ \/ /_  / / _ \/ ___/
+ ___/ / /_/ / /_/ / /_/ / /_/ / / / / / / /_/ / / / / / / / /_/  __/ /
+/____/\__,_/_.___/_____/\____/_/ /_/ /_/\__,_/_/_/ /_/_/ /___/\___/_/
+
+                                                              [ v3.0 ]
+    Passive DNS  •  JS Secrets  •  GitHub Scan  •  Cloud URLs  •  Python API
+    ─────────────────────────────────────────────────────────────────────────
+
+Disabled SSL Certificate Checking...
+Fetching page and searching for Javascripts...
+Successfully got inline and external JS links.
+Finding secrets, cloud URLs, subdomains in all Javascript files...
+Searching completed...
+
+Running passive subdomain enumeration (crt.sh / Wayback / HudsonRock)...
+  [HudsonRock] 7 subdomain(s) for mydigipay.com
+Got all the important, printing and/or saving...
+
+______________________Start of Results______________________
+
+Writing all the subdomains to given file...
+
+
+Writing Done..
+
+____________________________________________________________
+
+Got some subdomains...
+Total Subdomains: 9
+app.mydigipay.com
+business.mydigipay.com
+insurance-internal.mydigipay.com
+ipg.mydigipay.com
+mail.mydigipay.com
+merchant.mydigipay.com
+web.mydigipay.com
+webmail.mydigipay.com
+www.mydigipay.com
+____________________________________________________________
+
+Passive DNS breakdown...
+  [HudsonRock] 7 subdomain(s):
+    app.mydigipay.com
+    business.mydigipay.com
+    insurance-internal.mydigipay.com
+    mail.mydigipay.com
+    merchant.mydigipay.com
+    web.mydigipay.com
+    webmail.mydigipay.com
+
+_______________________End of Results_______________________
+
+
+   _____       __    ____                        _       _
+  / ___/__  __/ /_  / __ \____  ____ ___  ____ _(_)___  (_)___  ___  _____
+  \__ \/ / / / __ \/ / / / __ \/ __ `__ \/ __ `/ / __ \/ /_  / / _ \/ ___/
+ ___/ / /_/ / /_/ / /_/ / /_/ / / / / / / /_/ / / / / / / / /_/  __/ /
+/____/\__,_/_.___/_____/\____/_/ /_/ /_/\__,_/_/_/ /_/_/ /___/\___/_/
+
+                                                              [ v3.0 ]
+    Passive DNS  •  JS Secrets  •  GitHub Scan  •  Cloud URLs  •  Python API
+    ─────────────────────────────────────────────────────────────────────────
+
+Disabled SSL Certificate Checking...
+Fetching page and searching for Javascripts...
+Successfully got inline and external JS links.
+Finding secrets, cloud URLs, subdomains in all Javascript files...
+Searching completed...
+
+Running passive subdomain enumeration (crt.sh / Wayback / HudsonRock)...
+  [HudsonRock] 7 subdomain(s) for mydigipay.com
+Got all the important, printing and/or saving...
+
+______________________Start of Results______________________
+
+Writing all the subdomains to given file...
+
+
+Writing Done..
+
+____________________________________________________________
+
+Got some subdomains...
+Total Subdomains: 8
+app.mydigipay.com
+business.mydigipay.com
+dpm.mydigipay.com
+insurance-internal.mydigipay.com
+mail.mydigipay.com
+merchant.mydigipay.com
+web.mydigipay.com
+webmail.mydigipay.com
+____________________________________________________________
+
+Some cloud services urls are found...
+Total Cloud URLs: 2
+cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/css/materialize.min.css
+fonts.googleapis.com
+____________________________________________________________
+
+Passive DNS breakdown...
+  [HudsonRock] 7 subdomain(s):
+    app.mydigipay.com
+    business.mydigipay.com
+    insurance-internal.mydigipay.com
+    mail.mydigipay.com
+    merchant.mydigipay.com
+    web.mydigipay.com
+    webmail.mydigipay.com
+
+_______________________End of Results_______________________
+
+
+   _____       __    ____                        _       _
+  / ___/__  __/ /_  / __ \____  ____ ___  ____ _(_)___  (_)___  ___  _____
+  \__ \/ / / / __ \/ / / / __ \/ __ `__ \/ __ `/ / __ \/ /_  / / _ \/ ___/
+ ___/ / /_/ / /_/ / /_/ / /_/ / / / / / / /_/ / / / / / / / /_/  __/ /
+/____/\__,_/_.___/_____/\____/_/ /_/ /_/\__,_/_/_/ /_/_/ /___/\___/_/
+
+                                                              [ v3.0 ]
+    Passive DNS  •  JS Secrets  •  GitHub Scan  •  Cloud URLs  •  Python API
+    ─────────────────────────────────────────────────────────────────────────
+
+Disabled SSL Certificate Checking...
+Fetching page and searching for Javascripts...
+Successfully got inline and external JS links.
+Finding secrets, cloud URLs, subdomains in all Javascript files...
+Searching completed...
+
+Running passive subdomain enumeration (crt.sh / Wayback / HudsonRock)...
+  [HudsonRock] 7 subdomain(s) for mydigipay.com
+Got all the important, printing and/or saving...
+
+______________________Start of Results______________________
+
+Writing all the subdomains to given file...
+
+
+Writing Done..
+
+____________________________________________________________
+
+Got some subdomains...
+Total Subdomains: 8
+app.mydigipay.com
+autodiscover.mydigipay.com
+business.mydigipay.com
+insurance-internal.mydigipay.com
+mail.mydigipay.com
+merchant.mydigipay.com
+web.mydigipay.com
+webmail.mydigipay.com
+____________________________________________________________
+
+Some cloud services urls are found...
+Total Cloud URLs: 2
+cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/css/materialize.min.css
+fonts.googleapis.com
+____________________________________________________________
+
+Passive DNS breakdown...
+  [HudsonRock] 7 subdomain(s):
+    app.mydigipay.com
+    business.mydigipay.com
+    insurance-internal.mydigipay.com
+    mail.mydigipay.com
+    merchant.mydigipay.com
+    web.mydigipay.com
+    webmail.mydigipay.com
+
+_______________________End of Results_______________________
+
+
+   _____       __    ____                        _       _
+  / ___/__  __/ /_  / __ \____  ____ ___  ____ _(_)___  (_)___  ___  _____
+  \__ \/ / / / __ \/ / / / __ \/ __ `__ \/ __ `/ / __ \/ /_  / / _ \/ ___/
+ ___/ / /_/ / /_/ / /_/ / /_/ / / / / / / /_/ / / / / / / / /_/  __/ /
+/____/\__,_/_.___/_____/\____/_/ /_/ /_/\__,_/_/_/ /_/_/ /___/\___/_/
+
+                                                              [ v3.0 ]
+    Passive DNS  •  JS Secrets  •  GitHub Scan  •  Cloud URLs  •  Python API
+    ─────────────────────────────────────────────────────────────────────────
+
+Disabled SSL Certificate Checking...
+Fetching page and searching for Javascripts...
+Successfully got inline and external JS links.
+Finding secrets, cloud URLs, subdomains in all Javascript files...
+Searching completed...
+
+Running passive subdomain enumeration (crt.sh / Wayback / HudsonRock)...
+  [HudsonRock] 7 subdomain(s) for mydigipay.com
+Got all the important, printing and/or saving...
+
+______________________Start of Results______________________
+
+Writing all the subdomains to given file...
+
+
+Writing Done..
+
+____________________________________________________________
+
+Got some subdomains...
+Total Subdomains: 10
+analytics.mydigipay.com
+api.mydigipay.com
+app.mydigipay.com
+business.mydigipay.com
+crashlytics.mydigipay.com
+insurance-internal.mydigipay.com
+mail.mydigipay.com
+merchant.mydigipay.com
+web.mydigipay.com
+webmail.mydigipay.com
+____________________________________________________________
+
+Found some secrets(might be false positive)...
+Total Possible Secrets: 8
+android_auth_key:"f8efcf8d-3a73-4987-8075-8894d09b87b9" | https://business.mydigipay.com/main-H6SSWW4K.js
+android_hybrid_password:"hybrid-android-client-secert-ddd6c372-c3a0-4964-8faa-7b57d76f573b" | https://business.mydigipay.com/main-H6SSWW4K.js
+web_password:"webapp-client-secret-debee79d-b04d-47ef-8ed5-c32e24ec836e" | https://business.mydigipay.com/main-H6SSWW4K.js
+auth_key:"37d18dc1-4f9a-4c90-af48-e599f288397e" | https://business.mydigipay.com/main-H6SSWW4K.js
+ios_hybrid_password:"hybrid-ios-client-secert-88b40c21-6c9b-42e9-8191-1d1a22664f44" | https://business.mydigipay.com/main-H6SSWW4K.js
+ios_auth_key:"511ac095-f4a8-443f-8552-0e9553309261" | https://business.mydigipay.com/main-H6SSWW4K.js
+CLIENT_SECRET:"mc-secret-248f4b3b-5ec9-42b0-99f0-d23e0c154709" | https://business.mydigipay.com/main-H6SSWW4K.js
+GL_CLIENT_ID:"Yml6YWppOi5SK1FATCNrUUFoQA==" | https://business.mydigipay.com/main-H6SSWW4K.js
+____________________________________________________________
+
+Passive DNS breakdown...
+  [HudsonRock] 7 subdomain(s):
+    app.mydigipay.com
+    business.mydigipay.com
+    insurance-internal.mydigipay.com
+    mail.mydigipay.com
+    merchant.mydigipay.com
+    web.mydigipay.com
+    webmail.mydigipay.com
+
+_______________________End of Results_______________________
+
+
+   _____       __    ____                        _       _
+  / ___/__  __/ /_  / __ \____  ____ ___  ____ _(_)___  (_)___  ___  _____
+  \__ \/ / / / __ \/ / / / __ \/ __ `__ \/ __ `/ / __ \/ /_  / / _ \/ ___/
+ ___/ / /_/ / /_/ / /_/ / /_/ / / / / / / /_/ / / / / / / / /_/  __/ /
+/____/\__,_/_.___/_____/\____/_/ /_/ /_/\__,_/_/_/ /_/_/ /___/\___/_/
+
+                                                              [ v3.0 ]
+    Passive DNS  •  JS Secrets  •  GitHub Scan  •  Cloud URLs  •  Python API
+    ─────────────────────────────────────────────────────────────────────────
+
+Disabled SSL Certificate Checking...
+Fetching page and searching for Javascripts...
+Successfully got inline and external JS links.
+Finding secrets, cloud URLs, subdomains in all Javascript files...
+Searching completed...
+
+Running passive subdomain enumeration (crt.sh / Wayback / HudsonRock)...
+  [HudsonRock] 7 subdomain(s) for mydigipay.com
+Got all the important, printing and/or saving...
+
+______________________Start of Results______________________
+
+Writing all the subdomains to given file...
+
+
+Writing Done..
+
+____________________________________________________________
+
+Got some subdomains...
+Total Subdomains: 9
+app.mydigipay.com
+bot.mydigipay.com
+builder-bot.mydigipay.com
+business.mydigipay.com
+insurance-internal.mydigipay.com
+mail.mydigipay.com
+merchant.mydigipay.com
+web.mydigipay.com
+webmail.mydigipay.com
+____________________________________________________________
+
+Some cloud services urls are found...
+Total Cloud URLs: 1
+www.googletagmanager.com
+____________________________________________________________
+
+Passive DNS breakdown...
+  [HudsonRock] 7 subdomain(s):
+    app.mydigipay.com
+    business.mydigipay.com
+    insurance-internal.mydigipay.com
+    mail.mydigipay.com
+    merchant.mydigipay.com
+    web.mydigipay.com
+    webmail.mydigipay.com
+
+_______________________End of Results_______________________
+
+
+   _____       __    ____                        _       _
+  / ___/__  __/ /_  / __ \____  ____ ___  ____ _(_)___  (_)___  ___  _____
+  \__ \/ / / / __ \/ / / / __ \/ __ `__ \/ __ `/ / __ \/ /_  / / _ \/ ___/
+ ___/ / /_/ / /_/ / /_/ / /_/ / / / / / / /_/ / / / / / / / /_/  __/ /
+/____/\__,_/_.___/_____/\____/_/ /_/ /_/\__,_/_/_/ /_/_/ /___/\___/_/
+
+                                                              [ v3.0 ]
+    Passive DNS  •  JS Secrets  •  GitHub Scan  •  Cloud URLs  •  Python API
+    ─────────────────────────────────────────────────────────────────────────
+
+Disabled SSL Certificate Checking...
+Fetching page and searching for Javascripts...
+Successfully got inline and external JS links.
+Finding secrets, cloud URLs, subdomains in all Javascript files...
+Searching completed...
+
+Running passive subdomain enumeration (crt.sh / Wayback / HudsonRock)...
+  [crt.sh] 15 subdomain(s) for mydigipay.com
+  [HudsonRock] 7 subdomain(s) for mydigipay.com
+Got all the important, printing and/or saving...
+
+______________________Start of Results______________________
+
+Writing all the subdomains to given file...
+
+
+Writing Done..
+
+____________________________________________________________
+
+Got some subdomains...
+Total Subdomains: 22
+mydigipay.com
+dp-ise.ad.mydigipay.com
+www.dp-ise.ad.mydigipay.com
+api.mydigipay.com
+app.mydigipay.com
+appsec.mydigipay.com
+business.mydigipay.com
+dc-ise.mydigipay.com
+www.dc-ise.mydigipay.com
+dc-psn1.mydigipay.com
+www.dc-psn1.mydigipay.com
+dpo-ise.mydigipay.com
+www.dpo-ise.mydigipay.com
+dpo-psn1.mydigipay.com
+www.dpo-psn1.mydigipay.com
+drtest.mydigipay.com
+insurance-internal.mydigipay.com
+mail.mydigipay.com
+merchant.mydigipay.com
+portal.mydigipay.com
+web.mydigipay.com
+webmail.mydigipay.com
+____________________________________________________________
+
+Passive DNS breakdown...
+  [crt.sh] 15 subdomain(s):
+    api.mydigipay.com
+    appsec.mydigipay.com
+    dc-ise.mydigipay.com
+    dc-psn1.mydigipay.com
+    dp-ise.ad.mydigipay.com
+    dpo-ise.mydigipay.com
+    dpo-psn1.mydigipay.com
+    drtest.mydigipay.com
+    mydigipay.com
+    portal.mydigipay.com
+    www.dc-ise.mydigipay.com
+    www.dc-psn1.mydigipay.com
+    www.dp-ise.ad.mydigipay.com
+    www.dpo-ise.mydigipay.com
+    www.dpo-psn1.mydigipay.com
+  [HudsonRock] 7 subdomain(s):
+    app.mydigipay.com
+    business.mydigipay.com
+    insurance-internal.mydigipay.com
+    mail.mydigipay.com
+    merchant.mydigipay.com
+    web.mydigipay.com
+    webmail.mydigipay.com
+
+_______________________End of Results_______________________
+
+
+   _____       __    ____                        _       _
+  / ___/__  __/ /_  / __ \____  ____ ___  ____ _(_)___  (_)___  ___  _____
+  \__ \/ / / / __ \/ / / / __ \/ __ `__ \/ __ `/ / __ \/ /_  / / _ \/ ___/
+ ___/ / /_/ / /_/ / /_/ / /_/ / / / / / / /_/ / / / / / / / /_/  __/ /
+/____/\__,_/_.___/_____/\____/_/ /_/ /_/\__,_/_/_/ /_/_/ /___/\___/_/
+
+                                                              [ v3.0 ]
+    Passive DNS  •  JS Secrets  •  GitHub Scan  •  Cloud URLs  •  Python API
+    ─────────────────────────────────────────────────────────────────────────
+
+Disabled SSL Certificate Checking...
+Fetching page and searching for Javascripts...
+Successfully got inline and external JS links.
+Finding secrets, cloud URLs, subdomains in all Javascript files...
+Searching completed...
+
+Running passive subdomain enumeration (crt.sh / Wayback / HudsonRock)...
+  [crt.sh] 15 subdomain(s) for mydigipay.com
+  [HudsonRock] 7 subdomain(s) for mydigipay.com
+Got all the important, printing and/or saving...
+
+______________________Start of Results______________________
+
+Writing all the subdomains to given file...
+
+
+Writing Done..
+
+____________________________________________________________
+
+Got some subdomains...
+Total Subdomains: 23
+mydigipay.com
+dp-ise.ad.mydigipay.com
+www.dp-ise.ad.mydigipay.com
+api.mydigipay.com
+app.mydigipay.com
+appsec.mydigipay.com
+business.mydigipay.com
+dc-ise.mydigipay.com
+www.dc-ise.mydigipay.com
+dc-psn1.mydigipay.com
+www.dc-psn1.mydigipay.com
+dpo-ise.mydigipay.com
+www.dpo-ise.mydigipay.com
+dpo-psn1.mydigipay.com
+www.dpo-psn1.mydigipay.com
+drtest.mydigipay.com
+insurance-internal.mydigipay.com
+mail.mydigipay.com
+merchant.mydigipay.com
+mx01.mydigipay.com
+portal.mydigipay.com
+web.mydigipay.com
+webmail.mydigipay.com
+____________________________________________________________
+
+Some cloud services urls are found...
+Total Cloud URLs: 2
+cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/css/materialize.min.css
+fonts.googleapis.com
+____________________________________________________________
+
+Passive DNS breakdown...
+  [crt.sh] 15 subdomain(s):
+    api.mydigipay.com
+    appsec.mydigipay.com
+    dc-ise.mydigipay.com
+    dc-psn1.mydigipay.com
+    dp-ise.ad.mydigipay.com
+    dpo-ise.mydigipay.com
+    dpo-psn1.mydigipay.com
+    drtest.mydigipay.com
+    mydigipay.com
+    portal.mydigipay.com
+    www.dc-ise.mydigipay.com
+    www.dc-psn1.mydigipay.com
+    www.dp-ise.ad.mydigipay.com
+    www.dpo-ise.mydigipay.com
+    www.dpo-psn1.mydigipay.com
+  [HudsonRock] 7 subdomain(s):
+    app.mydigipay.com
+    business.mydigipay.com
+    insurance-internal.mydigipay.com
+    mail.mydigipay.com
+    merchant.mydigipay.com
+    web.mydigipay.com
+    webmail.mydigipay.com
+
+_______________________End of Results_______________________
+
+
+   _____       __    ____                        _       _
+  / ___/__  __/ /_  / __ \____  ____ ___  ____ _(_)___  (_)___  ___  _____
+  \__ \/ / / / __ \/ / / / __ \/ __ `__ \/ __ `/ / __ \/ /_  / / _ \/ ___/
+ ___/ / /_/ / /_/ / /_/ / /_/ / / / / / / /_/ / / / / / / / /_/  __/ /
+/____/\__,_/_.___/_____/\____/_/ /_/ /_/\__,_/_/_/ /_/_/ /___/\___/_/
+
+                                                              [ v3.0 ]
+    Passive DNS  •  JS Secrets  •  GitHub Scan  •  Cloud URLs  •  Python API
+    ─────────────────────────────────────────────────────────────────────────
+
+Disabled SSL Certificate Checking...
+Fetching page and searching for Javascripts...
+Successfully got inline and external JS links.
+Finding secrets, cloud URLs, subdomains in all Javascript files...
+Searching completed...
+
+Running passive subdomain enumeration (crt.sh / Wayback / HudsonRock)...
+  [crt.sh] 15 subdomain(s) for mydigipay.com
+  [HudsonRock] 7 subdomain(s) for mydigipay.com
+Got all the important, printing and/or saving...
+
+______________________Start of Results______________________
+
+Writing all the subdomains to given file...
+
+
+Writing Done..
+
+____________________________________________________________
+
+Got some subdomains...
+Total Subdomains: 26
+mydigipay.com
+dp-ise.ad.mydigipay.com
+www.dp-ise.ad.mydigipay.com
+api.mydigipay.com
+app.mydigipay.com
+appsec.mydigipay.com
+business.mydigipay.com
+crashlytics.mydigipay.com
+dc-ise.mydigipay.com
+www.dc-ise.mydigipay.com
+dc-psn1.mydigipay.com
+www.dc-psn1.mydigipay.com
+dpo-ise.mydigipay.com
+www.dpo-ise.mydigipay.com
+dpo-psn1.mydigipay.com
+www.dpo-psn1.mydigipay.com
+drapi.mydigipay.com
+drtest.mydigipay.com
+insurance-internal.mydigipay.com
+mail.mydigipay.com
+merchant.mydigipay.com
+pillar.mydigipay.com
+portal.mydigipay.com
+web.mydigipay.com
+webmail.mydigipay.com
+www.mydigipay.com
+____________________________________________________________
+
+Found some secrets(might be false positive)...
+Total Possible Secrets: 17
+api_password:"insurance-ui-client-secret-8ac85922-e170-4ffc-a475-fc10bef64927" | https://pillar.mydigipay.com/main-T7V26G66.js
+[JSON Web Token] eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsImp0aSI6IjFmYmNmYjU3NGE5NzM4ZWEwMTZhMzU1ZGE5Y2FkZjljZWVmNjFjNjA2M2I5OTVhYTUzYWUxZTc3MWNlM2NiMzljMWNmZWExOThiMmUxNTE2In0.eyJhdWQiOiIzMzM5NSIsImp0aSI6IjFmYmNmYjU3NGE5NzM4ZWEwMTZhMzU1ZGE5Y2FkZjljZWVmNjFjNjA2M2I5OTVhYTUzYWUxZTc3MWNlM2NiMzljMWNmZWExOThiMmUxNTE2IiwiaWF0IjoxNzUyNjY1OTU4LCJuYmYiOjE3NTI2NjU5NTgsImV4cCI6MTc1NTI1Nzk1OCwic3ViIjoiIiwic2NvcGVzIjpbImJhc2ljIl19.RvTPqOpCtCCZhVsWleFCjVqq1pguu2ASg2Wh6KUKAb1EB8Td8rTLKnuuUWz2bdPhNke8qZbUFbphGWEaNLjj2-g1Q8989EdY8dvYvR8gLvn673oXEx5T9g8VnRVGFXtiILFZVzpuBv398fvOqTSzWm3EtMa6SEunMA-eihsn2_J4w2uPmXBFXgrfztpc9pHIixYM4jUyCmXOIR8hMYEqJiG7TpAYPSPS2fuKIBidlCGF56LoYVtaAJnb_tt0RRUmj5-CJvFV1yzzpygnMI91VG9yNZicAgbCnJcB4vSjwI2CDvn_v8Z2qJUAVRnuiQ-RVPPMxL4EVUADFJ2lg5hw1w | https://pillar.mydigipay.com/main-T7V26G66.js
+ios_auth_key:"511ac095-f4a8-443f-8552-0e9553309261" | https://pillar.mydigipay.com/main-T7V26G66.js
+auth_key:"37d18dc1-4f9a-4c90-af48-e599f288397e" | https://pillar.mydigipay.com/main-T7V26G66.js
+basic_token:"ZGlnaWthbGEtc3VwcGVyYXBwLWNsaWVudC1pZDpUITd2S20jMnpSZkA5WGVM" | https://pillar.mydigipay.com/main-T7V26G66.js
+web_password:"webapp-client-secret-debee79d-b04d-47ef-8ed5-c32e24ec836e" | https://pillar.mydigipay.com/main-T7V26G66.js
+apiKey:"79efd949-27d6-48cf-8a78-9e7fb35dceab" | https://pillar.mydigipay.com/main-T7V26G66.js
+android_hybrid_password:"hybrid-android-client-secert-ddd6c372-c3a0-4964-8faa-7b57d76f573b" | https://pillar.mydigipay.com/main-T7V26G66.js
+ios_hybrid_password:"hybrid-ios-client-secert-88b40c21-6c9b-42e9-8191-1d1a22664f44" | https://pillar.mydigipay.com/main-T7V26G66.js
+android_auth_key:"f8efcf8d-3a73-4987-8075-8894d09b87b9" | https://pillar.mydigipay.com/main-T7V26G66.js
+____________________________________________________________
+
+Passive DNS breakdown...
+  [crt.sh] 15 subdomain(s):
+    api.mydigipay.com
+    appsec.mydigipay.com
+    dc-ise.mydigipay.com
+    dc-psn1.mydigipay.com
+    dp-ise.ad.mydigipay.com
+    dpo-ise.mydigipay.com
+    dpo-psn1.mydigipay.com
+    drtest.mydigipay.com
+    mydigipay.com
+    portal.mydigipay.com
+    www.dc-ise.mydigipay.com
+    www.dc-psn1.mydigipay.com
+    www.dp-ise.ad.mydigipay.com
+    www.dpo-ise.mydigipay.com
+    www.dpo-psn1.mydigipay.com
+  [HudsonRock] 7 subdomain(s):
+    app.mydigipay.com
+    business.mydigipay.com
+    insurance-internal.mydigipay.com
+    mail.mydigipay.com
+    merchant.mydigipay.com
+    web.mydigipay.com
+    webmail.mydigipay.com
+
+_______________________End of Results_______________________
+
+
+   _____       __    ____                        _       _
+  / ___/__  __/ /_  / __ \____  ____ ___  ____ _(_)___  (_)___  ___  _____
+  \__ \/ / / / __ \/ / / / __ \/ __ `__ \/ __ `/ / __ \/ /_  / / _ \/ ___/
+ ___/ / /_/ / /_/ / /_/ / /_/ / / / / / / /_/ / / / / / / / /_/  __/ /
+/____/\__,_/_.___/_____/\____/_/ /_/ /_/\__,_/_/_/ /_/_/ /___/\___/_/
+
+                                                              [ v3.0 ]
+    Passive DNS  •  JS Secrets  •  GitHub Scan  •  Cloud URLs  •  Python API
+    ─────────────────────────────────────────────────────────────────────────
+
+Disabled SSL Certificate Checking...
+Fetching page and searching for Javascripts...
+Successfully got inline and external JS links.
+Finding secrets, cloud URLs, subdomains in all Javascript files...
+Searching completed...
+
+Running passive subdomain enumeration (crt.sh / Wayback / HudsonRock)...
+  [crt.sh] 15 subdomain(s) for mydigipay.com
+  [HudsonRock] 7 subdomain(s) for mydigipay.com
+Got all the important, printing and/or saving...
+
+______________________Start of Results______________________
+
+Writing all the subdomains to given file...
+
+
+Writing Done..
+
+____________________________________________________________
+
+Got some subdomains...
+Total Subdomains: 23
+mydigipay.com
+dp-ise.ad.mydigipay.com
+www.dp-ise.ad.mydigipay.com
+api.mydigipay.com
+app.mydigipay.com
+appsec.mydigipay.com
+business.mydigipay.com
+dc-ise.mydigipay.com
+www.dc-ise.mydigipay.com
+dc-psn1.mydigipay.com
+www.dc-psn1.mydigipay.com
+dpo-ise.mydigipay.com
+www.dpo-ise.mydigipay.com
+dpo-psn1.mydigipay.com
+www.dpo-psn1.mydigipay.com
+drtest.mydigipay.com
+insurance-internal.mydigipay.com
+mail.mydigipay.com
+merchant.mydigipay.com
+portal.mydigipay.com
+web.mydigipay.com
+webmail.mydigipay.com
+www.mydigipay.com
+____________________________________________________________
+
+Some cloud services urls are found...
+Total Cloud URLs: 1
+www.googletagmanager.com
+____________________________________________________________
+
+Found some secrets(might be false positive)...
+Total Possible Secrets: 2
+token=411406268a947db16679" | Inline
+auth_key: "37d18dc1-4f9a-4c90-af48-e599f288397e" | Inline
+____________________________________________________________
+
+Passive DNS breakdown...
+  [crt.sh] 15 subdomain(s):
+    api.mydigipay.com
+    appsec.mydigipay.com
+    dc-ise.mydigipay.com
+    dc-psn1.mydigipay.com
+    dp-ise.ad.mydigipay.com
+    dpo-ise.mydigipay.com
+    dpo-psn1.mydigipay.com
+    drtest.mydigipay.com
+    mydigipay.com
+    portal.mydigipay.com
+    www.dc-ise.mydigipay.com
+    www.dc-psn1.mydigipay.com
+    www.dp-ise.ad.mydigipay.com
+    www.dpo-ise.mydigipay.com
+    www.dpo-psn1.mydigipay.com
+  [HudsonRock] 7 subdomain(s):
+    app.mydigipay.com
+    business.mydigipay.com
+    insurance-internal.mydigipay.com
+    mail.mydigipay.com
+    merchant.mydigipay.com
+    web.mydigipay.com
+    webmail.mydigipay.com
+
+_______________________End of Results_______________________
+

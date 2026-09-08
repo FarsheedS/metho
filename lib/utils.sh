@@ -166,6 +166,11 @@ PORT_SCAN=true
 # time crawling hosts one-by-one; a small bounded pool cuts that ~Nx with no
 # data loss.
 PARALLEL_HOSTS=5
+# How many root domains to process in parallel during Phase 1. Each domain
+# gets its own canonical_dns.tsv and httpx_metadata.tsv; after all complete,
+# merge_per_domain_dns combines them into the global TSV. I/O-bound workloads
+# (DNS, HTTP) tolerate higher concurrency than CPU-bound ones.
+PARALLEL_DOMAINS=3
 # ASN classification config file (shell-sourceable)
 ASN_CONFIG_FILE=""
 # Waymore mode: U (URLs only, default), B (URLs + response bodies).
@@ -213,6 +218,7 @@ parse_args() {
             --no-port-scan)   PORT_SCAN=false; shift ;;
             --threads)        _require_int "$1" "$2"; THREADS="$2"; shift 2 ;;
             --parallel-hosts) _require_int "$1" "$2"; PARALLEL_HOSTS="$2"; shift 2 ;;
+            --parallel-domains) _require_int "$1" "$2"; PARALLEL_DOMAINS="$2"; shift 2 ;;
             --rate-limit)     _require_int "$1" "$2"; RATE_LIMIT="$2"; shift 2 ;;
             --timeout)        _require_int "$1" "$2"; CHECKPOINT_TIMEOUT="$2"; shift 2 ;;
             --output)         OUTPUT_DIR="$2"; shift 2 ;;
@@ -234,6 +240,7 @@ parse_args() {
                 echo "  --no-port-scan            Skip port scanning phase"
                 echo "  --threads N               Thread count (default: 50)"
                 echo "  --parallel-hosts N         Hosts crawled in parallel per tool (default: 5)"
+                echo "  --parallel-domains N       Root domains processed in parallel in Phase 1 (default: 3)"
                 echo "  --rate-limit N            Requests/second (default: 100)"
                 echo "  --timeout N               Checkpoint auto-continue seconds (default: 30)"
                 echo "  --output DIR              Output directory (default: /output)"

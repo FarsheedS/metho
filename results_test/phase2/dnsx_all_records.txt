@@ -1,0 +1,16 @@
+mx01.mydigipay.com
+mx02.mydigipay.com
+h.ns.arvancdn.ir
+s.ns.arvancdn.ir
+45be87950cb17afd921dad319d84e8a7c54c8ef5179edffaf13a3333ee3aa75
+MS=ms55282580
+openai-domain-verification=dv-MJyyE23x7fEIS0PuEWCnPebw
+zoho-verification=zb16187930.zmverify.zoho.com
+a19100fa1f7d6d894380e459b7c33cd5.cdn.edge.sotoon.ir
+944cdbe5201dc8be48291b652f615f860293322a72fb3ad5c12753b65b798d9
+a54b23cceb8242c1db49fdbbad53c0ab41d4cab1853ae2d88d7cdf147b4bab4
+48e3821045d5ba9b060270690026afaa372c010e5a86f436ce9de372eae71f3
+f292f54fca0c6610584c0f7ee520fc51738200f85933d481c16cb6a5a53d511
+v=spf1 mx a ip4:93.113.226.252/32 ip4:93.113.226.194/32 -all
+google-site-verification=uDWQxDZW6HEHQWC5ut8H3eE24WLdvsdOehsNko27yPQ
+313595d45319221a58bce9fa37a054e81325987026b6ceac9f146f948b365db

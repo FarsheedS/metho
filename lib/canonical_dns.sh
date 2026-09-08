@@ -23,7 +23,7 @@
 # ── Initialize ─────────────────────────────────────────────────────────────────
 # Create the canonical DNS TSV with its header row.
 init_canonical_dns() {
-    local tsv="${OUTPUT_DIR}/canonical_dns.tsv"
+    local tsv="${CANONICAL_DNS_TSV:-${OUTPUT_DIR}/canonical_dns.tsv}"
     printf 'hostname\troot_domain\tdiscovery_sources\tA\tAAAA\tCNAME\tresolution_status\n' > "$tsv"
     log_info "Initialized canonical DNS dataset: $tsv"
 }
@@ -87,7 +87,7 @@ match_root_domain() {
 # passive-enum merge for one domain take ~30 minutes (O(N²) in file rewrites).
 canonical_dns_add_sources() {
     local source="$1" hostnames_file="$2" explicit_root="${3:-}"
-    local tsv="${OUTPUT_DIR}/canonical_dns.tsv"
+    local tsv="${CANONICAL_DNS_TSV:-${OUTPUT_DIR}/canonical_dns.tsv}"
 
     if [[ ! -f "$tsv" ]]; then
         init_canonical_dns
@@ -189,9 +189,9 @@ canonical_dns_add_sources() {
 # dnsx for A/AAAA/CNAME resolution, and updates the TSV in-place.
 # Any extra flags (e.g., -r resolvers.txt) are passed through to dnsx.
 canonical_dns_resolve_pending() {
-    local tsv="${OUTPUT_DIR}/canonical_dns.tsv"
-    local pending_file="${OUTPUT_DIR}/.pending_hosts.txt"
-    local dnsx_json="${OUTPUT_DIR}/.pending_dnsx.json"
+    local tsv="${CANONICAL_DNS_TSV:-${OUTPUT_DIR}/canonical_dns.tsv}"
+    local pending_file="${tsv}.pending_hosts"
+    local dnsx_json="${tsv}.pending_dnsx"
 
     if [[ ! -s "$tsv" ]]; then
         log_warn "canonical_dns_resolve_pending: TSV does not exist"
@@ -377,7 +377,7 @@ canonical_dns_resolve_pending() {
 # with columns: hostname  cdn  technologies  webserver  content_length  status_code  title  url
 canonical_dns_merge_httpx() {
     local httpx_json="$1"
-    local meta_tsv="${OUTPUT_DIR}/httpx_metadata.tsv"
+    local meta_tsv="${HTTPX_META_TSV:-${OUTPUT_DIR}/httpx_metadata.tsv}"
 
     if [[ ! -s "$httpx_json" ]]; then
         log_warn "canonical_dns_merge_httpx: $httpx_json is empty or missing"
@@ -442,7 +442,7 @@ canonical_dns_merge_httpx() {
 
 # ── Extract all hostnames from the canonical dataset ──────────────────────────
 canonical_dns_extract_hostnames() {
-    local tsv="${OUTPUT_DIR}/canonical_dns.tsv"
+    local tsv="${CANONICAL_DNS_TSV:-${OUTPUT_DIR}/canonical_dns.tsv}"
     if [[ ! -s "$tsv" ]]; then
         echo ""
         return
@@ -453,7 +453,7 @@ canonical_dns_extract_hostnames() {
 
 # ── Extract all unique resolved IPs (A records) ──────────────────────────────
 canonical_dns_extract_ips() {
-    local tsv="${OUTPUT_DIR}/canonical_dns.tsv"
+    local tsv="${CANONICAL_DNS_TSV:-${OUTPUT_DIR}/canonical_dns.tsv}"
     if [[ ! -s "$tsv" ]]; then
         echo ""
         return
@@ -471,7 +471,7 @@ canonical_dns_extract_ips() {
 # ── Extract hostnames with a specific resolution status ───────────────────────
 canonical_dns_extract_by_status() {
     local status="$1"
-    local tsv="${OUTPUT_DIR}/canonical_dns.tsv"
+    local tsv="${CANONICAL_DNS_TSV:-${OUTPUT_DIR}/canonical_dns.tsv}"
     if [[ ! -s "$tsv" ]]; then
         echo ""
         return
@@ -488,7 +488,7 @@ canonical_dns_extract_resolved() {
 # Returns "true" or "false" based on httpx_metadata.tsv
 get_httpx_cdn_for_host() {
     local host="$1"
-    local meta_tsv="${OUTPUT_DIR}/httpx_metadata.tsv"
+    local meta_tsv="${HTTPX_META_TSV:-${OUTPUT_DIR}/httpx_metadata.tsv}"
     if [[ ! -s "$meta_tsv" ]]; then
         echo "false"
         return
@@ -499,5 +499,132 @@ get_httpx_cdn_for_host() {
         echo "true"
     else
         echo "false"
+    fi
+}
+
+# ── Merge per-domain canonical DNS TSVs into the global TSV ───────────────────
+# After parallel Phase 1 processing, each domain has its own canonical_dns.tsv
+# and httpx_metadata.tsv in phase1/<domain>/. This function merges them into the
+# global ${OUTPUT_DIR}/canonical_dns.tsv and ${OUTPUT_DIR}/httpx_metadata.tsv
+# that Phase 2 and Phase 3 consume.
+#
+# Merge rules for canonical_dns.tsv:
+#   - Group by hostname (column 1)
+#   - discovery_sources: union (semicolon-joined, deduped)
+#   - A/AAAA/CNAME: union (semicolon-joined, deduped)
+#   - root_domain: first non-empty wins
+#   - resolution_status: prefer resolved > nxdomain > timeout > pending > bogon
+#
+# Merge rules for httpx_metadata.tsv:
+#   - Group by hostname (column 1)
+#   - Last record per host wins (same as canonical_dns_merge_httpx)
+merge_per_domain_dns() {
+    local global_tsv="${OUTPUT_DIR}/canonical_dns.tsv"
+    local global_meta="${OUTPUT_DIR}/httpx_metadata.tsv"
+    local p1_dir="${OUTPUT_DIR}/phase1"
+
+    log_info "Merging per-domain canonical DNS datasets..."
+
+    # ── Merge canonical_dns.tsv ─────────────────────────────────────────────
+    # Collect all per-domain TSVs (skip the global one if it exists in phase1/)
+    local per_domain_tsvs=()
+    local d
+    for d in "$p1_dir"/*/; do
+        [[ -d "$d" ]] || continue
+        if [[ -s "${d}canonical_dns.tsv" ]]; then
+            per_domain_tsvs+=("${d}canonical_dns.tsv")
+        fi
+    done
+
+    if [[ ${#per_domain_tsvs[@]} -gt 0 ]]; then
+        printf 'hostname\troot_domain\tdiscovery_sources\tA\tAAAA\tCNAME\tresolution_status\n' > "$global_tsv"
+
+        # Single awk pass: read all per-domain TSVs (skipping headers), group by
+        # hostname, merge fields. Status priority: resolved=1, nxdomain=2,
+        # timeout=3, pending=4, bogon=5 (lower = higher priority).
+        awk -F'\t' -v OFS='\t' '
+            function status_rank(s) {
+                if (s == "resolved") return 1
+                if (s == "nxdomain") return 2
+                if (s == "timeout") return 3
+                if (s == "pending") return 4
+                if (s == "bogon") return 5
+                return 6
+            }
+            # Merge a semicolon-separated field: add new values not already present
+            function merge_field(old, new,    a, b, i, j, seen, out) {
+                if (new == "") return old
+                split(old, a, ";")
+                split(new, b, ";")
+                out = ""
+                for (i in a) {
+                    if (a[i] != "" && !(a[i] in seen)) { seen[a[i]] = 1; out = (out == "") ? a[i] : out ";" a[i] }
+                }
+                for (j in b) {
+                    if (b[j] != "" && !(b[j] in seen)) { seen[b[j]] = 1; out = (out == "") ? b[j] : out ";" b[j] }
+                }
+                return out
+            }
+            FNR == 1 { next }  # skip headers
+            {
+                h = $1
+                if (h == "") next
+                if (!(h in seen)) { order[++n] = h; seen[h] = 1 }
+                # root_domain: first non-empty wins
+                if (rd[h] == "" && $2 != "") rd[h] = $2
+                # discovery_sources: union
+                src[h] = merge_field(src[h], $3)
+                # A/AAAA/CNAME: union
+                a[h] = merge_field(a[h], $4)
+                aaaa[h] = merge_field(aaaa[h], $5)
+                cname[h] = merge_field(cname[h], $6)
+                # resolution_status: best rank wins
+                if (status_rank($7) < status_rank(st[h])) st[h] = $7
+                if (st[h] == "") st[h] = $7
+            }
+            END {
+                for (i = 1; i <= n; i++) {
+                    h = order[i]
+                    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", h, rd[h], src[h], a[h], aaaa[h], cname[h], st[h]
+                }
+            }
+        ' "${per_domain_tsvs[@]}" >> "$global_tsv"
+
+        local entry_count=0
+        [[ -s "$global_tsv" ]] && entry_count=$(tail -n +2 "$global_tsv" | wc -l)
+        log_success "Merged canonical DNS: $entry_count entries from ${#per_domain_tsvs[@]} per-domain TSVs"
+    else
+        log_warn "No per-domain canonical_dns.tsv files found to merge"
+    fi
+
+    # ── Merge httpx_metadata.tsv ────────────────────────────────────────────
+    local per_domain_metas=()
+    for d in "$p1_dir"/*/; do
+        [[ -d "$d" ]] || continue
+        if [[ -s "${d}httpx_metadata.tsv" ]]; then
+            per_domain_metas+=("${d}httpx_metadata.tsv")
+        fi
+    done
+
+    if [[ ${#per_domain_metas[@]} -gt 0 ]]; then
+        printf 'hostname\tcdn\ttechnologies\twebserver\tcontent_length\tstatus_code\ttitle\turl\n' > "$global_meta"
+
+        # Last record per host wins (same semantics as canonical_dns_merge_httpx).
+        awk -F'\t' -v OFS='\t' '
+            FNR == 1 { next }  # skip headers
+            {
+                if ($1 == "") next
+                if (!($1 in seen)) order[++n] = $1
+                seen[$1] = 1
+                rec[$1] = $0  # last wins
+            }
+            END {
+                for (i = 1; i <= n; i++) print rec[order[i]]
+            }
+        ' "${per_domain_metas[@]}" >> "$global_meta"
+
+        local meta_count=0
+        [[ -s "$global_meta" ]] && meta_count=$(tail -n +2 "$global_meta" | wc -l)
+        log_info "Merged HTTPx metadata: $meta_count entries from ${#per_domain_metas[@]} per-domain files"
     fi
 }

@@ -1,0 +1,10 @@
+IP	classification	associated_hostnames	root_domains	ASN	ASN_org
+185.143.232.253	cdn	h.ns.arvancdn.ir	dnsx-cloud	AS205585	ARVANCLOUD-CDN-IR - Noyan Abr Arvan Co. ( Private Joint Stock), IR
+185.143.233.238	cdn	bot.mydigipay.com;business.mydigipay.com;ipg.mydigipay.com	mydigipay.com	AS205585	ARVANCLOUD-CDN-IR - Noyan Abr Arvan Co. ( Private Joint Stock), IR
+185.143.234.238	cdn	bot.mydigipay.com;business.mydigipay.com;ipg.mydigipay.com	mydigipay.com	AS205585	ARVANCLOUD-CDN-IR - Noyan Abr Arvan Co. ( Private Joint Stock), IR
+185.143.235.253	cdn	s.ns.arvancdn.ir	dnsx-cloud	AS205585	ARVANCLOUD-CDN-IR - Noyan Abr Arvan Co. ( Private Joint Stock), IR
+185.166.104.6	unknown	web.mydigipay.com;mydigipay.com;a19100fa1f7d6d894380e459b7c33cd5.cdn.edge.sotoon.ir	mydigipay.com;dnsx-cloud	AS202319	Sotoon-CDN - Hezardastan Unit Cloud Computing PJSC, IR
+185.166.104.7	unknown	pillar.mydigipay.com;a19100fa1f7d6d894380e459b7c33cd5.cdn.edge.sotoon.ir	mydigipay.com;dnsx-cloud	AS202319	Sotoon-CDN - Hezardastan Unit Cloud Computing PJSC, IR
+93.113.226.194	unknown	autodiscover.mydigipay.com;dpm.mydigipay.com;mail.mydigipay.com;mx01.mydigipay.com;mx02.mydigipay.com;webmail.mydigipay.com	mydigipay.com	AS25184	AFRANET - Afranet, IR
+93.113.226.201	unknown	ftp.mydigipay.com	mydigipay.com	AS25184	AFRANET - Afranet, IR
+93.113.226.212	unknown	builder-bot.mydigipay.com	mydigipay.com	AS25184	AFRANET - Afranet, IR

@@ -122,7 +122,7 @@ write_ip_datasets() {
     local pdir="$3"
 
     local class_tsv="${pdir}/ip_classification.tsv"
-    local meta_tsv="${OUTPUT_DIR}/httpx_metadata.tsv"
+    local meta_tsv="${HTTPX_META_TSV:-${OUTPUT_DIR}/httpx_metadata.tsv}"
 
     log_info "Building IP classification datasets..."
 
@@ -139,7 +139,7 @@ write_ip_datasets() {
     : > "$ip_hosts"
     if [[ -s "$domain_ip_map" ]]; then
         # First, get hostname→root_domain mapping from canonical DNS
-        local dns_tsv="${OUTPUT_DIR}/canonical_dns.tsv"
+        local dns_tsv="${CANONICAL_DNS_TSV:-${OUTPUT_DIR}/canonical_dns.tsv}"
         # Join domain_ip_map with canonical_dns on hostname to get root_domain
         # domain_ip_map: hostname<space>IP (written by phase3 with a single
         # space separator — NOT a tab). The earlier -F"\t" here never split

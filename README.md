@@ -178,6 +178,7 @@ Options:
   --no-port-scan            Skip the port-scan stage inside Phase 3 (classification still runs)
   --threads N               Threads for ShuffleDNS and Cloud_Enum (default: 50)
   --parallel-hosts N        Hosts crawled in parallel per per-host tool (default: 5)
+  --parallel-domains N      Root domains processed in parallel in Phase 1 (default: 3)
   --rate-limit N            httpx requests/second (default: 100)
   --timeout N               Checkpoint auto-continue timeout in seconds; 0 = wait forever (default: 30)
   --output DIR              Output directory (default: /output)
@@ -285,7 +286,7 @@ docker run --rm -it \
   -e KATANA_TIMEOUT=900 \
   -e WAYMORE_TIMEOUT=2700 \
   -e CEWL_MEM_LIMIT_MB=1536 \
-  metho --domains "example.com" --parallel-hosts 8 --auto
+  metho --domains "example.com" --parallel-hosts 8 --parallel-domains 5 --auto
 ```
 
 ---

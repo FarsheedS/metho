@@ -1,0 +1,8 @@
+api.mydigipay.com
+app.mydigipay.com
+business.mydigipay.com
+insurance-internal.mydigipay.com
+mail.mydigipay.com
+merchant.mydigipay.com
+web.mydigipay.com
+webmail.mydigipay.com

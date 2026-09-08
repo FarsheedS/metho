@@ -28,7 +28,7 @@ run_phase3() {
     canonical_dns_resolve_pending
 
     # Extract the domain→IP mapping from the canonical DNS dataset
-    local dns_tsv="${OUTPUT_DIR}/canonical_dns.tsv"
+    local dns_tsv="${CANONICAL_DNS_TSV:-${OUTPUT_DIR}/canonical_dns.tsv}"
     if [[ ! -s "$dns_tsv" ]]; then
         log_error "Canonical DNS dataset not found — cannot proceed with IP classification"
         return 1

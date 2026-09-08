@@ -1,0 +1,2 @@
+# Nmap 7.95 scan initiated Tue Sep  8 20:15:48 2026 as: nmap -Pn -iL /output/phase3/nmap_candidates.txt -p 53,179 -sV --open --min-rate 500 -oG /output/phase3/port_scan_results.txt
+# Nmap done at Tue Sep  8 20:16:03 2026 -- 5 IP addresses (5 hosts up) scanned in 15.36 seconds

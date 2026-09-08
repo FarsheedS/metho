@@ -1,0 +1,7 @@
+api.mydigipay.com
+app.mydigipay.com
+appsec.mydigipay.com
+business.mydigipay.com
+dsh.mydigipay.com
+mydigipay.com
+www.mydigipay.com

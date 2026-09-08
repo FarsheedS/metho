@@ -1,0 +1,15 @@
+hostname	cdn	technologies	webserver	content_length	status_code	title	url
+business.mydigipay.com	true	ArvanCloud;HSTS	ArvanCloud	51813	200	پنل پذیرندگان دیجی‌پی	https://business.mydigipay.com
+bot.mydigipay.com	true	ArvanCloud;HSTS	ArvanCloud	1969	200		https://bot.mydigipay.com
+mydigipay.com		HSTS	Sotoon CDN	169	301	301 Moved Permanently	https://mydigipay.com
+api.mydigipay.com		HSTS	Sotoon CDN	0	401		https://api.mydigipay.com
+ipg.mydigipay.com	true	ArvanCloud;HSTS	ArvanCloud	6494	404		https://ipg.mydigipay.com
+pillar.mydigipay.com		HSTS	Sotoon CDN	61722	200	دیجی‌پی | خدمات مالی و پرداخت	https://pillar.mydigipay.com
+analytics.mydigipay.com	true	ArvanCloud;HSTS;Matomo Analytics	ArvanCloud	238670	200	Sign in - Matomo	https://analytics.mydigipay.com
+dpm.mydigipay.com				1898	403	DP	https://dpm.mydigipay.com
+web.mydigipay.com		HSTS	Sotoon CDN	112	200	Digipay	https://web.mydigipay.com
+autodiscover.mydigipay.com				1898	403	DP	https://autodiscover.mydigipay.com
+mx01.mydigipay.com				1898	403	DP	https://mx01.mydigipay.com
+mx02.mydigipay.com			DP	0	302		http://mx02.mydigipay.com
+webmail.mydigipay.com			DP	0	302		http://webmail.mydigipay.com
+mail.mydigipay.com			DP	0	302		http://mail.mydigipay.com

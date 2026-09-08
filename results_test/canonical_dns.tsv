@@ -1,0 +1,49 @@
+api.mydigipay.com	mydigipay.com	subfaster;crt.name;waymore;katana;subdomainizer;final	185.166.104.7			resolved
+app.mydigipay.com	mydigipay.com	subfaster;crt.name;waymore;katana;subdomainizer;final				timeout
+appsec.mydigipay.com	mydigipay.com	subfaster;crt.name;waymore;subdomainizer;final				timeout
+autodiscover.mydigipay.com	mydigipay.com	subfaster;katana;subdomainizer;final	93.113.226.194			resolved
+blog.mydigipay.com	mydigipay.com	subfaster;crt.name;final				timeout
+bot.mydigipay.com	mydigipay.com	subfaster;katana;subdomainizer;final	185.143.234.238;185.143.233.238			resolved
+business.mydigipay.com	mydigipay.com	subfaster;waymore;katana;subdomainizer;final	185.143.234.238;185.143.233.238			resolved
+crashlytics.mydigipay.com	mydigipay.com	subfaster;katana;subdomainizer;final				timeout
+dc-ise.mydigipay.com	mydigipay.com	subfaster;crt.name;subdomainizer;final				timeout
+dc-psn1.mydigipay.com	mydigipay.com	subfaster;crt.name;subdomainizer;final				timeout
+docs.mydigipay.com	mydigipay.com	subfaster;crt.name;final				timeout
+dp-ise.ad.mydigipay.com	mydigipay.com	subfaster;crt.name;subdomainizer;final				timeout
+dpm.mydigipay.com	mydigipay.com	subfaster;katana;subdomainizer;final	93.113.226.194			resolved
+dpo-ise.mydigipay.com	mydigipay.com	subfaster;crt.name;subdomainizer;final				timeout
+dpo-psn1.mydigipay.com	mydigipay.com	subfaster;crt.name;subdomainizer;final				timeout
+drtest.mydigipay.com	mydigipay.com	subfaster;crt.name;subdomainizer;final				timeout
+express.mydigipay.com	mydigipay.com	subfaster;crt.name;katana;final				timeout
+ftp.mydigipay.com	mydigipay.com	subfaster;final	93.113.226.201			resolved
+imap.mydigipay.com	mydigipay.com	subfaster;final				timeout
+insurance-cp.mydigipay.com	mydigipay.com	subfaster;crt.name;final				timeout
+insurance-internal.mydigipay.com	mydigipay.com	subfaster;subdomainizer;final				timeout
+ipg.mydigipay.com	mydigipay.com	subfaster;crt.name;katana;subdomainizer;final	185.143.233.238;185.143.234.238			resolved
+landing.mydigipay.com	mydigipay.com	subfaster;crt.name;final				timeout
+legacy.mydigipay.com	mydigipay.com	subfaster;crt.name;final				timeout
+mail.mydigipay.com	mydigipay.com	subfaster;katana;subdomainizer;final	93.113.226.194			resolved
+merchant.mydigipay.com	mydigipay.com	subfaster;crt.name;subdomainizer;final				timeout
+mx01.mydigipay.com	mydigipay.com	subfaster;crt.name;katana;subdomainizer;final;dnsx-cloud	93.113.226.194			resolved
+mx02.mydigipay.com	mydigipay.com	subfaster;crt.name;katana;subdomainizer;final;dnsx-cloud	93.113.226.194			resolved
+pillar.mydigipay.com	mydigipay.com	subfaster;katana;subdomainizer;final	185.166.104.7			resolved
+portal.mydigipay.com	mydigipay.com	subfaster;crt.name;subdomainizer;final				timeout
+smokyapi.mydigipay.com	mydigipay.com	subfaster;final				timeout
+tools.mydigipay.com	mydigipay.com	subfaster;final				timeout
+uat.mydigipay.com	mydigipay.com	subfaster;final				timeout
+web.mydigipay.com	mydigipay.com	subfaster;crt.name;katana;subdomainizer;final	185.166.104.6			resolved
+webmail.mydigipay.com	mydigipay.com	subfaster;katana;subdomainizer;final	93.113.226.194			resolved
+www.dc-ise.mydigipay.com	mydigipay.com	subfaster;crt.name;subdomainizer;final				timeout
+www.dc-psn1.mydigipay.com	mydigipay.com	subfaster;crt.name;subdomainizer;final				timeout
+www.dp-ise.ad.mydigipay.com	mydigipay.com	subfaster;crt.name;subdomainizer;final				timeout
+www.dpo-ise.mydigipay.com	mydigipay.com	subfaster;crt.name;subdomainizer;final				timeout
+www.dpo-psn1.mydigipay.com	mydigipay.com	subfaster;crt.name;subdomainizer;final				timeout
+www.mydigipay.com	mydigipay.com	subfaster;crt.name;waymore;katana;subdomainizer;final				timeout
+dsh.mydigipay.com	mydigipay.com	waymore;final				timeout
+builder-bot.mydigipay.com	mydigipay.com	katana;subdomainizer;final	93.113.226.212			resolved
+mydigipay.com	mydigipay.com	katana;subdomainizer;final	185.166.104.6			resolved
+drapi.mydigipay.com	mydigipay.com	subdomainizer;final				timeout
+a19100fa1f7d6d894380e459b7c33cd5.cdn.edge.sotoon.ir		dnsx-cloud	185.166.104.6;185.166.104.7			resolved
+h.ns.arvancdn.ir		dnsx-cloud	185.143.232.253			resolved
+s.ns.arvancdn.ir		dnsx-cloud	185.143.235.253			resolved
+zb16187930.zmverify.zoho.com		dnsx-cloud				timeout

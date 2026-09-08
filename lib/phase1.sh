@@ -18,17 +18,20 @@ run_phase1() {
     domain_count=$(wc -l < "$root_domains_file")
     log_info "═══ PHASE 1: Root Domains → Subdomains (${domain_count} domains) ═══"
 
-    # Seed every user-supplied root domain itself into the canonical dataset
-    # so the apex/root application is not missed simply because no discovery
-    # tool returns it. The apex must subsequently go through the normal DNSX
-    # and HTTPX processing like any other hostname. Its source is recorded as
-    # `root`; match_root_domain resolves each apex to itself (exact match).
-    canonical_dns_add_sources "root" "$root_domains_file"
+    # Process domains in parallel. Each domain gets its own canonical_dns.tsv
+    # and httpx_metadata.tsv (set in process_domain via CANONICAL_DNS_TSV /
+    # HTTPX_META_TSV exports scoped to the subshell). After all domains
+    # complete, merge_per_domain_dns combines them into the global TSV that
+    # Phase 2 and Phase 3 consume.
+    _process_domain_wrapper() {
+        process_domain "$1" "$pdir"
+    }
 
-    while read -r DOMAIN; do
-        [[ -z "$DOMAIN" ]] && continue
-        process_domain "$DOMAIN" "$pdir"
-    done < "$root_domains_file"
+    log_info "Processing ${domain_count} domains with ${PARALLEL_DOMAINS:-3} parallel workers..."
+    bounded_parallel "${PARALLEL_DOMAINS:-3}" "$root_domains_file" _process_domain_wrapper
+
+    # Merge all per-domain canonical DNS TSVs into the global dataset
+    merge_per_domain_dns
 }
 
 # ── CeWL helpers (Stage 4) ─────────────────────────────────────────────────
@@ -89,6 +92,22 @@ process_domain() {
     log_info "────────────────────────────────────────────"
 
     cd "$ddir" || return 1
+
+    # Per-domain canonical DNS dataset. Each parallel domain gets its own
+    # canonical_dns.tsv and httpx_metadata.tsv in its per-domain directory.
+    # After all domains complete, merge_per_domain_dns combines them into
+    # the global TSV. These exports are scoped to this subshell (via
+    # bounded_parallel), so the parent shell retains the global defaults
+    # for Phase 2/3.
+    export CANONICAL_DNS_TSV="${ddir}/canonical_dns.tsv"
+    export HTTPX_META_TSV="${ddir}/httpx_metadata.tsv"
+    init_canonical_dns
+
+    # Seed this domain's root into the per-domain canonical dataset so the
+    # apex is not missed (previously done globally in run_phase1 for all
+    # roots at once; now per-domain since each has its own TSV).
+    printf '%s\n' "$domain" > .root_seed.txt
+    canonical_dns_add_sources "root" .root_seed.txt "$domain"
 
     # ── Stage 1: Passive Subdomain Enumeration ──────────────────────────────
     log_info "Stage 1: Passive subdomain enumeration"
@@ -568,9 +587,14 @@ WORDBASE
     fi
 
     # ── Stage 6: Web Crawling + JavaScript Analysis ────────────────────────
-    log_info "Stage 6: Web Crawling & JavaScript Analysis"
+    # Katana and Subdomainizer crawl the same hosts but write to separate
+    # directories (katana/ vs subdomainizer/) with no data dependency between
+    # them. Running them in parallel saves the full Subdomainizer time (~5 min
+    # per domain). canonical_dns_add_sources calls are deferred to after both
+    # complete to avoid concurrent TSV writes.
+    log_info "Stage 6: Web Crawling & JavaScript Analysis (Katana + Subdomainizer in parallel)"
 
-    # Katana (replaces GoSpider)
+    # ── Katana (background subshell) ──────────────────────────────────────
     # Per https://github.com/projectdiscovery/katana README:
     #   -u URL       seed URL to crawl
     #   -d N         max depth (we use 3)
@@ -585,6 +609,7 @@ WORDBASE
     #   -ct DURATION wall-clock cap for the whole crawl (s/m/h suffix)
     #   -ob -or      omit response body and raw request/response from JSONL
     #   -silent      suppress banner and progress
+    (
     if command -v katana &>/dev/null && [[ -s live_subdomains_round2.txt ]]; then
         mkdir -p katana
         : > katana/raw_output.jsonl
@@ -630,9 +655,6 @@ WORDBASE
             local ka_sub_count=0
             [[ -s katana/discovered_hosts.txt ]] && ka_sub_count=$(wc -l < katana/discovered_hosts.txt)
             log_success "Katana: ${ka_lines} JSON lines, ${ka_sub_count} in-scope subdomains, $(wc -l < katana/discovered_urls.txt 2>/dev/null || echo 0) URLs, $(wc -l < katana/javascript_assets.txt 2>/dev/null || echo 0) JS assets across ${ka_hosts_count} hosts"
-
-            # Add newly discovered hosts to canonical DNS dataset
-            [[ -s katana/discovered_hosts.txt ]] && canonical_dns_add_sources "katana" "katana/discovered_hosts.txt" "$domain"
         else
             local ka_hosts_count
             ka_hosts_count=$(wc -l < live_subdomains_round2.txt | tr -d ' ')
@@ -646,14 +668,17 @@ WORDBASE
             log_skip "Katana skipped (no live hosts to crawl)"
         fi
     fi
+    ) &
+    local _katana_pid=$!
 
-    # Subdomainizer
+    # ── Subdomainizer (background subshell) ───────────────────────────────
     # Per https://github.com/nsonaniya2010/SubDomainizer:
     #   -u URL         target URL to scan for JS-loaded subdomains
     #   -o FILE        write results to FILE
     #   -k             --nossl — disable SSL verification
     # Each per-host scan is wrapped in `timeout` so a single slow/unreachable
     # URL can't stall the whole stage for hours.
+    (
     if [[ -f /opt/tools/SubDomainizer/SubDomainizer.py ]] && [[ -s live_subdomains_round2.txt ]]; then
         mkdir -p subdomainizer
         : > subdomainizer/raw_output.txt
@@ -679,11 +704,11 @@ WORDBASE
             {
                 cat subdomainizer/raw_output.txt
                 cat subdomainizer/stdout.log 2>/dev/null
-            } > /tmp/sd_combined.txt
-            extract_domains /tmp/sd_combined.txt subdomainizer/all_domains.txt
+            } > subdomainizer/.sd_combined.txt
+            extract_domains subdomainizer/.sd_combined.txt subdomainizer/all_domains.txt
             local escaped_domain="${domain//./\\.}"
             grep -E "(^|\.)${escaped_domain}$" subdomainizer/all_domains.txt | sort -u > subdomainizer_subdomains.txt || true
-            rm -f /tmp/sd_combined.txt
+            rm -f subdomainizer/.sd_combined.txt
 
             # Preserve JavaScript assets separately
             if [[ -s subdomainizer/stdout.log ]]; then
@@ -694,9 +719,6 @@ WORDBASE
             local sd_count=0
             [[ -s subdomainizer_subdomains.txt ]] && sd_count=$(wc -l < subdomainizer_subdomains.txt)
             log_success "Subdomainizer subdomains (${sd_hosts} hosts scanned): $sd_count"
-
-            # Add newly discovered hosts to canonical DNS dataset
-            [[ -s subdomainizer_subdomains.txt ]] && canonical_dns_add_sources "subdomainizer" "subdomainizer_subdomains.txt" "$domain"
         else
             local sd_hosts
             sd_hosts=$(wc -l < live_subdomains_round2.txt | tr -d ' ')
@@ -705,6 +727,16 @@ WORDBASE
     else
         log_skip "Subdomainizer skipped (tool missing or no live hosts)"
     fi
+    ) &
+    local _sd_pid=$!
+
+    # Wait for both Katana and Subdomainizer to complete
+    wait "$_katana_pid" 2>/dev/null || true
+    wait "$_sd_pid" 2>/dev/null || true
+
+    # Merge results into canonical DNS (sequential — no concurrent TSV writes)
+    [[ -s katana/discovered_hosts.txt ]] && canonical_dns_add_sources "katana" "katana/discovered_hosts.txt" "$domain"
+    [[ -s subdomainizer_subdomains.txt ]] && canonical_dns_add_sources "subdomainizer" "subdomainizer_subdomains.txt" "$domain"
 
     # ── Stage 7: Final Consolidation + DNSx Delta + HTTPx Round 3 ──────────
     log_info "Stage 7: Final consolidation + DNSx delta resolution + HTTPx Round 3"

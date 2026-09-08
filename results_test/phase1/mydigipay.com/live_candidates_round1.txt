@@ -1,0 +1,15 @@
+mydigipay.com
+analytics.mydigipay.com
+api.mydigipay.com
+autodiscover.mydigipay.com
+bot.mydigipay.com
+business.mydigipay.com
+dpm.mydigipay.com
+ftp.mydigipay.com
+ipg.mydigipay.com
+mail.mydigipay.com
+mx01.mydigipay.com
+mx02.mydigipay.com
+pillar.mydigipay.com
+web.mydigipay.com
+webmail.mydigipay.com

@@ -1,0 +1,2 @@
+builder-bot.mydigipay.com
+drapi.mydigipay.com

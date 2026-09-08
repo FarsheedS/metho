@@ -1,0 +1,48 @@
+========================================
+RECONNAISSANCE PHASE COMPLETE
+========================================
+
+Root Domains Provided: 1
+
+ASSETS DISCOVERED:
+- All Subdomains:     46
+- Live Web Servers:   14
+- Waymore URLs:       32
+- Cloud Assets:       2
+- ASNs:               3
+- Network Ranges:     3
+- IP Addresses:       9
+- IP:Port Pairs:      2
+
+IP CLASSIFICATION:
+- CDN IPs:            4
+- Cloud IPs:          0
+- Dedicated IPs:      0
+- Unknown IPs:        5
+
+FILES CREATED IN final/:
+- final_all_domains.txt          (all subdomains)
+- final_live_web_servers.txt     (live web server URLs)
+- final_httpx_metadata.json       (full httpx JSON with CDN/tech/webserver)
+- httpx_metadata.tsv              (per-host HTTPX metadata companion to canonical_dns.tsv)
+- canonical_dns.tsv               (canonical hostname→DNS dataset)
+- final_waymore_urls.txt          (historical URLs from Waymore)
+- final_cloud_assets.txt         (cloud assets)
+- final_asn_list.txt             (ASN numbers)
+- final_asn_summary.txt          (ASNs sorted by IP count)
+- final_network_ranges.txt       (CIDR blocks)
+- final_ip_addresses.txt         (all resolved IPs)
+- final_ip_classification.tsv   (IP classification: CDN/cloud/dedicated/unknown)
+- final_ip_port_pairs.txt        (IP:port from non-CDN scan)
+- final_cdn_ips.txt              (CDN-associated IPs)
+- final_non_cdn_ips.txt          (non-CDN IPs)
+- final_nmap_candidates.txt      (IPs targeted for port scanning)
+- final_domain_ip_map.txt        (domain→IP mapping)
+
+LOG FILE:
+- recon.log                      (timestamped log of all stages)
+
+NEXT STEPS:
+Proceed to vulnerability scanning / enumeration on live web servers.
+
+========================================

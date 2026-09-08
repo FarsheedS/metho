@@ -1,0 +1,23 @@
+
+       __        ________        __       
+  ___ / /  __ __/ _/ _/ /__  ___/ /__ ___
+ (_-</ _ \/ // / _/ _/ / -_)/ _  / _ \(_-<
+/___/_//_/\_,_/_//_//_/\__/ \_,_/_//_/___/
+
+		projectdiscovery.io
+
+[[34mINF[0m] Started generating bruteforce permutation with streaming processing
+[[34mINF[0m] Processing chunk 1 (41 permutations, total: 41)
+[[34mINF[0m] Chunk 1 massdns execution took 5.019645128s
+[[34mINF[0m] Chunk 1 parsing completed in 6.115167ms
+[[34mINF[0m] Chunk 1 completed in 5.026635544s
+[[34mINF[0m] Total permutations generated: 41
+[[34mINF[0m] Started removing wildcards records
+[[34mINF[0m] Started filtering wildcards for analytics.mydigipay.com
+[[34mINF[0m] Started filtering wildcards for analytics.mydigipay.com
+[[34mINF[0m] Wildcard removal completed in 4.960342835s
+[[34mINF[0m] Finished enumeration, started writing output
+analytics.mydigipay.com
+[[34mINF[0m] Total resolved: 1
+[[34mINF[0m] Output written in 4.667416ms
+[[34mINF[0m] Finished resolving.

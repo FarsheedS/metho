@@ -1,0 +1,10 @@
+api.mydigipay.com
+app.mydigipay.com
+appsec.mydigipay.com
+business.mydigipay.com
+download.html
+dsh.mydigipay.com
+main-7SPWV67L.js
+mydigipay.com
+wp-digipay-V1.6.9.zip
+www.mydigipay.com

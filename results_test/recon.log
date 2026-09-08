@@ -1,0 +1,125 @@
+2026-09-08 19:23:57 [*] Log file: /output/recon.log
+2026-09-08 19:23:57 [*] Initialized canonical DNS dataset: /output/canonical_dns.tsv
+2026-09-08 19:23:57 [*] Loaded ASN config: 10 CDN ASNs, 23 cloud ASNs, 4 dedicated ASNs
+2026-09-08 19:23:57 [*] Domains:    <not set>
+2026-09-08 19:23:57 [*] Domains file: /input/targets.txt
+2026-09-08 19:23:57 [*] Auto mode:  false
+2026-09-08 19:23:57 [*] Output:     /output
+2026-09-08 19:23:57 [*] Threads:    10
+2026-09-08 19:23:57 [*] Rate limit: 100/s
+2026-09-08 19:23:57 [*] Parallel hosts (per-tool): 5
+2026-09-08 19:23:57 [*] Port scan:  true
+2026-09-08 19:23:57 [*] Subfaster config: /input/provider-config.yaml
+2026-09-08 19:23:57 [*] Waymore mode: U
+2026-09-08 19:23:57 [+] Loaded 1 root domains
+2026-09-08 19:23:57 [*] ═══ PHASE 1: Root Domains → Subdomains (1 domains) ═══
+2026-09-08 19:23:57 [*] Canonical DNS: added 1 new hostnames from root, updated 0 existing
+2026-09-08 19:23:57 [*] ────────────────────────────────────────────
+2026-09-08 19:23:57 [*] Processing domain: mydigipay.com
+2026-09-08 19:23:57 [*] ────────────────────────────────────────────
+2026-09-08 19:23:57 [*] Stage 1: Passive subdomain enumeration
+2026-09-08 19:23:57 [*] Running Subfaster...
+2026-09-08 19:24:08 [+] Subfaster subdomains: 42
+2026-09-08 19:24:08 [*] Querying crt.name for mydigipay.com...
+2026-09-08 19:24:13 [+] crt.name subdomains for mydigipay.com: 29
+2026-09-08 19:24:13 [*] Running GitHub-subdomains...
+2026-09-08 19:24:16 [+] GitHub-subdomains: 0 subdomains
+2026-09-08 19:24:16 [*] Attempting DNS zone transfer (AXFR)...
+2026-09-08 19:24:46 [*] AXFR: zone transfer not permitted (expected for most targets)
+2026-09-08 19:24:46 [*] Canonical DNS: added 42 new hostnames from subfaster, updated 0 existing
+2026-09-08 19:24:46 [*] Canonical DNS: added 0 new hostnames from crt.name, updated 29 existing
+2026-09-08 19:24:46 [*] Stage 2: Historical reconnaissance (Waymore)
+2026-09-08 19:24:46 [*] Running Waymore on root domain mydigipay.com (mode U)...
+2026-09-08 19:25:57 [+] Waymore: found 7 in-scope subdomains from 32 URLs
+2026-09-08 19:25:58 [*] Canonical DNS: added 1 new hostnames from waymore, updated 6 existing
+2026-09-08 19:25:58 [*] Stage 3: Consolidating passive results + DNSx resolution + HTTPx Round 1
+2026-09-08 19:25:58 [+] Subdomains from passive enumeration: 44
+2026-09-08 19:25:58 [*] Canonical DNS: resolving 44 pending hostnames via DNSx
+2026-09-08 19:26:20 [+] Canonical DNS: resolved=15, nxdomain=0, timeout=29, bogon=0, pending=0
+2026-09-08 19:26:20 [*] Probing 15 targets with httpx...
+2026-09-08 19:26:42 [+] Live web servers found: 14
+2026-09-08 19:26:42 [*] Canonical DNS: merged HTTPX metadata from httpx_results_round1.json
+2026-09-08 19:26:42 [*] Stage 4: Brute force subdomain discovery
+2026-09-08 19:26:42 [*] CeWL: crawling 14 hosts (depth 2, mem cap 1024MB, 5 in parallel)...
+2026-09-08 19:26:54 [*] Wordlist size: 41 unique words (CeWL-filtered)
+2026-09-08 19:26:54 [*] Running ShuffleDNS brute force on 41 words against mydigipay.com...
+2026-09-08 19:27:04 [+] Subdomains from brute force: 1 (see shuffledns.debug.log)
+2026-09-08 19:27:04 [*] Canonical DNS: added 0 new hostnames from shuffledns, updated 1 existing
+2026-09-08 19:27:04 [*] Stage 4b: Subdomain permutation (dnsgen)
+2026-09-08 19:27:04 [*]   Generating permutations from 44 subdomains...
+2026-09-08 19:27:05 [*]   Generated 985 permutation candidates, resolving...
+2026-09-08 19:27:05 [*] dnsgen: no permutations resolved
+2026-09-08 19:27:05 [*] Stage 5: Consolidate + DNSx delta resolution + HTTPx Round 2
+2026-09-08 19:27:05 [+] New subdomains from brute force: 0
+2026-09-08 19:27:05 [*] No new subdomains from brute force — skipping HTTPx Round 2 (reusing Round 1 results)
+2026-09-08 19:27:05 [*] Stage 6: Web Crawling & JavaScript Analysis
+2026-09-08 19:27:05 [*] Katana: crawling 14 hosts (per-host cap 30m, 5 in parallel)...
+2026-09-08 19:38:28 [+] Katana: 25584 JSON lines, 19 in-scope subdomains, 2106 URLs, 0 JS assets across 14 hosts
+2026-09-08 19:38:28 [*] Canonical DNS: added 2 new hostnames from katana, updated 17 existing
+2026-09-08 19:38:28 [*] Subdomainizer: scanning 14 hosts (5 in parallel)...
+2026-09-08 19:43:43 [+] Subdomainizer subdomains (14 hosts scanned): 34
+2026-09-08 19:43:43 [*] Canonical DNS: added 1 new hostnames from subdomainizer, updated 33 existing
+2026-09-08 19:43:43 [*] Stage 7: Final consolidation + DNSx delta resolution + HTTPx Round 3
+2026-09-08 19:43:43 [+] Total unique subdomains for mydigipay.com: 46
+2026-09-08 19:43:43 [*] Canonical DNS: added 0 new hostnames from final, updated 46 existing
+2026-09-08 19:43:43 [*] Canonical DNS: resolving 3 pending hostnames via DNSx
+2026-09-08 19:43:52 [+] Canonical DNS: resolved=16, nxdomain=0, timeout=30, bogon=0, pending=0
+2026-09-08 19:43:52 [*] New subdomains since Round 2 (from crawling): 2
+2026-09-08 19:43:52 [*] Probing 1 targets with httpx...
+2026-09-08 19:44:15 [!] No live web servers found in this round.
+2026-09-08 19:44:15 [+] FINAL live web servers for mydigipay.com: 14
+2026-09-08 19:44:15 [*] Non-interactive terminal — continuing...
+2026-09-08 19:44:15 [*] ═══ PHASE 2: Cloud Asset Discovery ═══
+2026-09-08 19:44:15 [*] Stage 1: DNSx cloud record discovery
+2026-09-08 19:44:15 [*]   Querying 16 resolved hosts for cloud record types (CNAME/MX/NS/TXT)
+2026-09-08 19:44:54 [*] Canonical DNS: added 4 new hostnames from dnsx-cloud, updated 2 existing
+2026-09-08 19:44:54 [*] Canonical DNS: resolving 4 pending hostnames via DNSx
+2026-09-08 19:45:07 [+] Canonical DNS: resolved=18, nxdomain=0, timeout=31, bogon=0, pending=0
+2026-09-08 19:45:07 [+] DNSx: 16 records, 0 cloud-related (52s elapsed)
+2026-09-08 19:45:07 [*] Stage 2: Cloud_Enum brute force
+2026-09-08 19:45:07 [*]   Cloud_Enum keywords: mydigipay (wall-clock cap 1800s)
+2026-09-08 20:15:07 [!] Cloud_Enum exited non-zero or was killed by CLOUD_ENUM_TIMEOUT -- see /output/phase2/cloud_enum.stderr.log
+2026-09-08 20:15:07 [*] Canonical DNS: no pending hostnames to resolve
+2026-09-08 20:15:07 [+] Cloud_Enum: 0 assets discovered (30m 0s elapsed)
+2026-09-08 20:15:07 [*] Stage 3: Extracting cloud assets from Phase 1 Katana crawl data
+2026-09-08 20:15:07 [+] Katana cloud assets: 2 from 2106 Phase 1 URLs (0s total)
+2026-09-08 20:15:07 [*] Consolidating cloud assets
+2026-09-08 20:15:07 [+] Total unique cloud assets: 2
+2026-09-08 20:15:07 [*] Non-interactive terminal — continuing...
+2026-09-08 20:15:07 [*] ═══ PHASE 3: IP → Classification → Port Scanning ═══
+2026-09-08 20:15:07 [*] Stage 1: Extracting IPs from canonical DNS dataset
+2026-09-08 20:15:07 [*] Canonical DNS: no pending hostnames to resolve
+2026-09-08 20:15:08 [+] Unique IP addresses from canonical DNS: 9
+2026-09-08 20:15:08 [*] Stage 1b: Reverse DNS (PTR) lookups on 9 IPs
+2026-09-08 20:15:23 [*] PTR: no hostnames discovered from reverse DNS
+2026-09-08 20:15:23 [*] Stage 2: Looking up ASNs via whois.cymru.com
+2026-09-08 20:15:26 [+] ASN summary:
+2026-09-08 20:15:26 [*]   AS205585 | ARVANCLOUD-CDN-IR - Noyan Abr Arvan Co. ( Private Joint Stock), IR | 185.143.232.0/24 | 4 IPs
+2026-09-08 20:15:26 [*]   AS25184 | AFRANET - Afranet, IR | 93.113.226.0/24 | 3 IPs
+2026-09-08 20:15:27 [*]   AS202319 | Sotoon-CDN - Hezardastan Unit Cloud Computing PJSC, IR | 185.166.104.0/24 | 2 IPs
+2026-09-08 20:15:27 [*]   ... (total 3 ASNs)
+2026-09-08 20:15:27 [*] Stage 3: Deterministic IP classification
+2026-09-08 20:15:27 [*] Loaded ASN config: 10 CDN ASNs, 23 cloud ASNs, 4 dedicated ASNs
+2026-09-08 20:15:27 [*] Building IP classification datasets...
+2026-09-08 20:15:27 [+] IP classification: CDN=4, Cloud=0, Dedicated=0, Unknown=5
+2026-09-08 20:15:27 [*] Classification breakdown:
+2026-09-08 20:15:27 [*]   CDN IPs:       4
+2026-09-08 20:15:27 [*]   Cloud IPs:     0
+2026-09-08 20:15:27 [*]   Dedicated IPs: 0
+2026-09-08 20:15:27 [*]   Unknown IPs:   5
+2026-09-08 20:15:27 [*]   Nmap targets:  5
+2026-09-08 20:15:27 [*] Stage 4: Port scanning 5 nmap candidates (non-CDN IPs)
+2026-09-08 20:15:27 [*]   Stage 4a: Naabu fast scan (top 1000 ports)
+2026-09-08 20:15:48 [+]   Naabu: 2 open ports on 2 hosts
+2026-09-08 20:15:48 [*]   Stage 4b: Nmap service detection on 5 candidates
+2026-09-08 20:16:03 [+] IP:Port pairs discovered: 2
+2026-09-08 20:16:03 [+] Phase 3 complete
+2026-09-08 20:16:03 [*] Non-interactive terminal — continuing...
+2026-09-08 20:16:03 [*] ═══ CONSOLIDATING ALL RESULTS ═══
+2026-09-08 20:16:03 [*] Canonical DNS dataset: 48 entries
+2026-09-08 20:16:04 [+] Summary report written to RECON_SUMMARY.txt
+2026-09-08 20:16:04 [*] ═══ Per-Root-Domain Results ═══
+2026-09-08 20:16:04 [*] Slicing results for root domain: mydigipay.com
+2026-09-08 20:16:04 [+] Per-root results written for 1 root domain(s) under /output/results/
+2026-09-08 20:16:04 [+] Recon pipeline complete!
+2026-09-08 20:16:04 [*] Full log saved to /output/recon.log

@@ -1,0 +1,14 @@
+http://mail.mydigipay.com
+http://mx02.mydigipay.com
+http://webmail.mydigipay.com
+https://analytics.mydigipay.com
+https://api.mydigipay.com
+https://autodiscover.mydigipay.com
+https://bot.mydigipay.com
+https://business.mydigipay.com
+https://dpm.mydigipay.com
+https://ipg.mydigipay.com
+https://mx01.mydigipay.com
+https://mydigipay.com
+https://pillar.mydigipay.com
+https://web.mydigipay.com
