@@ -406,67 +406,64 @@ WORDBASE
 
     log_info "Wordlist size: $(wc -l < wordlists/custom_wordlist.txt) unique words (CeWL-filtered)"
 
-    # Step 4b: ShuffleDNS brute force
-    if command -v shuffledns &>/dev/null; then
-        if ! command -v massdns &>/dev/null; then
-            log_warn "massdns not found on PATH — ShuffleDNS brute force will produce 0 results. Re-build the Docker image to include massdns."
-        fi
-
+    # Step 4b: dnsx brute force (replaces shuffledns — same wildcard detection,
+    # faster, no massdns dependency). dnsx -auto-wildcard filters wildcard
+    # subdomains (equivalent to shuffledns -sw). -t 500 for high throughput.
+    if command -v dnsx &>/dev/null; then
         if [[ ! -s /opt/scripts/wordlists/resolvers.txt ]]; then
-            log_warn "resolvers file missing or empty: /opt/scripts/wordlists/resolvers.txt — ShuffleDNS will fail"
+            log_warn "resolvers file missing or empty: /opt/scripts/wordlists/resolvers.txt — dnsx bruteforce will fail"
         fi
 
-        log_info "Running ShuffleDNS brute force on $(wc -l < wordlists/custom_wordlist.txt) words against $domain..."
+        log_info "Running dnsx brute force on $(wc -l < wordlists/custom_wordlist.txt) words against $domain..."
 
-        local shuffledns_log="shuffledns.debug.log"
-        : > "$shuffledns_log"
-        local shuffledns_exit=0
-        timeout "${SHUFFLEDNS_TIMEOUT:-900}" shuffledns -d "$domain" \
+        local bruteforce_log="bruteforce.debug.log"
+        : > "$bruteforce_log"
+        local bruteforce_exit=0
+        timeout "${BRUTEFORCE_TIMEOUT:-900}" dnsx \
+            -d "$domain" \
             -w wordlists/custom_wordlist.txt \
             -r /opt/scripts/wordlists/resolvers.txt \
-            -mode bruteforce \
-            -sw \
-            -duc \
-            -t "$THREADS" \
-            -wt 100 \
+            -auto-wildcard \
+            -duc -silent \
+            -t 500 \
             -o shuffledns_results.txt \
-            >> "$shuffledns_log" 2>&1 || shuffledns_exit=$?
+            >> "$bruteforce_log" 2>&1 || bruteforce_exit=$?
 
-        if [[ "$shuffledns_exit" -ne 0 ]]; then
-            log_warn "ShuffleDNS exited with code ${shuffledns_exit} — see ${shuffledns_log}"
-            tail -5 "$shuffledns_log" 2>/dev/null | sed 's/^/    /'
+        if [[ "$bruteforce_exit" -ne 0 ]]; then
+            log_warn "dnsx bruteforce exited with code ${bruteforce_exit} — see ${bruteforce_log}"
+            tail -5 "$bruteforce_log" 2>/dev/null | sed 's/^/    /'
         fi
 
         if [[ -s shuffledns_results.txt ]]; then
             local bf_count
             bf_count=$(wc -l < shuffledns_results.txt)
-            log_success "Subdomains from brute force: ${bf_count} (see ${shuffledns_log})"
-        elif [[ -s "$shuffledns_log" ]]; then
-            log_info "ShuffleDNS: no output file produced. Last log lines:"
-            tail -3 "$shuffledns_log" 2>/dev/null | sed 's/^/    /'
+            log_success "Subdomains from brute force: ${bf_count} (see ${bruteforce_log})"
+        elif [[ -s "$bruteforce_log" ]]; then
+            log_info "dnsx bruteforce: no output file produced. Last log lines:"
+            tail -3 "$bruteforce_log" 2>/dev/null | sed 's/^/    /'
         else
-            log_info "ShuffleDNS: no new subdomains found (no log entries captured)"
+            log_info "dnsx bruteforce: no new subdomains found (no log entries captured)"
         fi
     else
-        log_warn "ShuffleDNS not found, skipping brute force"
+        log_warn "dnsx not found, skipping brute force"
     fi
 
-    # comm (Stage 5 below) requires BOTH inputs sorted, but shuffledns -o
-    # output is in massdns discovery order — NOT sorted. Sorting it in place
-    # here fixes the "comm: file 2 is not in sorted order" error.
+    # comm (Stage 5 below) requires BOTH inputs sorted. dnsx -o output is
+    # NOT guaranteed sorted. Sorting it in place here fixes the
+    # "comm: file 2 is not in sorted order" error.
     if [[ -s shuffledns_results.txt ]]; then
         sort -u shuffledns_results.txt -o shuffledns_results.txt || true
     fi
 
     # Add ShuffleDNS results to canonical DNS dataset
-    [[ -s shuffledns_results.txt ]] && canonical_dns_add_sources "shuffledns" "shuffledns_results.txt" "$domain"
+    [[ -s shuffledns_results.txt ]] && canonical_dns_add_sources "dnsx-brute" "shuffledns_results.txt" "$domain"
 
     # ── Stage 4b: Subdomain Permutation (dnsgen) ──────────────────────────
     # dnsgen takes discovered subdomains and generates permutations by
     # combining labels with common prefixes/suffixes and extracting words
     # from the existing subdomain names. E.g. dev.example.com → dev1,
     # dev-internal, dev-staging, qa-dev, prod-dev .example.com. The
-    # permutations are then resolved with massdns via shuffledns. This
+    # permutations are then resolved with dnsx. This
     # finds subdomains that follow the target's naming patterns but appear
     # in no passive source, CT log, or archive.
     log_info "Stage 4b: Subdomain permutation (dnsgen)"
@@ -475,6 +472,32 @@ WORDBASE
         # Build input from all subdomains discovered so far (passive + brute)
         cat all_subdomains_round1.txt shuffledns_results.txt 2>/dev/null \
             | sort -u > dnsgen_input.txt || true
+
+        # Cap dnsgen input for large domains. dnsgen generates O(n²)
+        # permutations — 27K subdomains → 850K candidates, which exhausts
+        # memory/time during resolution. For large corpora, prefer resolved
+        # hostnames (they reveal active naming patterns) and cap the rest.
+        local _dnsgen_max="${DNSGEN_MAX_INPUT:-2000}"
+        if [[ -s dnsgen_input.txt ]]; then
+            local _dnsgen_in_count
+            _dnsgen_in_count=$(wc -l < dnsgen_input.txt)
+            if [[ "$_dnsgen_in_count" -gt "$_dnsgen_max" ]]; then
+                log_warn "  dnsgen input capped: $_dnsgen_in_count → $_dnsgen_max (resolved hosts prioritized)"
+                local _tsv="${CANONICAL_DNS_TSV:-${OUTPUT_DIR}/canonical_dns.tsv}"
+                # Extract resolved hostnames from canonical DNS, fall back to head
+                if [[ -s "$_tsv" ]]; then
+                    awk -F'\t' 'NR>1 && $7=="resolved" {print $1}' "$_tsv" 2>/dev/null \
+                        | sort -u > dnsgen_input.resolved.txt
+                fi
+                if [[ -s dnsgen_input.resolved.txt ]]; then
+                    head -n "$_dnsgen_max" dnsgen_input.resolved.txt > dnsgen_input.txt
+                    rm -f dnsgen_input.resolved.txt
+                else
+                    head -n "$_dnsgen_max" dnsgen_input.txt > dnsgen_input.tmp
+                    mv dnsgen_input.tmp dnsgen_input.txt
+                fi
+            fi
+        fi
 
         if [[ -s dnsgen_input.txt ]]; then
             log_info "  Generating permutations from $(wc -l < dnsgen_input.txt) subdomains..."
@@ -490,20 +513,35 @@ WORDBASE
                 perm_count=$(wc -l < dnsgen_permutations.txt)
                 log_info "  Generated $perm_count permutation candidates, resolving..."
 
-                # Resolve permutations using shuffledns in list mode (not
-                # bruteforce — the permutations are already full hostnames).
-                # < /dev/null guards against stdin consumption from the
-                # enclosing while-read loop.
-                timeout "${SHUFFLEDNS_TIMEOUT:-900}" shuffledns -d "$domain" \
-                    -list dnsgen_permutations.txt \
+                # Resolve permutations using dnsx with wildcard detection.
+                # dnsx -wd performs inline wildcard filtering (replaces
+                # shuffledns -sw). -wt 1 = strict per-host wildcard check.
+                # -t 500 = high thread count (dnsx defaults to 100; we need
+                # massdns-level throughput for bulk permutation resolution).
+                # Dynamic timeout: scale with permutation count so large
+                # sets aren't killed prematurely.
+                local _resolve_timeout
+                _resolve_timeout=$(( perm_count / 100 ))
+                (( _resolve_timeout < 300 )) && _resolve_timeout=300
+                (( _resolve_timeout > 3600 )) && _resolve_timeout=3600
+
+                timeout "$_resolve_timeout" dnsx \
+                    -l dnsgen_permutations.txt \
+                    -silent -wd "$domain" -wt 1 \
                     -r /opt/scripts/wordlists/resolvers.txt \
-                    -sw -duc \
-                    -t "$THREADS" \
-                    -o dnsgen_results.txt \
-                    < /dev/null 2>/dev/null || true
+                    -t 500 -timeout 5 -json \
+                    < /dev/null 2>/dev/null > dnsgen_results.json || true
+
+                if [[ -s dnsgen_results.json ]]; then
+                    jq -r '.host // empty' dnsgen_results.json 2>/dev/null \
+                        | sort -u > dnsgen_results.txt || true
+                    rm -f dnsgen_results.json
+                else
+                    : > dnsgen_results.txt
+                    rm -f dnsgen_results.json
+                fi
 
                 if [[ -s dnsgen_results.txt ]]; then
-                    sort -u dnsgen_results.txt -o dnsgen_results.txt || true
                     local dnsgen_count
                     dnsgen_count=$(wc -l < dnsgen_results.txt)
                     log_success "dnsgen: $dnsgen_count subdomains resolved from permutations"

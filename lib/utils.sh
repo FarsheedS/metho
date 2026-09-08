@@ -190,9 +190,16 @@ WAYMORE_TIMEOUT=600
 # mutations that rarely yield findings.
 CLOUD_ENUM_TIMEOUT=900
 
+# Cap dnsgen input subdomain count. dnsgen generates O(n²) permutations on
+# v1.x and O(n) with a large constant on v2.0 — 27K subdomains → 850K
+# candidates, exhausting memory/time during resolution. For large corpora,
+# resolved hostnames are prioritized (they reveal active naming patterns).
+# Set to 0 to disable the cap.
+DNSGEN_MAX_INPUT=5000
+
 # Numeric-argument guard: rejects non-integer values up-front so a typo like
 # `--threads abc` fails immediately with a clear message instead of deep inside
-# shuffledns/cloud_enum at runtime.
+# dnsx/cloud_enum at runtime.
 _require_int() {
     local flag="$1" val="$2"
     if ! [[ "$val" =~ ^[0-9]+$ ]]; then
@@ -386,7 +393,7 @@ setup_dirs() {
 
 # ── Dependency Check ────────────────────────────────────────────────────────
 # Only the core plumbing tools are checked up-front. The recon tools
-# (dnsx, shuffledns, katana, etc.) are validated lazily, per-stage, with
+# (dnsx, katana, etc.) are validated lazily, per-stage, with
 # `command -v` so any missing tool is skipped cleanly instead of failing
 # the whole run.
 REQUIRED_TOOLS=(jq curl)

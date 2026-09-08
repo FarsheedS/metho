@@ -15,13 +15,11 @@ for the per-phase breakdown):
 - [GitHub-subdomains](https://github.com/gwen001/github-subdomains) — GitHub code search for subdomain references
 - [Waymore](https://github.com/xnl-h4ck3r/waymore) — Historical URL/subdomain discovery from Wayback/CommonCrawl/OTX/URLScan/VirusTotal
 - [CeWL](https://github.com/digininja/CeWL) — Custom wordlist generation via web spidering
-- [ShuffleDNS](https://github.com/projectdiscovery/shuffledns) — DNS brute force with CeWL-derived wordlists
-- [massdns](https://github.com/blechschmidt/massdns) — High-performance DNS resolver (required by ShuffleDNS)
 - [dnsgen](https://github.com/AlephNullSK/dnsgen) — Subdomain permutation generation from discovered patterns
 - [Katana](https://github.com/projectdiscovery/katana) — Web crawler and JavaScript discovery
 - [Subdomainizer](https://github.com/nsonaniya2010/SubDomainizer) — JavaScript subdomain and secret extraction
 - [httpx](https://github.com/projectdiscovery/httpx) — HTTP probing with CDN detection, tech fingerprinting, and metadata
-- [dnsx](https://github.com/projectdiscovery/dnsx) — Canonical DNS resolution layer (forward + reverse PTR + AXFR)
+- [dnsx](https://github.com/projectdiscovery/dnsx) — DNS resolution, brute force, wildcard filtering, and permutation resolution (replaces ShuffleDNS + massdns)
 - [Cloud_Enum](https://github.com/initstring/cloud_enum) — AWS/Azure/GCP bucket and service brute force
 - [naabu](https://github.com/projectdiscovery/naabu) — Fast SYN port scanner for wide port discovery
 - [nmap](https://github.com/nmap/nmap) — Port scanning with service/version detection on non-CDN IPs
@@ -61,8 +59,8 @@ For each root domain, discovers subdomains through passive enumeration, historic
 | 1 | Passive subdomain enumeration | Subfaster, crt.name, GitHub-subdomains, AXFR |
 | 2 | Historical URL/subdomain discovery | Waymore (root domains only) |
 | 3 | Consolidate + DNSx resolution + HTTPx Round 1 | dnsx, httpx |
-| 4 | Custom wordlist generation + DNS brute force | CeWL, ShuffleDNS |
-| 4b | Subdomain permutation + resolution | dnsgen, ShuffleDNS |
+| 4 | Custom wordlist generation + DNS brute force | CeWL, dnsx |
+| 4b | Subdomain permutation + resolution | dnsgen, dnsx |
 | 5 | Consolidate + DNSx delta resolution + HTTPx Round 2 | dnsx, httpx |
 | 6 | Web crawling + JavaScript analysis | Katana, SubDomainizer |
 | 7 | Final consolidation + DNSx delta + HTTPx Round 3 | dnsx, httpx |
@@ -176,7 +174,7 @@ Options:
   --skip-phase {1,2,3}      Skip specific phase(s) — value is validated
   --skip-cloud              Shorthand for --skip-phase 2
   --no-port-scan            Skip the port-scan stage inside Phase 3 (classification still runs)
-  --threads N               Threads for ShuffleDNS and Cloud_Enum (default: 50)
+  --threads N               Threads for dnsx and Cloud_Enum (default: 50)
   --parallel-hosts N        Hosts crawled in parallel per per-host tool (default: 5)
   --parallel-domains N      Root domains processed in parallel in Phase 1 (default: 3)
   --rate-limit N            httpx requests/second (default: 100)
@@ -185,7 +183,7 @@ Options:
   --cloud-enum-keywords KW Keywords for cloud_enum brute force (comma-sep, auto-derived from domains)
 ```
 
-> **Flag scope notes:** `--rate-limit` applies only to httpx (Waymore, Katana, and the DNS tools use their own fixed/internal limits); `--threads` applies only to ShuffleDNS and Cloud_Enum.
+> **Flag scope notes:** `--rate-limit` applies only to httpx (Waymore, Katana, and the DNS tools use their own fixed/internal limits); `--threads` applies only to dnsx and Cloud_Enum.
 
 ### Checkpoints
 
@@ -265,7 +263,7 @@ Some tools can stall on misbehaving hosts. Each one has a configurable wall-cloc
 
 | Variable | Default | Tool / What it bounds |
 |----------|---------|----------------------|
-| `SHUFFLEDNS_TIMEOUT` | `900` | ShuffleDNS brute force (per root domain) |
+| `BRUTEFORCE_TIMEOUT` | `900` | dnsx brute force (per root domain) |
 | `KATANA_TIMEOUT` | `600` | Katana crawl in Phase 1 (per live host) |
 | `KATANA_CRAWL_DURATION` | `15m` | Katana per-host wall-clock cap (Phase 1) |
 | `SUBDOMAINIZER_TIMEOUT` | `300` | SubDomainizer JS scan (per live host) |
@@ -427,7 +425,7 @@ How it works:
   multiple root domains, it appears in every applicable root's `ips.txt`,
   `ip_asn.tsv`, and `nmap_results/`.
 - **Discovery provenance is preserved.** `discovery_sources.tsv` lists every tool
-  that found each hostname (e.g. `subfaster;crt.name;waymore;shuffledns`), and
+  that found each hostname (e.g. `subfaster;crt.name;waymore;dnsx-brute`), and
   root-seeded apexes keep the `root` source.
 - All per-root outputs are deduplicated.
 
@@ -479,7 +477,7 @@ docker build -t metho .
 ```
 
 The build uses a multi-stage Dockerfile:
-- **Builder stage** (`debian:13-slim`): Compiles the Go binaries (subfaster, httpx, katana, dnsx, shuffledns — all pinned to exact release versions), builds massdns, and clones the git-hosted tools (CeWL, SubDomainizer, cloud_enum). Go compiler, git, and build-essential stay in this stage.
+- **Builder stage** (`debian:13-slim`): Compiles the Go binaries (subfaster, httpx, katana, dnsx — all pinned to exact release versions), and clones the git-hosted tools (CeWL, SubDomainizer, cloud_enum). Go compiler, git, and build-essential stay in this stage.
 - **Runtime stage** (`debian:13-slim`): Copies the compiled binaries and cloned tools, installs runtime interpreters/packages, and installs the Ruby gems CeWL needs (native gems must compile against the runtime's libc, so they are built here — their build deps are purged in the same layer). No compilers, Go SDK, or git in the final image.
 
 ### Installed Tools
@@ -495,8 +493,7 @@ Every tool below is wired into the pipeline (see `lib/phase1.sh`, `lib/phase2.sh
 | **GitHub-subdomains** | GitHub code search for subdomain references |
 | **Waymore** | Historical URL/subdomain discovery (Wayback, CommonCrawl, etc.) |
 | **CeWL** | Spider live hosts → custom wordlist for DNS brute force |
-| **ShuffleDNS** | DNS brute force using CeWL-derived wordlist |
-| **massdns** | High-performance DNS resolver (required by ShuffleDNS) |
+| **dnsx** | DNS brute force (CeWL wordlist), wildcard filtering, permutation resolution |
 | **dnsgen** | Subdomain permutation generation from discovered patterns |
 | **Katana** | Web crawler — finds URLs, JS endpoints, and new subdomains |
 | **SubDomainizer** | Extract subdomains and secrets from JavaScript files |

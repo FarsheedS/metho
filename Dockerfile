@@ -1,5 +1,5 @@
 # ── Build Stage ───────────────────────────────────────────────────────────────
-# Compile Go binaries and massdns; clone git-hosted repos.
+# Compile Go binaries; clone git-hosted repos.
 # Everything here is discarded in the runtime stage.
 FROM debian:13-slim AS builder
 
@@ -29,19 +29,8 @@ RUN go install -v github.com/melvinsh/subfaster/v2/cmd/subfaster@v2.20.0 && \
     go install -v github.com/projectdiscovery/httpx/cmd/httpx@v1.11.0 && \
     go install -v github.com/projectdiscovery/katana/cmd/katana@v1.7.0 && \
     go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@v1.3.1 && \
-    go install -v github.com/projectdiscovery/shuffledns/cmd/shuffledns@v1.2.1 && \
     go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@v2.6.1 && \
     go install -v github.com/gwen001/github-subdomains@v1.2.2
-
-# massdns -- required by shuffledns for DNS brute force. It does NOT ship
-# with shuffledns and shuffledns will silently produce no output if it
-# can't find massdns. Compile from source per blechschmidt/massdns README.
-RUN git clone --depth 1 https://github.com/blechschmidt/massdns.git /opt/massdns && \
-    cd /opt/massdns && \
-    make -j"$(nproc)" 2>/dev/null && \
-    cp bin/massdns /usr/local/bin/massdns && \
-    chmod +x /usr/local/bin/massdns && \
-    rm -rf /opt/massdns
 
 # ── Clone Git-hosted Repos ─────────────────────────────────────────────────
 # Git lives only in the builder stage. The runtime stage receives these
@@ -94,10 +83,8 @@ COPY --from=builder /root/go/bin/subfaster /usr/local/bin/
 COPY --from=builder /root/go/bin/httpx /usr/local/bin/
 COPY --from=builder /root/go/bin/katana /usr/local/bin/
 COPY --from=builder /root/go/bin/dnsx /usr/local/bin/
-COPY --from=builder /root/go/bin/shuffledns /usr/local/bin/
 COPY --from=builder /root/go/bin/naabu /usr/local/bin/
 COPY --from=builder /root/go/bin/github-subdomains /usr/local/bin/
-COPY --from=builder /usr/local/bin/massdns /usr/local/bin/
 
 # ── Copy git-cloned repos from builder ─────────────────────────────────────
 COPY --from=builder /opt/tools/cewl /opt/tools/cewl
@@ -163,12 +150,9 @@ RUN chmod +x /opt/scripts/recon.sh /opt/scripts/entrypoint.sh
 # Every binary and Python package must actually work in the final image.
 #
 # Two stream-behavior subtleties make `cmd -h 2>/dev/null | grep -q .` fragile:
-#   1. projectdiscovery Go tools (httpx, dnsx, katana, shuffledns, subfaster)
+#   1. projectdiscovery Go tools (httpx, dnsx, katana, subfaster)
 #      print -h usage to STDOUT — `2>/dev/null` is harmless and stdout is non-empty.
-#   2. massdns has NO -h/--help flag. It prints usage to STDERR and exits 1.
-#      `massdns --help 2>/dev/null | grep -q .` → empty stdout → grep fails → build breaks.
-#      Fix: invoke massdns with no args (usage → stderr) and capture BOTH streams.
-#   3. waymore --help goes to stdout — fine.
+#   2. waymore --help goes to stdout — fine.
 #
 # Pattern: `cmd <args> 2>&1 | grep -q .` — redirect stderr into stdout so
 # grep sees the output regardless of which stream the tool chose, and fails
@@ -177,10 +161,8 @@ RUN subfaster -h 2>&1 | grep -q . && \
     httpx -h 2>&1 | grep -q . && \
     katana -h 2>&1 | grep -q . && \
     dnsx -h 2>&1 | grep -q . && \
-    shuffledns -h 2>&1 | grep -q . && \
     naabu -h 2>&1 | grep -q . && \
     github-subdomains -h 2>&1 | grep -q . && \
-    massdns 2>&1 | grep -q . && \
     waymore --help 2>&1 | grep -q . && \
     dnsgen --help 2>&1 | grep -q . && \
     test -f /opt/tools/SubDomainizer/SubDomainizer.py && \
