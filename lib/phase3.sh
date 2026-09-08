@@ -87,7 +87,7 @@ run_phase3() {
                 rd=$(normalize_hostname "$rd")
                 [[ -z "$rd" ]] && continue
                 local escaped_rd="${rd//./\\.}"
-                grep -E "(^|\.)${escaped_rd}$" "${pdir}/ptr_hostnames.txt" 2>/dev/null >> "$ptr_in_scope"
+                grep -E "(^|\.)${escaped_rd}$" "${pdir}/ptr_hostnames.txt" 2>/dev/null >> "$ptr_in_scope" || true
             done < "$ROOT_DOMAINS_FILE"
             sort -u "$ptr_in_scope" -o "$ptr_in_scope" 2>/dev/null || true
 
