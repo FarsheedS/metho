@@ -302,10 +302,13 @@ write_ip_datasets() {
         tail -n +2 "$class_tsv" | cut -f1 | sort -u -V > "${pdir}/all_resolved_ips.txt"
 
         # cdn_ips.txt
-        awk -F'\t' '$2 == "cdn" {print $1}' "$class_tsv" | sort -u -V > "${pdir}/cdn_ips.txt"
+        awk -F'\t' 'FNR>1 && $2 == "cdn" {print $1}' "$class_tsv" | sort -u -V > "${pdir}/cdn_ips.txt"
 
         # non_cdn_ips.txt (cloud + dedicated + unknown)
-        awk -F'\t' '$2 != "cdn" {print $1}' "$class_tsv" | sort -u -V > "${pdir}/non_cdn_ips.txt"
+        # FNR>1 skips the header row — without it the literal "IP" label from
+        # column 1 of the header leaked into nmap_candidates.txt (168 lines =
+        # 167 IPs + "IP"), and nmap treated "IP" as a target name.
+        awk -F'\t' 'FNR>1 && $2 != "cdn" {print $1}' "$class_tsv" | sort -u -V > "${pdir}/non_cdn_ips.txt"
 
         # nmap_candidates.txt (dedicated + cloud + unknown — same as non-CDN)
         # This is intentionally identical to non_cdn_ips.txt for the default case.

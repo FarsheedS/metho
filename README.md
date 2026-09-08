@@ -12,16 +12,19 @@ for the per-phase breakdown):
 
 - [Subfaster](https://github.com/melvinsh/subfaster) — Passive subdomain enumeration (Subfinder fork, faster defaults)
 - [crt.name](https://crt.name) — Certificate Transparency log lookup
+- [GitHub-subdomains](https://github.com/gwen001/github-subdomains) — GitHub code search for subdomain references
 - [Waymore](https://github.com/xnl-h4ck3r/waymore) — Historical URL/subdomain discovery from Wayback/CommonCrawl/OTX/URLScan/VirusTotal
 - [CeWL](https://github.com/digininja/CeWL) — Custom wordlist generation via web spidering
 - [ShuffleDNS](https://github.com/projectdiscovery/shuffledns) — DNS brute force with CeWL-derived wordlists
 - [massdns](https://github.com/blechschmidt/massdns) — High-performance DNS resolver (required by ShuffleDNS)
+- [dnsgen](https://github.com/AlephNullSK/dnsgen) — Subdomain permutation generation from discovered patterns
 - [Katana](https://github.com/projectdiscovery/katana) — Web crawler and JavaScript discovery
 - [Subdomainizer](https://github.com/nsonaniya2010/SubDomainizer) — JavaScript subdomain and secret extraction
 - [httpx](https://github.com/projectdiscovery/httpx) — HTTP probing with CDN detection, tech fingerprinting, and metadata
-- [dnsx](https://github.com/projectdiscovery/dnsx) — Canonical DNS resolution layer
+- [dnsx](https://github.com/projectdiscovery/dnsx) — Canonical DNS resolution layer (forward + reverse PTR + AXFR)
 - [Cloud_Enum](https://github.com/initstring/cloud_enum) — AWS/Azure/GCP bucket and service brute force
-- [nmap](https://github.com/nmap/nmap) — Port scanning of non-CDN IPs
+- [naabu](https://github.com/projectdiscovery/naabu) — Fast SYN port scanner for wide port discovery
+- [nmap](https://github.com/nmap/nmap) — Port scanning with service/version detection on non-CDN IPs
 
 ---
 
@@ -55,10 +58,11 @@ For each root domain, discovers subdomains through passive enumeration, historic
 
 | Stage | What Happens | Tool(s) |
 |-------|-------------|---------|
-| 1 | Passive subdomain enumeration | Subfaster, crt.name |
+| 1 | Passive subdomain enumeration | Subfaster, crt.name, GitHub-subdomains, AXFR |
 | 2 | Historical URL/subdomain discovery | Waymore (root domains only) |
 | 3 | Consolidate + DNSx resolution + HTTPx Round 1 | dnsx, httpx |
 | 4 | Custom wordlist generation + DNS brute force | CeWL, ShuffleDNS |
+| 4b | Subdomain permutation + resolution | dnsgen, ShuffleDNS |
 | 5 | Consolidate + DNSx delta resolution + HTTPx Round 2 | dnsx, httpx |
 | 6 | Web crawling + JavaScript analysis | Katana, SubDomainizer |
 | 7 | Final consolidation + DNSx delta + HTTPx Round 3 | dnsx, httpx |
@@ -83,9 +87,10 @@ Resolves any still-pending hostnames from the canonical DNS dataset, performs de
 | Stage | What Happens | Tool(s) |
 |-------|-------------|---------|
 | 1 | Extract IPs from canonical DNS dataset (pending hosts resolved first) | dnsx |
+| 1b | Reverse DNS (PTR) lookups on resolved IPs → new in-scope hostnames | dnsx |
 | 2 | IP → ASN lookup via whois.cymru.com | nc |
 | 3 | Deterministic IP classification (CDN/cloud/dedicated/unknown) | Built-in classification engine |
-| 4 | Port scan on nmap candidates (dedicated + cloud + unknown) — skipped with `--no-port-scan` | nmap |
+| 4 | Fast port scan (naabu top 1000) + deep service detection (nmap -sV) — skipped with `--no-port-scan` | naabu, nmap |
 
 ---
 
@@ -103,7 +108,7 @@ Columns:
 | `A` | Semicolon-separated IPv4 addresses |
 | `AAAA` | Semicolon-separated IPv6 addresses |
 | `CNAME` | Semicolon-separated CNAME targets |
-| `resolution_status` | `resolved`, `nxdomain`, `timeout`, or `pending` |
+| `resolution_status` | `resolved`, `nxdomain`, `timeout`, `bogon`, or `pending` |
 
 Phases 2 and 3 never re-resolve the entire corpus — only newly discovered hosts are resolved through dnsx, and the results are merged incrementally.
 
@@ -165,8 +170,8 @@ Options:
   -h, --help                Show this help and exit
   --subfaster-config FILE   Path to subfaster provider-config.yaml (API keys)
   --asn-config FILE         Path to ASN provider classification config (default: built-in)
-  --waymore-mode MODE       Waymore mode: U (URLs) or B (both, default). R (responses
-                            only) is not supported — the pipeline consumes URL output
+  --waymore-mode MODE       Waymore mode: U (URLs, default) or B (URLs+responses). R
+                            (responses only) is not supported — the pipeline consumes URL output
   --auto                    Skip all checkpoint prompts
   --skip-phase {1,2,3}      Skip specific phase(s) — value is validated
   --skip-cloud              Shorthand for --skip-phase 2
@@ -268,7 +273,11 @@ Some tools can stall on misbehaving hosts. Each one has a configurable wall-cloc
 | `CEWL_TIMEOUT` | `600` | CeWL word-crawl (per live host) |
 | `CEWL_DEPTH` | `2` | CeWL spider depth on first pass (retries at depth 1 on failure) |
 | `CEWL_MEM_LIMIT_MB` | `1024` | CeWL per-process address-space cap (MB) |
-| `WAYMORE_TIMEOUT` | `1800` | Waymore historical recon (per root domain) |
+| `WAYMORE_TIMEOUT` | `600` | Waymore historical recon (per root domain) |
+| `GITHUB_SUBDOMAINS_TIMEOUT` | `300` | GitHub-subdomains code search (per root domain) |
+| `DNSGEN_TIMEOUT` | `120` | dnsgen permutation generation |
+| `NAABU_TIMEOUT` | `600` | Naabu fast port scan |
+| `NAABU_TOP_PORTS` | `1000` | Naabu top-N ports to scan |
 
 ```bash
 docker run --rm -it \
@@ -482,14 +491,16 @@ Every tool below is wired into the pipeline (see `lib/phase1.sh`, `lib/phase2.sh
 |------|------|
 | **Subfaster** | Passive subdomain enumeration (fast Subfinder fork) |
 | **crt.name** | Certificate Transparency log lookup |
+| **GitHub-subdomains** | GitHub code search for subdomain references |
 | **Waymore** | Historical URL/subdomain discovery (Wayback, CommonCrawl, etc.) |
 | **CeWL** | Spider live hosts → custom wordlist for DNS brute force |
 | **ShuffleDNS** | DNS brute force using CeWL-derived wordlist |
 | **massdns** | High-performance DNS resolver (required by ShuffleDNS) |
+| **dnsgen** | Subdomain permutation generation from discovered patterns |
 | **Katana** | Web crawler — finds URLs, JS endpoints, and new subdomains |
 | **SubDomainizer** | Extract subdomains and secrets from JavaScript files |
 | **httpx** | HTTP/HTTPS probing with CDN detection and tech fingerprinting (3 rounds) |
-| **dnsx** | Canonical DNS resolution layer |
+| **dnsx** | Canonical DNS resolution (forward A/AAAA/CNAME, reverse PTR, AXFR) |
 
 #### Cloud Asset Discovery — Phase 2
 
@@ -502,9 +513,10 @@ Every tool below is wired into the pipeline (see `lib/phase1.sh`, `lib/phase2.sh
 
 | Tool | Role |
 |------|------|
-| **dnsx** | DNS resolution (data already in canonical dataset) |
+| **dnsx** | DNS resolution + reverse DNS (PTR) lookups on resolved IPs |
 | **nc** (netcat) | whois.cymru.com ASN lookup |
-| **nmap** | Port scanning of nmap candidates (dedicated + cloud + unknown IPs) |
+| **naabu** | Fast SYN port scan (top 1000 ports) for wide port discovery |
+| **nmap** | Service/version detection on ports discovered by naabu |
 
 ---
 
@@ -556,7 +568,11 @@ Every tool below is wired into the pipeline (see `lib/phase1.sh`, `lib/phase2.sh
 - **Cloud enum keywords.** By default, the base name of each root domain is used as a keyword. Use `--cloud-enum-keywords` to add extra keywords.
 - **Check canonical_dns.tsv.** The canonical DNS dataset tracks every hostname, its resolution status, and which tools discovered it. Useful for debugging and understanding coverage gaps.
 - **IP classification is configurable.** Edit `config/asn_providers.sh` to add or remove CDN, cloud, and dedicated hosting providers and ASNs.
-- **Waymore modes.** Use `--waymore-mode U` for URLs only (faster) or `--waymore-mode B` for both URLs and archived responses (slower, richer data). Mode `R` (responses without the URL file) is not supported — the pipeline extracts subdomains from the URL output.
+- **Waymore modes.** Mode `U` (URLs only, default) is fast and sufficient for subdomain discovery — the pipeline2pipeline extracts subdomains from the URL output. Mode `B` also downloads archived response bodies (slower, richer data, but the pipeline does not currently parse them). Mode `R` (responses without the URL file) is not supported.
+- **GitHub subdomain discovery.** Set the `GITHUB_TOKEN` environment variable (comma-separated for multiple tokens) or include GitHub tokens in the subfaster provider-config. The pipeline searches GitHub code for references to each target domain.
+- **Subdomain permutation.** After brute force, dnsgen generates permutations from discovered subdomain patterns (e.g. `dev` → `dev1`, `dev-internal`, `dev-staging`) and resolves them. This finds subdomains that follow the target's naming conventions but appear in no passive source.
+- **Reverse DNS.** Phase 3 performs PTR lookups on all resolved IPs, which can reveal hostnames not in7discovered by any subdomain enumeration tool.
+- **Two-phase port scanning.** Naabu fast-scans the top 1000 ports, then nmap does service/version detection (`-sV`) on just the ports naabu found open — wider coverage than a fixed port list, faster than nmap scanning 1000 ports directly.
 - **Check recon.log.** The timestamped log file captures everything — useful for debugging or tuning the pipeline.
 - **Do manual recon first.** Google dorking and reverse WHOIS can find additional root domains. Add them to your input file before running the pipeline.
 

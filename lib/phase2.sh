@@ -143,7 +143,14 @@ run_phase2() {
                     log_warn "Cloud_Enum exited non-zero or was killed by CLOUD_ENUM_TIMEOUT -- see ${ce_log}"
 
             if [[ -s "${pdir}/cloud_enum_results.json" ]]; then
-                jq -r 'select(.msg != null) | .target' "${pdir}/cloud_enum_results.json" 2>/dev/null | \
+                # cloud_enum interleaves banner/status lines with JSON objects
+                # in its "json" output. A bare `jq` on the raw file chokes on
+                # the first non-JSON line, exits non-zero, and silently drops
+                # ALL findings (we saw 116 findings → "0 assets"). Read every
+                # line as a raw string and parse defensively so non-JSON
+                # banner lines are skipped instead of aborting the parse.
+                jq -R 'fromjson? // empty | select(.msg != null) | .target' \
+                    "${pdir}/cloud_enum_results.json" 2>/dev/null | \
                     sort -u > "${pdir}/cloud_enum_assets.txt" || true
 
                 # Extract any newly discovered hostnames from cloud_enum and add to canonical dataset

@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     golang-go \
     git \
     build-essential \
+    libpcap-dev \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
@@ -28,7 +29,9 @@ RUN go install -v github.com/melvinsh/subfaster/v2/cmd/subfaster@v2.20.0 && \
     go install -v github.com/projectdiscovery/httpx/cmd/httpx@v1.11.0 && \
     go install -v github.com/projectdiscovery/katana/cmd/katana@v1.7.0 && \
     go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@v1.3.1 && \
-    go install -v github.com/projectdiscovery/shuffledns/cmd/shuffledns@v1.2.1
+    go install -v github.com/projectdiscovery/shuffledns/cmd/shuffledns@v1.2.1 && \
+    go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@v2.6.1 && \
+    go install -v github.com/gwen001/github-subdomains@v1.2.2
 
 # massdns -- required by shuffledns for DNS brute force. It does NOT ship
 # with shuffledns and shuffledns will silently produce no output if it
@@ -77,6 +80,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     dnsutils \
     nmap \
     netcat-openbsd \
+    libpcap-dev \
     curl \
     jq \
     ca-certificates \
@@ -91,6 +95,8 @@ COPY --from=builder /root/go/bin/httpx /usr/local/bin/
 COPY --from=builder /root/go/bin/katana /usr/local/bin/
 COPY --from=builder /root/go/bin/dnsx /usr/local/bin/
 COPY --from=builder /root/go/bin/shuffledns /usr/local/bin/
+COPY --from=builder /root/go/bin/naabu /usr/local/bin/
+COPY --from=builder /root/go/bin/github-subdomains /usr/local/bin/
 COPY --from=builder /usr/local/bin/massdns /usr/local/bin/
 
 # ── Copy git-cloned repos from builder ─────────────────────────────────────
@@ -140,6 +146,10 @@ RUN pip3 install --break-system-packages \
 # https://github.com/xnl-h4ck3r/waymore
 RUN pip3 install --break-system-packages waymore
 
+# dnsgen - Subdomain permutation generation
+# https://github.com/AlephNullSK/dnsgen
+RUN pip3 install --break-system-packages dnsgen
+
 # ── Copy Pipeline Scripts & Config ────────────────────────────────────────
 COPY recon.sh /opt/scripts/recon.sh
 COPY entrypoint.sh /opt/scripts/entrypoint.sh
@@ -168,8 +178,11 @@ RUN subfaster -h 2>&1 | grep -q . && \
     katana -h 2>&1 | grep -q . && \
     dnsx -h 2>&1 | grep -q . && \
     shuffledns -h 2>&1 | grep -q . && \
+    naabu -h 2>&1 | grep -q . && \
+    github-subdomains -h 2>&1 | grep -q . && \
     massdns 2>&1 | grep -q . && \
     waymore --help 2>&1 | grep -q . && \
+    dnsgen --help 2>&1 | grep -q . && \
     test -f /opt/tools/SubDomainizer/SubDomainizer.py && \
     test -f /opt/tools/cloud_enum/cloud_enum.py && \
     python3 -c "import bs4, requests, termcolor, colorama, tldextract, cffi, dns.resolver, requests_futures" && \

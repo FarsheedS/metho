@@ -98,7 +98,11 @@ process_domain() {
         log_info "Running Subfaster..."
         local sf_opts=(-d "$domain" -silent -o subfaster_results.txt)
         if [[ -n "$SUBFASTER_PROVIDER_CONFIG" ]]; then
-            sf_opts+=(-provider-config "$SUBFASTER_PROVIDER_CONFIG")
+            # -all enables every source, including the API-keyed ones in the
+            # provider config (binaryedge, chaos, github, virustotal, …).
+            # Without -all, subfaster defaults to -fast (8 keyless sources)
+            # and the configured API keys are silently unused.
+            sf_opts+=(-all -provider-config "$SUBFASTER_PROVIDER_CONFIG")
         fi
         subfaster "${sf_opts[@]}" 2>/dev/null || true
         local sf_count=0
@@ -111,9 +115,57 @@ process_domain() {
     # crt.name — Certificate Transparency
     crtname_query "$domain" crtname_results.txt crtname_raw.json
 
+    # GitHub-subdomains — search GitHub code for subdomain references.
+    # Unique source: developers commit config files, internal URLs, and
+    # hostname references that no DNS/CT/archive source indexes.
+    if command -v github-subdomains &>/dev/null; then
+        local gh_token="${GITHUB_TOKEN:-}"
+        # If no env var, try extracting tokens from the subfaster provider-config
+        # (subfinder format: github: [{token: ghp_xxx}, ...])
+        if [[ -z "$gh_token" && -n "$SUBFASTER_PROVIDER_CONFIG" && -f "$SUBFASTER_PROVIDER_CONFIG" ]]; then
+            gh_token=$(grep -E '^\s*token:' "$SUBFASTER_PROVIDER_CONFIG" 2>/dev/null \
+                | sed 's/^\s*token:\s*//' | sed 's/[[:space:]]*$//' | grep -v '^$' | paste -sd, - 2>/dev/null)
+        fi
+        if [[ -n "$gh_token" ]]; then
+            log_info "Running GitHub-subdomains..."
+            timeout "${GITHUB_SUBDOMAINS_TIMEOUT:-300}" github-subdomains \
+                -d "$domain" -t "$gh_token" -o github_subdomains.txt \
+                < /dev/null 2>/dev/null || true
+            local gh_count=0
+            [[ -s github_subdomains.txt ]] && gh_count=$(wc -l < github_subdomains.txt)
+            log_success "GitHub-subdomains: $gh_count subdomains"
+        else
+            log_skip "GitHub-subdomains skipped (set GITHUB_TOKEN env var or add github tokens to provider-config)"
+        fi
+    else
+        log_warn "github-subdomains not found, skipping GitHub subdomain discovery"
+    fi
+
+    # DNS zone transfer (AXFR) — rarely permitted on modern targets, but
+    # near-zero cost to attempt and a complete zone dump when it works.
+    log_info "Attempting DNS zone transfer (AXFR)..."
+    : > axfr_results.txt
+    printf '%s\n' "$domain" > axfr_input.txt
+    timeout 30 dnsx -silent -axfr -resp-only \
+        -l axfr_input.txt \
+        -r /opt/scripts/wordlists/resolvers.txt \
+        < /dev/null > axfr_results.txt 2>/dev/null || true
+    if [[ -s axfr_results.txt ]]; then
+        extract_domains axfr_results.txt axfr_all_domains.txt || true
+        local escaped_domain="${domain//./\\.}"
+        grep -E "(^|\.)${escaped_domain}$" axfr_all_domains.txt | sort -u > axfr_subdomains.txt || true
+        local axfr_count=0
+        [[ -s axfr_subdomains.txt ]] && axfr_count=$(wc -l < axfr_subdomains.txt)
+        log_success "AXFR: $axfr_count in-scope subdomains from zone transfer"
+    else
+        log_info "AXFR: zone transfer not permitted (expected for most targets)"
+    fi
+
     # Add all Stage 1 discoveries to the canonical DNS dataset
     [[ -s subfaster_results.txt ]] && canonical_dns_add_sources "subfaster" "subfaster_results.txt" "$domain"
     [[ -s crtname_results.txt ]] && canonical_dns_add_sources "crt.name" "crtname_results.txt" "$domain"
+    [[ -s github_subdomains.txt ]] && canonical_dns_add_sources "github" "github_subdomains.txt" "$domain"
+    [[ -s axfr_subdomains.txt ]] && canonical_dns_add_sources "axfr" "axfr_subdomains.txt" "$domain"
 
     # ── Stage 2: Historical Recon (Waymore) ─────────────────────────────────
     # Waymore operates on ROOT DOMAINS ONLY — it fetches historical URLs and
@@ -125,14 +177,19 @@ process_domain() {
         mkdir -p "$wm_output_dir"
         local wm_urls="${ddir}/waymore_urls.txt"
 
-        log_info "Running Waymore on root domain $domain (mode ${WAYMORE_MODE:-B})..."
-        timeout "${WAYMORE_TIMEOUT:-1800}" waymore \
+        log_info "Running Waymore on root domain $domain (mode ${WAYMORE_MODE:-U})..."
+        # < /dev/null detaches waymore's stdin from the enclosing `while read`
+        # loop (phase1.sh:28). Without it, waymore drains the loop's input
+        # file and only the FIRST root domain is ever processed — the rest are
+        # silently consumed as waymore's stdin. This is the same bug class that
+        # katana/cewl exhibited; they already carry < /dev/null guards.
+        timeout "${WAYMORE_TIMEOUT:-600}" waymore \
             -i "$domain" \
-            -mode "${WAYMORE_MODE:-B}" \
+            -mode "${WAYMORE_MODE:-U}" \
             -oU "$wm_urls" \
             -oR "$wm_output_dir" \
             -t 30 -p 2 --verbose \
-            2>/dev/null || true
+            < /dev/null 2>/dev/null || true
 
         if [[ -s "$wm_urls" ]]; then
             # Extract subdomains from URLs, filter to in-scope, deduplicate
@@ -381,22 +438,88 @@ WORDBASE
     # Add ShuffleDNS results to canonical DNS dataset
     [[ -s shuffledns_results.txt ]] && canonical_dns_add_sources "shuffledns" "shuffledns_results.txt" "$domain"
 
+    # ── Stage 4b: Subdomain Permutation (dnsgen) ──────────────────────────
+    # dnsgen takes discovered subdomains and generates permutations by
+    # combining labels with common prefixes/suffixes and extracting words
+    # from the existing subdomain names. E.g. dev.example.com → dev1,
+    # dev-internal, dev-staging, qa-dev, prod-dev .example.com. The
+    # permutations are then resolved with massdns via shuffledns. This
+    # finds subdomains that follow the target's naming patterns but appear
+    # in no passive source, CT log, or archive.
+    log_info "Stage 4b: Subdomain permutation (dnsgen)"
+
+    if command -v dnsgen &>/dev/null; then
+        # Build input from all subdomains discovered so far (passive + brute)
+        cat all_subdomains_round1.txt shuffledns_results.txt 2>/dev/null \
+            | sort -u > dnsgen_input.txt || true
+
+        if [[ -s dnsgen_input.txt ]]; then
+            log_info "  Generating permutations from $(wc -l < dnsgen_input.txt) subdomains..."
+
+            # -f fast mode: generates permutations from the input domains
+            # themselves (no external wordlist needed — dnsgen extracts
+            # words from the subdomain labels).
+            timeout "${DNSGEN_TIMEOUT:-120}" dnsgen -f dnsgen_input.txt \
+                < /dev/null > dnsgen_permutations.txt 2>/dev/null || true
+
+            if [[ -s dnsgen_permutations.txt ]]; then
+                local perm_count
+                perm_count=$(wc -l < dnsgen_permutations.txt)
+                log_info "  Generated $perm_count permutation candidates, resolving..."
+
+                # Resolve permutations using shuffledns in list mode (not
+                # bruteforce — the permutations are already full hostnames).
+                # < /dev/null guards against stdin consumption from the
+                # enclosing while-read loop.
+                timeout "${SHUFFLEDNS_TIMEOUT:-900}" shuffledns -d "$domain" \
+                    -list dnsgen_permutations.txt \
+                    -r /opt/scripts/wordlists/resolvers.txt \
+                    -sw -duc \
+                    -t "$THREADS" \
+                    -o dnsgen_results.txt \
+                    < /dev/null 2>/dev/null || true
+
+                if [[ -s dnsgen_results.txt ]]; then
+                    sort -u dnsgen_results.txt -o dnsgen_results.txt || true
+                    local dnsgen_count
+                    dnsgen_count=$(wc -l < dnsgen_results.txt)
+                    log_success "dnsgen: $dnsgen_count subdomains resolved from permutations"
+                else
+                    log_info "dnsgen: no permutations resolved"
+                    : > dnsgen_results.txt
+                fi
+            else
+                log_info "dnsgen: no permutations generated"
+                : > dnsgen_results.txt
+            fi
+        else
+            log_info "dnsgen: no subdomains to permute"
+            : > dnsgen_results.txt
+        fi
+    else
+        log_warn "dnsgen not found, skipping subdomain permutation"
+        : > dnsgen_results.txt
+    fi
+
+    # Add dnsgen results to canonical DNS dataset
+    [[ -s dnsgen_results.txt ]] && canonical_dns_add_sources "dnsgen" "dnsgen_results.txt" "$domain"
+
     # ── Stage 5: Consolidate + DNSx Delta Resolution + HTTPx Round 2 ───────
     log_info "Stage 5: Consolidate + DNSx delta resolution + HTTPx Round 2"
 
-    # Build the full set so far (round-1 passive + brute force).
-    cat all_subdomains_round1.txt shuffledns_results.txt 2>/dev/null | \
+    # Build the full set so far (round-1 passive + brute force + permutations).
+    cat all_subdomains_round1.txt shuffledns_results.txt dnsgen_results.txt 2>/dev/null | \
         sort -u > all_subdomains_round2.txt || true
 
-    # Compute ONLY the newly discovered subdomains from brute force so we don't
-    # re-probe the entire round-1 set with HTTPx again.
+    # Compute ONLY the newly discovered subdomains from brute force + permutation
+    # so we don't re-probe the entire round-1 set with HTTPx again.
     local new_only_subs=0
     : > new_subdomains_round2.txt
-    if [[ -s all_subdomains_round1.txt && -s shuffledns_results.txt ]]; then
-        comm -13 all_subdomains_round1.txt shuffledns_results.txt \
+    if [[ -s all_subdomains_round1.txt ]]; then
+        comm -13 all_subdomains_round1.txt all_subdomains_round2.txt \
             > new_subdomains_round2.txt || true
-    elif [[ -s shuffledns_results.txt ]]; then
-        cp shuffledns_results.txt new_subdomains_round2.txt
+    elif [[ -s all_subdomains_round2.txt ]]; then
+        cp all_subdomains_round2.txt new_subdomains_round2.txt
     fi
     [[ -s new_subdomains_round2.txt ]] && new_only_subs=$(wc -l < new_subdomains_round2.txt)
     log_success "New subdomains from brute force: $new_only_subs"

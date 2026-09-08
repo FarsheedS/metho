@@ -59,6 +59,50 @@ run_phase3() {
         return 0
     fi
 
+    # ── Stage 1b: Reverse DNS (PTR) Lookups ───────────────────────────────
+    # PTR lookups on resolved IPs can reveal hostnames not in any subdomain
+    # source — internal naming, infrastructure hosts, CDN backend names.
+    # dnsx -ptr -resp-only prints just the resolved PTR hostnames.
+    if command -v dnsx &>/dev/null; then
+        log_info "Stage 1b: Reverse DNS (PTR) lookups on ${ip_count} IPs"
+
+        cat "${pdir}/all_ips.txt" | timeout "${DNSX_TIMEOUT:-600}" dnsx \
+            -silent -ptr -resp-only \
+            -r /opt/scripts/wordlists/resolvers.txt \
+            -timeout 5 \
+            2>/dev/null | sort -u > "${pdir}/ptr_hostnames.txt" || true
+
+        if [[ -s "${pdir}/ptr_hostnames.txt" ]]; then
+            local ptr_total ptr_in_scope_count=0
+            ptr_total=$(wc -l < "${pdir}/ptr_hostnames.txt")
+
+            # Filter to in-scope hostnames using the root-domain list.
+            # canonical_dns_add_sources already does root-domain matching,
+            # but we pre-filter to avoid adding thousands of unrelated PTR
+            # names (e.g. google.com, cloudflare.com) to the dataset.
+            local ptr_in_scope="${pdir}/ptr_in_scope.txt"
+            : > "$ptr_in_scope"
+            while IFS= read -r rd; do
+                [[ -z "$rd" ]] && continue
+                rd=$(normalize_hostname "$rd")
+                [[ -z "$rd" ]] && continue
+                local escaped_rd="${rd//./\\.}"
+                grep -E "(^|\.)${escaped_rd}$" "${pdir}/ptr_hostnames.txt" 2>/dev/null >> "$ptr_in_scope"
+            done < "$ROOT_DOMAINS_FILE"
+            sort -u "$ptr_in_scope" -o "$ptr_in_scope" 2>/dev/null || true
+
+            [[ -s "$ptr_in_scope" ]] && ptr_in_scope_count=$(wc -l < "$ptr_in_scope")
+            log_success "PTR: $ptr_total hostnames from reverse DNS, $ptr_in_scope_count in-scope"
+
+            if [[ "$ptr_in_scope_count" -gt 0 ]]; then
+                canonical_dns_add_sources "ptr-reverse" "$ptr_in_scope"
+                canonical_dns_resolve_pending
+            fi
+        else
+            log_info "PTR: no hostnames discovered from reverse DNS"
+        fi
+    fi
+
     # ── Stage 2: IP → ASN Lookup via whois.cymru.com ───────────────────────
     log_info "Stage 2: Looking up ASNs via whois.cymru.com"
 
@@ -158,24 +202,64 @@ run_phase3() {
     write_ip_datasets "${pdir}/domain_ip_map.txt" "${pdir}/ip_asn_map.txt" "${pdir}"
 
     # ── Stage 4: Port Scan on Nmap Candidates ───────────────────────────────
+    # Two-phase scanning: naabu (fast SYN scan, top 1000 ports) discovers
+    # open ports quickly, then nmap -sV does service/version detection on
+    # just those ports. This is wider than the old fixed 37-port nmap list
+    # and faster than nmap scanning 1000 ports directly.
     if [[ "$PORT_SCAN" == true && -s "${pdir}/nmap_candidates.txt" ]]; then
         local nmap_count=0
         nmap_count=$(wc -l < "${pdir}/nmap_candidates.txt")
         log_info "Stage 4: Port scanning ${nmap_count} nmap candidates (non-CDN IPs)"
 
+        : > "${pdir}/ip_port_pairs.txt"
+
+        # ── Stage 4a: Naabu fast port scan (top 1000 ports) ──────────────
+        local naabu_found=0
+        if command -v naabu &>/dev/null; then
+            log_info "  Stage 4a: Naabu fast scan (top ${NAABU_TOP_PORTS:-1000} ports)"
+            timeout "${NAABU_TIMEOUT:-600}" naabu \
+                -list "${pdir}/nmap_candidates.txt" \
+                -top-ports "${NAABU_TOP_PORTS:-1000}" \
+                -silent -json \
+                < /dev/null 2>/dev/null > "${pdir}/naabu_results.json" || true
+
+            if [[ -s "${pdir}/naabu_results.json" ]]; then
+                jq -r '"\(.ip):\(.port)"' "${pdir}/naabu_results.json" 2>/dev/null \
+                    | sort -u > "${pdir}/naabu_ip_ports.txt" || true
+                naabu_found=$(wc -l < "${pdir}/naabu_ip_ports.txt" 2>/dev/null || echo 0)
+                local naabu_hosts
+                naabu_hosts=$(cut -d: -f1 "${pdir}/naabu_ip_ports.txt" 2>/dev/null | sort -u | wc -l)
+                log_success "  Naabu: $naabu_found open ports on $naabu_hosts hosts"
+            else
+                log_info "  Naabu: no open ports found"
+                : > "${pdir}/naabu_ip_ports.txt"
+            fi
+        else
+            log_warn "  naabu not available, falling back to nmap-only scan"
+            : > "${pdir}/naabu_ip_ports.txt"
+        fi
+
+        # ── Stage 4b: Nmap deep scan (service/version detection) ──────────
+        # -Pn skips host discovery (ICMP/ping) — metho already has valid IPs
+        # from DNS. -sV does service version detection. If naabu found open
+        # ports, nmap scans only those; otherwise it falls back to a fixed
+        # port list.
         if command -v nmap &>/dev/null; then
-            # -Pn skips Nmap's default host-discovery (ICMP/ping) phase and
-            # treats every target IP as up. Metho already obtained valid IPs
-            # from DNS, so a host that simply doesn't answer ICMP must NOT be
-            # discarded — otherwise known candidates get silently skipped.
-            # Port-selection policy is unchanged.
+            local nmap_ports=""
+            if [[ "$naabu_found" -gt 0 ]]; then
+                nmap_ports=$(cut -d: -f2 "${pdir}/naabu_ip_ports.txt" | sort -un | paste -sd, -)
+            fi
+            if [[ -z "$nmap_ports" ]]; then
+                nmap_ports="21,22,23,25,53,80,110,111,135,139,143,443,445,993,995,1433,1521,2049,3306,3389,5432,5900,5985,5986,6379,6443,8080,8443,8888,9090,9200,9443,27017"
+            fi
+
+            log_info "  Stage 4b: Nmap service detection on ${nmap_count} candidates"
             nmap -Pn -iL "${pdir}/nmap_candidates.txt" \
-                -p 21,22,23,25,53,80,110,111,135,139,143,443,445,993,995,1433,1521,2049,3306,3389,5432,5900,5985,5986,6379,6443,8080,8443,8888,9090,9200,9443,27017 \
-                --open --min-rate 500 \
+                -p "$nmap_ports" \
+                -sV --open --min-rate 500 \
                 -oG "${pdir}/port_scan_results.txt" 2>/dev/null || true
 
             # Parse nmap greppable output: extract IP:port pairs
-            : > "${pdir}/ip_port_pairs.txt"
             grep '/open/' "${pdir}/port_scan_results.txt" 2>/dev/null | while read -r line; do
                 ip=$(echo "$line" | awk '{print $2}')
                 echo "$line" | grep -oE '[0-9]+/open/tcp' | \
@@ -183,15 +267,20 @@ run_phase3() {
                     while read -r port; do
                         echo "${ip}:${port}"
                     done
-            done | sort -u > "${pdir}/ip_port_pairs.txt" || true
+            done | sort -u > "${pdir}/nmap_ip_ports.txt" || true
 
-            if [[ -s "${pdir}/ip_port_pairs.txt" ]]; then
-                log_success "IP:Port pairs discovered: $(wc -l < "${pdir}/ip_port_pairs.txt")"
-            else
-                log_warn "No open ports found in nmap output (or parsing found no /open/ lines)"
-            fi
+            # Merge naabu + nmap results (naabu may catch ports nmap -sV misses)
+            cat "${pdir}/naabu_ip_ports.txt" "${pdir}/nmap_ip_ports.txt" 2>/dev/null \
+                | sort -u > "${pdir}/ip_port_pairs.txt" || true
         else
-            log_warn "nmap not available, skipping port scan"
+            log_warn "  nmap not available, using naabu results only"
+            cp "${pdir}/naabu_ip_ports.txt" "${pdir}/ip_port_pairs.txt" 2>/dev/null || true
+        fi
+
+        if [[ -s "${pdir}/ip_port_pairs.txt" ]]; then
+            log_success "IP:Port pairs discovered: $(wc -l < "${pdir}/ip_port_pairs.txt")"
+        else
+            log_warn "No open ports found"
         fi
     elif [[ "$PORT_SCAN" != true ]]; then
         log_skip "Port scanning disabled (--no-port-scan)"

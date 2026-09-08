@@ -212,6 +212,14 @@ canonical_dns_resolve_pending() {
 
     log_info "Canonical DNS: resolving $pending_count pending hostnames via DNSx"
 
+    # Reserved/bogon IP guard. A fake-IP VPN (Clash/mihomo/Surge in fake-ip
+    # mode) returns RFC 2544 benchmark addresses (198.18.0.0/15) for every
+    # domain, which then pollute the canonical dataset and make nmap scan
+    # phantom hosts (every port "open" via the proxy). After the merge below
+    # we strip ALL reserved ranges from A/AAAA fields so they never reach
+    # classification or nmap. A host whose IPs are ALL reserved is marked
+    # "bogon" (not "resolved") so it is excluded from downstream probing.
+
     if ! command -v dnsx &>/dev/null; then
         log_error "dnsx not found — cannot resolve pending hostnames"
         rm -f "$pending_file" "$dnsx_json"
@@ -296,14 +304,65 @@ canonical_dns_resolve_pending() {
         mv "${tsv}.pre_resolve" "$tsv"
     fi
 
+    # ── Bogon/reserved-IP filter pass ───────────────────────────────────────
+    # Strip reserved IP ranges from A/AAAA in a single idempotent awk pass
+    # over the finalized TSV. Runs after every resolve round regardless of
+    # whether dnsx produced output. A host left with no A/AAAA/CNAME that was
+    # "resolved" is reclassified "bogon" so it is excluded from HTTPx/nmap.
+    local _bogon_stripped=0
+    awk -F'\t' -v OFS='\t' '
+        function is_reserved(ip,    a, n, o1, o2, o3) {
+            if (ip == "") return 0
+            n = split(ip, a, ".")
+            if (n != 4) return 1
+            o1 = a[1]+0; o2 = a[2]+0; o3 = a[3]+0
+            if (o1 == 0) return 1
+            if (o1 == 10) return 1
+            if (o1 == 100 && o2 >= 64 && o2 <= 127) return 1
+            if (o1 == 127) return 1
+            if (o1 == 169 && o2 == 254) return 1
+            if (o1 == 172 && o2 >= 16 && o2 <= 31) return 1
+            if (o1 == 192 && o2 == 0 && (o3 == 0 || o3 == 2)) return 1
+            if (o1 == 192 && o2 == 168) return 1
+            if (o1 == 198 && (o2 == 18 || o2 == 19)) return 1
+            if (o1 == 198 && o2 == 51 && o3 == 100) return 1
+            if (o1 == 203 && o2 == 0 && o3 == 113) return 1
+            if (o1 >= 224) return 1
+            return 0
+        }
+        function filter_reserved(ips,    a, i, k, out, t) {
+            k = split(ips, a, ";")
+            out = ""
+            for (i = 1; i <= k; i++) {
+                t = a[i]
+                gsub(/^[ \t]+|[ \t]+$/, "", t)
+                if (t == "" || is_reserved(t)) continue
+                out = (out == "") ? t : out ";" t
+            }
+            return out
+        }
+        FNR == 1 { print; next }
+        {
+            $4 = filter_reserved($4)
+            $5 = filter_reserved($5)
+            if ($4 == "" && $5 == "" && $6 == "" && $7 == "resolved") $7 = "bogon"
+            print
+        }
+    ' "$tsv" > "${tsv}.bogon_filtered" && mv "${tsv}.bogon_filtered" "$tsv"
+
     # Report
-    local resolved=0 nxdomain=0 timeout=0 still_pending=0
+    local resolved=0 nxdomain=0 timeout=0 bogon=0 still_pending=0
     resolved=$(awk -F'\t' '$7 == "resolved" {count++} END {print count+0}' "$tsv")
     nxdomain=$(awk -F'\t' '$7 == "nxdomain" {count++} END {print count+0}' "$tsv")
     timeout=$(awk -F'\t' '$7 == "timeout" {count++} END {print count+0}' "$tsv")
+    bogon=$(awk -F'\t' '$7 == "bogon" {count++} END {print count+0}' "$tsv")
     still_pending=$(awk -F'\t' '$7 == "pending" {count++} END {print count+0}' "$tsv")
 
-    log_success "Canonical DNS: resolved=$resolved, nxdomain=$nxdomain, timeout=$timeout, pending=$still_pending"
+    log_success "Canonical DNS: resolved=$resolved, nxdomain=$nxdomain, timeout=$timeout, bogon=$bogon, pending=$still_pending"
+
+    if [[ "$bogon" -gt 0 ]]; then
+        log_warn "Canonical DNS: $bogon host(s) resolved to reserved/bogon IPs (e.g. 198.18.x.x fake-IP VPN, RFC1918). Excluded from downstream probing/nmap. Verify Docker DNS bypasses fake-ip mode."
+    fi
 
     rm -f "$pending_file" "$dnsx_json"
 }

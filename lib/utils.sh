@@ -165,8 +165,16 @@ PORT_SCAN=true
 PARALLEL_HOSTS=5
 # ASN classification config file (shell-sourceable)
 ASN_CONFIG_FILE=""
-# Waymore mode: U (URLs only), R (responses only), B (both, default)
-WAYMORE_MODE="B"
+# Waymore mode: U (URLs only, default), B (URLs + response bodies).
+# R (responses only) is rejected in validate_args — the pipeline extracts
+# subdomains from the -oU URL list, not response bodies. Mode U keeps full
+# subdomain-discovery coverage while skipping the slow response-body
+# downloads that the pipeline never reads back (the -oR dir is unused).
+WAYMORE_MODE="U"
+# Per-domain wall-clock cap for waymore. Mode U (URLs only) is much faster
+# than mode B (which downloads archived response bodies), so 600s is a sane
+# default; override with WAYMORE_TIMEOUT for very large domains.
+WAYMORE_TIMEOUT=600
 
 # Numeric-argument guard: rejects non-integer values up-front so a typo like
 # `--threads abc` fails immediately with a clear message instead of deep inside
@@ -210,7 +218,7 @@ parse_args() {
                 echo "Options:"
                 echo "  --subfaster-config FILE   Path to subfaster provider-config.yaml (API keys)"
                 echo "  --asn-config FILE         Path to ASN provider classification config (default: built-in)"
-                echo "  --waymore-mode MODE       Waymore mode: U (URLs) or B (both, default)"
+                echo "  --waymore-mode MODE       Waymore mode: U (URLs, default) or B (URLs+responses)"
                 echo "  --auto                    Skip all checkpoint prompts"
                 echo "  --skip-phase {1,2,3}      Skip specific phase(s)"
                 echo "  --skip-cloud              Shorthand for --skip-phase 2"
