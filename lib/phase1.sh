@@ -120,11 +120,15 @@ process_domain() {
     # hostname references that no DNS/CT/archive source indexes.
     if command -v github-subdomains &>/dev/null; then
         local gh_token="${GITHUB_TOKEN:-}"
-        # If no env var, try extracting tokens from the subfaster provider-config
-        # (subfinder format: github: [{token: ghp_xxx}, ...])
+        # If no env var, try extracting tokens from the subfaster provider-config.
+        # The config may use either bare YAML list items (github: [- ghp_xxx]) or
+        # the subfinder key format (github: [{token: ghp_xxx}]). grep -oE extracts
+        # just the token regardless of surrounding YAML structure. The || true
+        # is critical: under set -e + pipefail, a grep with no matches exits 1
+        # and would kill the pipeline before the empty-check below.
         if [[ -z "$gh_token" && -n "$SUBFASTER_PROVIDER_CONFIG" && -f "$SUBFASTER_PROVIDER_CONFIG" ]]; then
-            gh_token=$(grep -E '^\s*token:' "$SUBFASTER_PROVIDER_CONFIG" 2>/dev/null \
-                | sed 's/^\s*token:\s*//' | sed 's/[[:space:]]*$//' | grep -v '^$' | paste -sd, - 2>/dev/null)
+            gh_token=$(grep -oE '(ghp_|github_pat_)[A-Za-z0-9_]+' "$SUBFASTER_PROVIDER_CONFIG" 2>/dev/null \
+                | sort -u | paste -sd, -) || true
         fi
         if [[ -n "$gh_token" ]]; then
             log_info "Running GitHub-subdomains..."
