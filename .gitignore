@@ -1,12 +1,4 @@
-# Local-only / generated content - never commit:
-results/
+results_test/
+targets_test.txt
 metho.tar
-.DS_Store
-.claude/
-
-# IDE / editor:
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
+metho.tar.gz
