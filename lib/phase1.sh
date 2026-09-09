@@ -477,35 +477,50 @@ WORDBASE
             | grep -E '^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$' \
             | sort -u > dnsgen_input.txt || true
 
-        # Cap dnsgen input for large domains. dnsgen (default mode) yields
-        # ~150-200 permutations per input — 5K inputs → ~885K candidates,
-        # which takes hours to resolve and starves the rest of the pipeline
-        # (reconftw skips permutations entirely above 500 subs for the same
-        # reason). For large corpora, prefer resolved hostnames (they reveal
-        # active naming patterns) and cap the rest.
+        # ── Volume control for large domains ─────────────────────────────
+        # dnsgen (default mode) yields ~800-1100 permutations per input
+        # (a large telecom target: 500 inputs → 561K candidates). Each candidate costs
+        # one DNS query, and empirical yield on these corpora is ZERO
+        # (38K permutations on a fintech target → 0 resolved; 561K on a telecom target →
+        # hour+ of sustained DNS that starved the host's network stack).
+        # reconftw skips permutations entirely on large corpora for the same
+        # reason. Two levers:
+        #   DNSGEN_SKIP_THRESHOLD — above this many discovered subs, skip
+        #       permutation entirely (large target: passive+brute coverage
+        #       is already broad; permutation adds hours, finds nothing).
+        #   DNSGEN_MAX_INPUT — for medium targets, cap the input set
+        #       (resolved hosts prioritized: they reveal live naming
+        #       patterns) and bound the candidate volume.
+        # 0 disables the skip (a threshold of 0 would otherwise skip always)
+        local _dnsgen_skip="${DNSGEN_SKIP_THRESHOLD:-2000}"
+        [[ "$_dnsgen_skip" -eq 0 ]] && _dnsgen_skip=$((1<<62))
         local _dnsgen_max="${DNSGEN_MAX_INPUT:-500}"
-        if [[ -s dnsgen_input.txt ]]; then
-            local _dnsgen_in_count
-            _dnsgen_in_count=$(wc -l < dnsgen_input.txt)
-            if [[ "$_dnsgen_in_count" -gt "$_dnsgen_max" ]]; then
-                log_warn "  dnsgen input capped: $_dnsgen_in_count → $_dnsgen_max (resolved hosts prioritized)"
-                local _tsv="${CANONICAL_DNS_TSV:-${OUTPUT_DIR}/canonical_dns.tsv}"
-                # Extract resolved hostnames from canonical DNS, fall back to head
-                if [[ -s "$_tsv" ]]; then
-                    awk -F'\t' 'NR>1 && $7=="resolved" {print $1}' "$_tsv" 2>/dev/null \
-                        | sort -u > dnsgen_input.resolved.txt
-                fi
-                if [[ -s dnsgen_input.resolved.txt ]]; then
-                    head -n "$_dnsgen_max" dnsgen_input.resolved.txt > dnsgen_input.txt
-                    rm -f dnsgen_input.resolved.txt
-                else
-                    head -n "$_dnsgen_max" dnsgen_input.txt > dnsgen_input.tmp
-                    mv dnsgen_input.tmp dnsgen_input.txt
-                fi
+        local _dnsgen_in_count=0
+        [[ -s dnsgen_input.txt ]] && _dnsgen_in_count=$(wc -l < dnsgen_input.txt)
+
+        if [[ "$_dnsgen_in_count" -gt "$_dnsgen_skip" ]]; then
+            log_skip "  dnsgen skipped entirely: ${_dnsgen_in_count} subdomains exceed DNSGEN_SKIP_THRESHOLD=${_dnsgen_skip} (large target — permutations historically yield ~0 here and cost hours of DNS)"
+            : > dnsgen_results.txt
+        elif [[ -s dnsgen_input.txt && "$_dnsgen_in_count" -gt "$_dnsgen_max" ]]; then
+            log_warn "  dnsgen input capped: $_dnsgen_in_count → $_dnsgen_max (resolved hosts prioritized)"
+            local _tsv="${CANONICAL_DNS_TSV:-${OUTPUT_DIR}/canonical_dns.tsv}"
+            # Extract resolved hostnames from canonical DNS, fall back to head
+            if [[ -s "$_tsv" ]]; then
+                awk -F'\t' 'NR>1 && $7=="resolved" {print $1}' "$_tsv" 2>/dev/null \
+                    | sort -u > dnsgen_input.resolved.txt
+            fi
+            if [[ -s dnsgen_input.resolved.txt ]]; then
+                head -n "$_dnsgen_max" dnsgen_input.resolved.txt > dnsgen_input.txt
+                rm -f dnsgen_input.resolved.txt
+            else
+                head -n "$_dnsgen_max" dnsgen_input.txt > dnsgen_input.tmp
+                mv dnsgen_input.tmp dnsgen_input.txt
             fi
         fi
 
-        if [[ -s dnsgen_input.txt ]]; then
+        # _skipped flag: large-target skip leaves dnsgen_input.txt intact
+        # (for the record) but must not trigger generation below.
+        if [[ -s dnsgen_input.txt && "$_dnsgen_in_count" -le "$_dnsgen_skip" ]]; then
             log_info "  Generating permutations from $(wc -l < dnsgen_input.txt) subdomains..."
 
             # Default mode (no -f): includes the word-insertion permutator,
@@ -513,7 +528,7 @@ WORDBASE
             # api→api-internal neighbors). v2's -f "fast mode" only does
             # number mutations and port suffixes — a near-no-op for domains
             # without digits/ports in their subdomains (verified on
-            # mydigipay.com: fast mode → 0 permutations).
+            # a fintech target.com: fast mode → 0 permutations).
             # Volume is controlled by DNSGEN_MAX_INPUT (500) upstream and
             # this byte cap downstream (head -c cuts mid-generation, so a
             # runaway generator can't outlast DNSGEN_TIMEOUT either).
@@ -576,8 +591,12 @@ WORDBASE
                 : > dnsgen_results.txt
             fi
         else
-            log_info "dnsgen: no subdomains to permute"
-            : > dnsgen_results.txt
+            if [[ "$_dnsgen_in_count" -gt "$_dnsgen_skip" ]]; then
+                : > dnsgen_results.txt   # already skipped above; keep empty
+            else
+                log_info "dnsgen: no subdomains to permute"
+                : > dnsgen_results.txt
+            fi
         fi
     else
         log_warn "dnsgen not found, skipping subdomain permutation"

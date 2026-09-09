@@ -276,6 +276,7 @@ Some tools can stall on misbehaving hosts. Each one has a configurable wall-cloc
 | `GITHUB_SUBDOMAINS_TIMEOUT` | `300` | GitHub-subdomains code search (per root domain) |
 | `DNSGEN_TIMEOUT` | `120` | dnsgen permutation generation |
 | `DNSGEN_MAX_INPUT` | `500` | Max subdomains fed to dnsgen (resolved hosts prioritized; 0 disables) |
+| `DNSGEN_SKIP_THRESHOLD` | `2000` | Domains with more discovered subs than this skip dnsgen entirely (large targets: ~0 yield, hours of DNS; 0 disables) |
 | `DNSGEN_MAX_OUTPUT_BYTES` | `26214400` | Hard cap on dnsgen permutation output size (25MB) |
 | `NAABU_TIMEOUT` | `600` | Naabu fast port scan |
 | `NAABU_TOP_PORTS` | `1000` | Naabu top-N ports to scan |
