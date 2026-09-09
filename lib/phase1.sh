@@ -473,11 +473,13 @@ WORDBASE
         cat all_subdomains_round1.txt shuffledns_results.txt 2>/dev/null \
             | sort -u > dnsgen_input.txt || true
 
-        # Cap dnsgen input for large domains. dnsgen generates O(n²)
-        # permutations — 27K subdomains → 850K candidates, which exhausts
-        # memory/time during resolution. For large corpora, prefer resolved
-        # hostnames (they reveal active naming patterns) and cap the rest.
-        local _dnsgen_max="${DNSGEN_MAX_INPUT:-2000}"
+        # Cap dnsgen input for large domains. dnsgen yields ~150-200
+        # permutations per input — 5K inputs → ~885K candidates, which
+        # takes hours to resolve and starves the rest of the pipeline
+        # (reconftw skips permutations entirely above 500 subs for the
+        # same reason). For large corpora, prefer resolved hostnames
+        # (they reveal active naming patterns) and cap the rest.
+        local _dnsgen_max="${DNSGEN_MAX_INPUT:-500}"
         if [[ -s dnsgen_input.txt ]]; then
             local _dnsgen_in_count
             _dnsgen_in_count=$(wc -l < dnsgen_input.txt)
@@ -502,11 +504,18 @@ WORDBASE
         if [[ -s dnsgen_input.txt ]]; then
             log_info "  Generating permutations from $(wc -l < dnsgen_input.txt) subdomains..."
 
-            # -f fast mode: generates permutations from the input domains
-            # themselves (no external wordlist needed — dnsgen extracts
-            # words from the subdomain labels).
+            # -f fast mode: uses only the low-yield permutators (number
+            # mutations, common ports). Default mode's word-insertion
+            # permutator generates ~700+ candidates/domain, which is what
+            # caused the 885K-candidate explosion. Fast mode is the
+            # maintainer's official answer to output volume (issue #7).
             timeout "${DNSGEN_TIMEOUT:-120}" dnsgen -f dnsgen_input.txt \
-                < /dev/null > dnsgen_permutations.txt 2>/dev/null || true
+                < /dev/null 2>/dev/null \
+                | head -c "${DNSGEN_MAX_OUTPUT_BYTES:-26214400}" \
+                > dnsgen_permutations.txt || true
+
+            # Drop a possibly-truncated last line (head -c cuts mid-line)
+            [[ -s dnsgen_permutations.txt ]] && sed -i '$ d' dnsgen_permutations.txt 2>/dev/null || true
 
             if [[ -s dnsgen_permutations.txt ]]; then
                 local perm_count

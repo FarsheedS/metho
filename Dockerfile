@@ -135,7 +135,11 @@ RUN pip3 install --break-system-packages waymore
 
 # dnsgen - Subdomain permutation generation
 # https://github.com/AlephNullSK/dnsgen
-RUN pip3 install --break-system-packages dnsgen
+# Pin to GitHub v2.0.3: pip's `dnsgen` package still ships the old v1.0.4
+# with the O(N²) word-enrichment algorithm (issue #24). v2 uses a fixed
+# 380-word list and is what the -f fast-mode guidance applies to.
+RUN pip3 install --break-system-packages \
+    "git+https://github.com/AlephNullSK/dnsgen@v2.0.3"
 
 # ── Copy Pipeline Scripts & Config ────────────────────────────────────────
 COPY recon.sh /opt/scripts/recon.sh

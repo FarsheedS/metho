@@ -190,12 +190,18 @@ WAYMORE_TIMEOUT=600
 # mutations that rarely yield findings.
 CLOUD_ENUM_TIMEOUT=900
 
-# Cap dnsgen input subdomain count. dnsgen generates O(n²) permutations on
-# v1.x and O(n) with a large constant on v2.0 — 27K subdomains → 850K
-# candidates, exhausting memory/time during resolution. For large corpora,
-# resolved hostnames are prioritized (they reveal active naming patterns).
-# Set to 0 to disable the cap.
-DNSGEN_MAX_INPUT=5000
+# Cap dnsgen input subdomain count. dnsgen yields ~150-200 permutations
+# per input — 5K inputs produced 885K candidates (~2.5h resolution). 500
+# inputs ≈ 88K candidates ≈ 15 min, and beyond ~500 passive subs the
+# permutation yield drops to near zero anyway (passive sources saturate
+# coverage — reconftw uses the same 500 threshold). Resolved hostnames
+# are prioritized. Set to 0 to disable the cap.
+DNSGEN_MAX_INPUT=500
+
+# Hard cap on dnsgen output size in bytes (default 25MB ≈ ~350K
+# candidates). Safety net against permutation explosion before the
+# resolution stage.
+DNSGEN_MAX_OUTPUT_BYTES=26214400
 
 # Numeric-argument guard: rejects non-integer values up-front so a typo like
 # `--threads abc` fails immediately with a clear message instead of deep inside
