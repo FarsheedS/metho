@@ -25,12 +25,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # install makes the CI build hostage to upstream releases: a renamed flag or
 # breaking change in a new httpx/katana release breaks the build (or worse,
 # the pipeline at runtime) with no change on our side.
-RUN go install -v github.com/melvinsh/subfaster/v2/cmd/subfaster@v2.20.0 && \
-    go install -v github.com/projectdiscovery/httpx/cmd/httpx@v1.11.0 && \
-    go install -v github.com/projectdiscovery/katana/cmd/katana@v1.7.0 && \
-    go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@v1.3.1 && \
-    go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@v2.6.1 && \
-    go install -v github.com/gwen001/github-subdomains@v1.2.2
+# go_install_retry <pkg>@<version> — go install with up to 3 attempts.
+# sum.golang.org intermittently drops mid-verification ("stream error:
+# INTERNAL_ERROR; received from peer"), failing CI builds that are fine on
+# retry. Module downloads are cached for the duration of this RUN, so a
+# retry only re-attempts verification, not the download.
+go_install_retry() {
+    local pkg="$1" attempt
+    for attempt in 1 2 3; do
+        if go install -v "$pkg"; then return 0; fi
+        echo "go install $pkg failed (attempt $attempt/3), retrying in 15s..." >&2
+        sleep 15
+    done
+    return 1
+}
+
+RUN go_install_retry github.com/melvinsh/subfaster/v2/cmd/subfaster@v2.20.0 && \
+    go_install_retry github.com/projectdiscovery/httpx/cmd/httpx@v1.11.0 && \
+    go_install_retry github.com/projectdiscovery/katana/cmd/katana@v1.7.0 && \
+    go_install_retry github.com/projectdiscovery/dnsx/cmd/dnsx@v1.3.1 && \
+    go_install_retry github.com/projectdiscovery/naabu/v2/cmd/naabu@v2.6.1 && \
+    go_install_retry github.com/gwen001/github-subdomains@v1.2.2
 
 # ── Clone Git-hosted Repos ─────────────────────────────────────────────────
 # Git lives only in the builder stage. The runtime stage receives these
