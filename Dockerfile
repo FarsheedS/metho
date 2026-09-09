@@ -142,7 +142,7 @@ RUN pip3 install --break-system-packages waymore
 # install from the default-branch archive tarball (no git binary needed).
 RUN pip3 install --break-system-packages \
     "https://github.com/AlephNullSK/dnsgen/archive/refs/heads/master.tar.gz" \
- && dnsgen --version 2>&1 | grep -q "2.0"
+ && dnsgen --help 2>&1 | grep -q "fast generation mode"
 
 # ── Copy Pipeline Scripts & Config ────────────────────────────────────────
 COPY recon.sh /opt/scripts/recon.sh
