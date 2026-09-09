@@ -478,11 +478,11 @@ WORDBASE
             | sort -u > dnsgen_input.txt || true
 
         # ── Volume control for large domains ─────────────────────────────
-        # dnsgen (default mode) yields ~800-1100 permutations per input
-        # (a large telecom target: 500 inputs → 561K candidates). Each candidate costs
-        # one DNS query, and empirical yield on these corpora is ZERO
-        # (38K permutations on a fintech target → 0 resolved; 561K on a telecom target →
-        # hour+ of sustained DNS that starved the host's network stack).
+        # dnsgen (default mode) yields ~800-1100 permutations per input —
+        # 500 inputs can produce up to ~561K candidates. Each candidate
+        # costs one DNS query, and empirical yield on such corpora is ZERO
+        # (38K permutations → 0 resolved on one target; 561K → hour+ of
+        # sustained DNS that starved the host's network stack on another).
         # reconftw skips permutations entirely on large corpora for the same
         # reason. Two levers:
         #   DNSGEN_SKIP_THRESHOLD — above this many discovered subs, skip
@@ -492,7 +492,7 @@ WORDBASE
         #       (resolved hosts prioritized: they reveal live naming
         #       patterns) and bound the candidate volume.
         # 0 disables the skip (a threshold of 0 would otherwise skip always)
-        local _dnsgen_skip="${DNSGEN_SKIP_THRESHOLD:-2000}"
+        local _dnsgen_skip="${DNSGEN_SKIP_THRESHOLD:-1500}"
         [[ "$_dnsgen_skip" -eq 0 ]] && _dnsgen_skip=$((1<<62))
         local _dnsgen_max="${DNSGEN_MAX_INPUT:-500}"
         local _dnsgen_in_count=0
@@ -527,8 +527,8 @@ WORDBASE
             # which is where permutation value is (dev→dev-staging,
             # api→api-internal neighbors). v2's -f "fast mode" only does
             # number mutations and port suffixes — a near-no-op for domains
-            # without digits/ports in their subdomains (verified on
-            # a fintech target.com: fast mode → 0 permutations).
+            # without digits/ports in their subdomains (verified in E2E
+            # testing: fast mode → 0 permutations).
             # Volume is controlled by DNSGEN_MAX_INPUT (500) upstream and
             # this byte cap downstream (head -c cuts mid-generation, so a
             # runaway generator can't outlast DNSGEN_TIMEOUT either).

@@ -191,21 +191,22 @@ WAYMORE_TIMEOUT=600
 CLOUD_ENUM_TIMEOUT=900
 
 # Cap dnsgen input subdomain count. dnsgen v2 default mode yields
-# ~800-1100 permutations per input (a large telecom target: 500 inputs → 561K
-# candidates). 500 inputs keeps resolution ≈ 6-10 min, and beyond ~500
-# passive subs the permutation yield drops to near zero anyway (passive
-# sources saturate coverage — reconftw uses the same 500 threshold).
-# Resolved hostnames are prioritized. Set to 0 to disable the cap.
+# ~800-1100 permutations per input — 500 inputs → up to ~561K candidates.
+# 500 inputs keeps resolution ≈ 6-10 min, and beyond ~500 passive subs the
+# permutation yield drops to near zero anyway (passive sources saturate
+# coverage — reconftw uses the same 500 threshold). Resolved hostnames
+# are prioritized. Set to 0 to disable the cap.
 DNSGEN_MAX_INPUT=500
 
 # Skip dnsgen entirely for large targets: when a domain has more than
-# this many discovered subdomains, permutation is skipped. E2E evidence
-# (2026-09-09): a large telecom target 29,495 subs → even capped to 500 inputs the
-# 561K-candidate resolution ran 1h+ and starved the host network stack;
-# a fintech target's 38K candidates resolved ZERO. Large targets already have
-# broad passive coverage; permutations add hours for ~0 findings.
-# Set to 0 to never skip.
-DNSGEN_SKIP_THRESHOLD=2000
+# this many discovered subdomains, permutation is skipped. 1500 matches
+# reconftw's DEEP_LIMIT2 — the point where their pipeline hard-skips
+# permutations ("Too Many Subdomains") rather than degrading further.
+# Our own E2E agrees: a 29K-subdomain target capped to 500 inputs still
+# produced 561K candidates whose resolution ran 1h+ and starved the
+# host network stack, while a smaller target's 38K candidates resolved
+# ZERO. Set to 0 to never skip.
+DNSGEN_SKIP_THRESHOLD=1500
 
 # Hard cap on dnsgen output size in bytes (default 25MB ≈ ~350K
 # candidates). Safety net against permutation explosion before the
