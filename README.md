@@ -7,8 +7,8 @@ Inspired by the [Ars0n Framework v2](https://github.com/R-s0n/ars0n-framework-v2
 ## Tools
 
 The pipeline is built on the work of many open-source projects. Every tool
-below is wired into one or more phases (see [Installed Tools](#installed-tools)
-for the per-phase breakdown):
+below is wired into one or more phases (see the stage tables in
+[The Methodology](#the-methodology) for the per-phase breakdown):
 
 - [Subfaster](https://github.com/melvinsh/subfaster) — Passive subdomain enumeration (Subfinder fork, faster defaults)
 - [crt.name](https://crt.name) — Certificate Transparency log lookup
@@ -88,7 +88,7 @@ Resolves any still-pending hostnames from the canonical DNS dataset, performs de
 | 1b | Reverse DNS (PTR) lookups on resolved IPs → new in-scope hostnames | dnsx |
 | 2 | IP → ASN lookup via whois.cymru.com | nc |
 | 3 | Deterministic IP classification (CDN/cloud/dedicated/unknown) | Built-in classification engine |
-| 4 | Fast port scan (naabu top 1000) + deep service detection (nmap -sV) — skipped with `--no-port-scan` | naabu, nmap |
+| 4 | Fast port scan (naabu, top 1000 ports) then service detection (nmap -sV on hosts naabu found open) — skipped with `--no-port-scan` | naabu, nmap |
 
 ---
 
@@ -280,6 +280,8 @@ Some tools can stall on misbehaving hosts. Each one has a configurable wall-cloc
 | `DNSGEN_MAX_OUTPUT_BYTES` | `26214400` | Hard cap on dnsgen permutation output size (25MB) |
 | `NAABU_TIMEOUT` | `600` | Naabu fast port scan |
 | `NAABU_TOP_PORTS` | `1000` | Naabu top-N ports to scan |
+| `NAABU_RATE` | `1000` | Naabu packets/sec cap (noise/IPS throttle) |
+| `NAABU_RETRIES` | `2` | Naabu SYN retransmit count |
 
 ```bash
 docker run --rm -it \
@@ -480,44 +482,8 @@ docker build -t metho .
 ```
 
 The build uses a multi-stage Dockerfile:
-- **Builder stage** (`debian:13-slim`): Compiles the Go binaries (subfaster, httpx, katana, dnsx — all pinned to exact release versions), and clones the git-hosted tools (CeWL, SubDomainizer, cloud_enum). Go compiler, git, and build-essential stay in this stage.
+- **Builder stage** (`debian:13-slim`): Compiles the Go binaries (subfaster, httpx, katana, dnsx, naabu, github-subdomains — all pinned to exact release versions), and clones the git-hosted tools (CeWL, SubDomainizer, cloud_enum, dnsgen). Go compiler, git, and build-essential stay in this stage.
 - **Runtime stage** (`debian:13-slim`): Copies the compiled binaries and cloned tools, installs runtime interpreters/packages, and installs the Ruby gems CeWL needs (native gems must compile against the runtime's libc, so they are built here — their build deps are purged in the same layer). No compilers, Go SDK, or git in the final image.
-
-### Installed Tools
-
-Every tool below is wired into the pipeline (see `lib/phase1.sh`, `lib/phase2.sh`, `lib/phase3.sh`).
-
-#### Subdomain Discovery — Phase 1
-
-| Tool | Role |
-|------|------|
-| **Subfaster** | Passive subdomain enumeration (fast Subfinder fork) |
-| **crt.name** | Certificate Transparency log lookup |
-| **GitHub-subdomains** | GitHub code search for subdomain references |
-| **Waymore** | Historical URL/subdomain discovery (Wayback, CommonCrawl, etc.) |
-| **CeWL** | Spider live hosts → custom wordlist for DNS brute force |
-| **dnsx** | DNS brute force (CeWL wordlist), wildcard filtering, permutation resolution |
-| **dnsgen** | Subdomain permutation generation from discovered patterns |
-| **Katana** | Web crawler — finds URLs, JS endpoints, and new subdomains |
-| **SubDomainizer** | Extract subdomains and secrets from JavaScript files |
-| **httpx** | HTTP/HTTPS probing with CDN detection and tech fingerprinting (3 rounds) |
-| **dnsx** | Canonical DNS resolution (forward A/AAAA/CNAME, reverse PTR, AXFR) |
-
-#### Cloud Asset Discovery — Phase 2
-
-| Tool | Role |
-|------|------|
-| **dnsx** | Bulk DNS queries for cloud CNAME/A records |
-| **Cloud_Enum** | AWS / Azure / GCP bucket and service brute force |
-
-#### IP / Classification / Port Scan — Phase 3
-
-| Tool | Role |
-|------|------|
-| **dnsx** | DNS resolution + reverse DNS (PTR) lookups on resolved IPs |
-| **nc** (netcat) | whois.cymru.com ASN lookup |
-| **naabu** | Fast SYN port scan (top 1000 ports) for wide port discovery |
-| **nmap** | Service/version detection on ports discovered by naabu |
 
 ---
 
@@ -569,11 +535,11 @@ Every tool below is wired into the pipeline (see `lib/phase1.sh`, `lib/phase2.sh
 - **Cloud enum keywords.** By default, the base name of each root domain is used as a keyword. Use `--cloud-enum-keywords` to add extra keywords.
 - **Check canonical_dns.tsv.** The canonical DNS dataset tracks every hostname, its resolution status, and which tools discovered it. Useful for debugging and understanding coverage gaps.
 - **IP classification is configurable.** Edit `config/asn_providers.sh` to add or remove CDN, cloud, and dedicated hosting providers and ASNs.
-- **Waymore modes.** Mode `U` (URLs only, default) is fast and sufficient for subdomain discovery — the pipeline2pipeline extracts subdomains from the URL output. Mode `B` also downloads archived response bodies (slower, richer data, but the pipeline does not currently parse them). Mode `R` (responses without the URL file) is not supported.
+- **Waymore modes.** Mode `U` (URLs only, default) is fast and sufficient for subdomain discovery — the pipeline extracts subdomains from the URL output. Mode `B` also downloads archived response bodies (slower, richer data, but the pipeline does not currently parse them). Mode `R` (responses without the URL file) is not supported.
 - **GitHub subdomain discovery.** Set the `GITHUB_TOKEN` environment variable (comma-separated for multiple tokens) or include GitHub tokens in the subfaster provider-config. The pipeline searches GitHub code for references to each target domain.
 - **Subdomain permutation.** After brute force, dnsgen generates permutations from discovered subdomain patterns (e.g. `dev` → `dev1`, `dev-internal`, `dev-staging`) and resolves them. This finds subdomains that follow the target's naming conventions but appear in no passive source.
-- **Reverse DNS.** Phase 3 performs PTR lookups on all resolved IPs, which can reveal hostnames not in7discovered by any subdomain enumeration tool.
-- **Two-phase port scanning.** Naabu fast-scans the top 1000 ports, then nmap does service/version detection (`-sV`) on just the ports naabu found open — wider coverage than a fixed port list, faster than nmap scanning 1000 ports directly.
+- **Reverse DNS.** Phase 3 performs PTR lookups on all resolved IPs, which can reveal hostnames not discovered by any subdomain enumeration tool.
+- **Two-phase port scanning.** Naabu fast-scans the top 1000 ports on all non-CDN candidates, then nmap runs service/version detection (`-sV`) on only the hosts naabu found open — the hosts with nothing open skip the expensive -sV pass entirely, and the fallback fixed-port list covers the rare case where naabu is unavailable or finds nothing.
 - **Check recon.log.** The timestamped log file captures everything — useful for debugging or tuning the pipeline.
 - **Do manual recon first.** Google dorking and reverse WHOIS can find additional root domains. Add them to your input file before running the pipeline.
 

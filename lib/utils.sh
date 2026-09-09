@@ -213,6 +213,16 @@ DNSGEN_SKIP_THRESHOLD=1500
 # resolution stage.
 DNSGEN_MAX_OUTPUT_BYTES=26214400
 
+# Naabu packets-per-second cap for the top-1000 SYN sweep. 1000 pps is
+# reconftw's NAABU_RATE default: fast enough that 1000 hosts × 1000 ports
+# finish well within the timeout, throttled enough to avoid saturating
+# the uplink or tripping IPS on the target edge.
+NAABU_RATE=1000
+# Naabu SYN retransmit count. 2 matches reconftw's --max-retries default
+# (one initial probe + 2 retries): resilient to single-packet loss
+# without multiplying noise on filtered ports.
+NAABU_RETRIES=2
+
 # Numeric-argument guard: rejects non-integer values up-front so a typo like
 # `--threads abc` fails immediately with a clear message instead of deep inside
 # dnsx/cloud_enum at runtime.

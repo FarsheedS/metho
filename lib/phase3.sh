@@ -240,12 +240,17 @@ run_phase3() {
         : > "${pdir}/ip_port_pairs.txt"
 
         # ── Stage 4a: Naabu fast port scan (top 1000 ports) ──────────────
+        # -rate caps packets/sec (reconftw default NAABU_RATE=1000): fast
+        # enough for top-1000 sweeps, throttled enough to avoid tripping
+        # IPS/IDS and saturating the uplink on large candidate lists.
         local naabu_found=0
         if command -v naabu &>/dev/null; then
-            log_info "  Stage 4a: Naabu fast scan (top ${NAABU_TOP_PORTS:-1000} ports)"
+            log_info "  Stage 4a: Naabu fast scan (top ${NAABU_TOP_PORTS:-1000} ports, rate ${NAABU_RATE:-1000} pps)"
             timeout "${NAABU_TIMEOUT:-600}" naabu \
                 -list "${pdir}/nmap_candidates.txt" \
                 -top-ports "${NAABU_TOP_PORTS:-1000}" \
+                -rate "${NAABU_RATE:-1000}" \
+                -retries "${NAABU_RETRIES:-2}" \
                 -silent -json \
                 < /dev/null 2>/dev/null > "${pdir}/naabu_results.json" || true
 
@@ -266,23 +271,39 @@ run_phase3() {
         fi
 
         # ── Stage 4b: Nmap deep scan (service/version detection) ──────────
-        # -Pn skips host discovery (ICMP/ping) — metho already has valid IPs
-        # from DNS. -sV does service version detection. If naabu found open
-        # ports, nmap scans only those; otherwise it falls back to a fixed
-        # port list.
+        # Two-scan strategy (mirrors reconftw's PORTSCAN_STRATEGY=naabu_nmap):
+        # naabu already swept ALL candidates on top-1000 ports (Stage 4a), so
+        # -sV service detection only needs to touch the hosts naabu found
+        # open. Scanning all candidates again with -sV re-probes ~99% hosts
+        # with nothing open — the dominant cost of the old approach.
+        #   -Pn              skip ping discovery (IPs already validated via DNS)
+        #   -n               skip reverse DNS (metho already knows hostnames)
+        #   --max-retries 2  cap retransmits (reconftw default)
+        #   --min-hostgroup/--min-parallelism  batch hosts in parallel
+        # If naabu found nothing (or is absent), fall back to the fixed port
+        # list over all candidates — keeps coverage when Stage 4a failed.
         if command -v nmap &>/dev/null; then
-            local nmap_ports=""
+            local nmap_ports="" nmap_targets="${pdir}/nmap_candidates.txt"
             if [[ "$naabu_found" -gt 0 ]]; then
                 nmap_ports=$(cut -d: -f2 "${pdir}/naabu_ip_ports.txt" | sort -un | paste -sd, -)
+                # Target list = only hosts with naabu-confirmed open ports
+                cut -d: -f1 "${pdir}/naabu_ip_ports.txt" | sort -u > "${pdir}/nmap_target_hosts.txt"
+                if [[ -s "${pdir}/nmap_target_hosts.txt" ]]; then
+                    nmap_targets="${pdir}/nmap_target_hosts.txt"
+                fi
             fi
             if [[ -z "$nmap_ports" ]]; then
                 nmap_ports="21,22,23,25,53,80,110,111,135,139,143,443,445,993,995,1433,1521,2049,3306,3389,5432,5900,5985,5986,6379,6443,8080,8443,8888,9090,9200,9443,27017"
+                nmap_targets="${pdir}/nmap_candidates.txt"
             fi
 
-            log_info "  Stage 4b: Nmap service detection on ${nmap_count} candidates"
-            nmap -Pn -iL "${pdir}/nmap_candidates.txt" \
+            local _nmap_target_count
+            _nmap_target_count=$(wc -l < "$nmap_targets")
+            log_info "  Stage 4b: Nmap service detection on ${_nmap_target_count} hosts (ports: ${nmap_ports})"
+            nmap -Pn -n -iL "$nmap_targets" \
                 -p "$nmap_ports" \
-                -sV --open --min-rate 500 \
+                -sV --open --max-retries 2 \
+                --min-hostgroup 64 --min-parallelism 16 \
                 -oG "${pdir}/port_scan_results.txt" 2>/dev/null || true
 
             # Parse nmap greppable output: extract IP:port pairs
