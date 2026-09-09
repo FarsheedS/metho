@@ -30,17 +30,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # INTERNAL_ERROR; received from peer"), failing CI builds that are fine on
 # retry. Module downloads are cached for the duration of this RUN, so a
 # retry only re-attempts verification, not the download.
-go_install_retry() {
-    local pkg="$1" attempt
-    for attempt in 1 2 3; do
-        if go install -v "$pkg"; then return 0; fi
-        echo "go install $pkg failed (attempt $attempt/3), retrying in 15s..." >&2
-        sleep 15
-    done
-    return 1
-}
-
-RUN go_install_retry github.com/melvinsh/subfaster/v2/cmd/subfaster@v2.20.0 && \
+# The function must be defined inside RUN: Docker parses every top-level
+# Dockerfile line as an instruction, and only joins lines ending in a
+# backslash — so every line of this RUN ends with one.
+RUN go_install_retry() { \
+    local pkg="$1" attempt; \
+    for attempt in 1 2 3; do \
+        if go install -v "$pkg"; then return 0; fi; \
+        echo "go install $pkg failed (attempt $attempt/3), retrying in 15s..." >&2; \
+        sleep 15; \
+    done; \
+    return 1; \
+} && \
+    go_install_retry github.com/melvinsh/subfaster/v2/cmd/subfaster@v2.20.0 && \
     go_install_retry github.com/projectdiscovery/httpx/cmd/httpx@v1.11.0 && \
     go_install_retry github.com/projectdiscovery/katana/cmd/katana@v1.7.0 && \
     go_install_retry github.com/projectdiscovery/dnsx/cmd/dnsx@v1.3.1 && \
