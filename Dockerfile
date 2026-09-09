@@ -55,7 +55,8 @@ RUN go_install_retry() { \
 RUN git clone --depth 1 https://github.com/digininja/CeWL.git /opt/tools/cewl && \
     chmod +x /opt/tools/cewl/cewl.rb && \
     git clone --depth 1 https://github.com/nsonaniya2010/SubDomainizer.git /opt/tools/SubDomainizer && \
-    git clone --depth 1 https://github.com/initstring/cloud_enum.git /opt/tools/cloud_enum
+    git clone --depth 1 https://github.com/initstring/cloud_enum.git /opt/tools/cloud_enum && \
+    git clone --depth 1 https://github.com/AlephNullSK/dnsgen.git /opt/tools/dnsgen
 
 
 # ── Runtime Stage ─────────────────────────────────────────────────────────────
@@ -155,11 +156,22 @@ RUN pip3 install --break-system-packages waymore
 # Pin to v2.0.3 (master): pip's `dnsgen` package still ships the old v1.0.4
 # with the O(N²) word-enrichment algorithm (issue #24). v2 uses a fixed
 # 380-word list and is what the -f fast-mode guidance applies to.
-# v2 exists only on the master branch — no git tag, no PyPI release — so
-# install from the default-branch archive tarball (no git binary needed).
-RUN pip3 install --break-system-packages \
-    "https://github.com/AlephNullSK/dnsgen/archive/refs/heads/master.tar.gz" \
- && pip3 show dnsgen | grep -q "^Version: 2.0"
+# v2 exists only on the master branch — no git tag, no PyPI release.
+#
+# Upstream's hatchling wheel config is BROKEN: [tool.hatch.build.targets.
+# wheel.sources] maps "dnsgen" -> "" which flattens the package into
+# site-packages root (dnsgen.py next to cli.py), so the installed
+# `dnsgen.cli:main` entry point fails with "No module named 'dnsgen.cli'".
+# Fix: COPY the cloned source tree and install the package directory
+# directly (a proper dnsgen/ package dir, not the flattened wheel), then
+# provide a console wrapper that runs the module.
+COPY --from=builder /opt/tools/dnsgen /opt/tools/dnsgen
+RUN pip3 install --break-system-packages click rich tldextract && \
+    cp -r /opt/tools/dnsgen/dnsgen \
+        "$(python3 -c 'import site; print(site.getsitepackages()[0])')/dnsgen" && \
+    printf '#!/bin/sh\nexec python3 -m dnsgen.cli "$@"\n' \
+        > /usr/local/bin/dnsgen && \
+    chmod +x /usr/local/bin/dnsgen
 
 # ── Copy Pipeline Scripts & Config ────────────────────────────────────────
 COPY recon.sh /opt/scripts/recon.sh
@@ -188,11 +200,18 @@ RUN subfaster -h 2>&1 | grep -q . && \
     naabu -h 2>&1 | grep -q . && \
     github-subdomains -h 2>&1 | grep -q . && \
     waymore --help 2>&1 | grep -q . && \
-    dnsgen --help 2>&1 | grep -q . && \
     test -f /opt/tools/SubDomainizer/SubDomainizer.py && \
     test -f /opt/tools/cloud_enum/cloud_enum.py && \
     python3 -c "import bs4, requests, termcolor, colorama, tldextract, cffi, dns.resolver, requests_futures" && \
     echo "All runtime tools verified OK"
+
+# dnsgen functional test: --help output can contain a traceback (click
+# prints rich errors to stdout too), so grep is not enough — generate
+# permutations for a known domain and verify real output comes back.
+# api.example.com must yield word-insertion perms like api-dev.example.com.
+RUN printf 'api.example.com\n' > /tmp/dnsgen_in.txt && \
+    dnsgen /tmp/dnsgen_in.txt 2>/dev/null | grep -q '^api-\|^-api\.' && \
+    echo "dnsgen functional test OK"
 
 # CeWL smoke test: if any required gem is missing, cewl exits with
 # "Error: <gem> gem not installed" before printing help. Require BOTH:

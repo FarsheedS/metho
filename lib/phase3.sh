@@ -103,6 +103,32 @@ run_phase3() {
         fi
     fi
 
+    # ── Stage 1c: Rebuild IP datasets after PTR enrichment ────────────────
+    # Stage 1b may have added and resolved NEW hostnames (ptr-reverse). They
+    # were not in the canonical TSV when domain_ip_map.txt / all_ips.txt were
+    # built at the top of this phase, so their IPs would silently miss ASN
+    # lookup, classification, and port scanning. Rebuild both files from the
+    # now-updated TSV so no resolved host is lost.
+    if [[ -s "${pdir}/ptr_in_scope.txt" ]]; then
+        tail -n +2 "$dns_tsv" | awk -F'\t' '{
+            if ($4 != "" && $7 == "resolved") {
+                n = split($4, ips, ";")
+                for (i = 1; i <= n; i++) {
+                    gsub(/^[ \t]+|[ \t]+$/, "", ips[i])
+                    if (ips[i] != "") printf "%s %s\n", $1, ips[i]
+                }
+            }
+        }' > "${pdir}/domain_ip_map.txt"
+        cut -d' ' -f2 "${pdir}/domain_ip_map.txt" | sort -u -V > "${pdir}/all_ips.txt"
+        local _ip_count_before_ptr="$ip_count"
+        ip_count=$(wc -l < "${pdir}/all_ips.txt")
+        log_info "IP dataset rebuilt after PTR enrichment: ${ip_count} unique IPs (was ${_ip_count_before_ptr})"
+        if [[ "$ip_count" -eq 0 ]]; then
+            log_warn "No IPs resolved, skipping classification and port scanning"
+            return 0
+        fi
+    fi
+
     # ── Stage 2: IP → ASN Lookup via whois.cymru.com ───────────────────────
     log_info "Stage 2: Looking up ASNs via whois.cymru.com"
 

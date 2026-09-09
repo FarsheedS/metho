@@ -517,9 +517,14 @@ WORDBASE
             # Volume is controlled by DNSGEN_MAX_INPUT (500) upstream and
             # this byte cap downstream (head -c cuts mid-generation, so a
             # runaway generator can't outlast DNSGEN_TIMEOUT either).
+            # Filter to strict hostnames: dnsgen v2 logs (rich) go to
+            # STDOUT, not stderr — the "Generated N variations" INFO line
+            # and spinner escapes would otherwise land in the permutations
+            # file (verified empirically: 4 junk lines for a 1-domain input).
             timeout "${DNSGEN_TIMEOUT:-120}" dnsgen dnsgen_input.txt \
                 < /dev/null 2>/dev/null \
                 | head -c "${DNSGEN_MAX_OUTPUT_BYTES:-26214400}" \
+                | grep -E '^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$' \
                 > dnsgen_permutations.txt || true
 
             # Drop a possibly-truncated last line (head -c cuts mid-line)

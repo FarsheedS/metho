@@ -20,12 +20,11 @@ jobs:
                    httpx -h 2>&1 | grep -q . && \
                    katana -h 2>&1 | grep -q . && \
                    dnsx -h 2>&1 | grep -q . && \
-                   shuffledns -h 2>&1 | grep -q . && \
-                   massdns 2>&1 | grep -q . && \
+                   naabu -h 2>&1 | grep -q . && \
+                   github-subdomains -h 2>&1 | grep -q . && \
                    waymore --help 2>&1 | grep -q . && \
                    test -f /opt/tools/SubDomainizer/SubDomainizer.py && \
                    test -f /opt/tools/cloud_enum/cloud_enum.py && \
-                   python3 -c "import bs4, requests, termcolor, colorama, tldextract, cffi, dns.resolver, requests_futures" && \
                    echo "All runtime tools OK"'
 
       - name: Verify pipeline scripts
@@ -38,6 +37,7 @@ jobs:
                    bash -n /opt/scripts/lib/consolidate.sh && \
                    bash -n /opt/scripts/lib/canonical_dns.sh && \
                    bash -n /opt/scripts/lib/classify.sh && \
+                   bash -n /opt/scripts/lib/results.sh && \
                    bash -n /opt/scripts/config/asn_providers.sh && \
                    echo "All scripts OK"'
 
