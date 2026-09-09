@@ -487,7 +487,13 @@ extract_domains() {
     # `|| true`: grep exits 1 when the input contains zero domain-like
     # tokens. Without it, set -e + pipefail would abort the ENTIRE pipeline
     # run at Stage 5 with no error message (verified in testing).
-    grep -oE '([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}' "$input_file" \
+    #
+    # Strip percent-encoded fragments first: URLs like
+    # https://x.example.com/redirect?to=%2Fapp.example.com would otherwise
+    # yield bogus "2Fapp.example.com" tokens (the %2F path separator
+    # merges with the following hostname chars).
+    sed -E 's/%[0-9A-Fa-f]{2}/ /g' "$input_file" 2>/dev/null \
+        | grep -oE '([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}' \
         | sort -u > "$output_file" || true
 }
 

@@ -469,16 +469,20 @@ WORDBASE
     log_info "Stage 4b: Subdomain permutation (dnsgen)"
 
     if command -v dnsgen &>/dev/null; then
-        # Build input from all subdomains discovered so far (passive + brute)
+        # Build input from all subdomains discovered so far (passive + brute).
+        # Keep only valid hostname characters — passive sources (esp. waymore
+        # URL parsing) leak debris like "2Fapp.example.com" (URL-encoding
+        # fragments) that dnsgen would treat as real labels.
         cat all_subdomains_round1.txt shuffledns_results.txt 2>/dev/null \
+            | grep -E '^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$' \
             | sort -u > dnsgen_input.txt || true
 
-        # Cap dnsgen input for large domains. dnsgen yields ~150-200
-        # permutations per input — 5K inputs → ~885K candidates, which
-        # takes hours to resolve and starves the rest of the pipeline
-        # (reconftw skips permutations entirely above 500 subs for the
-        # same reason). For large corpora, prefer resolved hostnames
-        # (they reveal active naming patterns) and cap the rest.
+        # Cap dnsgen input for large domains. dnsgen (default mode) yields
+        # ~150-200 permutations per input — 5K inputs → ~885K candidates,
+        # which takes hours to resolve and starves the rest of the pipeline
+        # (reconftw skips permutations entirely above 500 subs for the same
+        # reason). For large corpora, prefer resolved hostnames (they reveal
+        # active naming patterns) and cap the rest.
         local _dnsgen_max="${DNSGEN_MAX_INPUT:-500}"
         if [[ -s dnsgen_input.txt ]]; then
             local _dnsgen_in_count
@@ -504,12 +508,16 @@ WORDBASE
         if [[ -s dnsgen_input.txt ]]; then
             log_info "  Generating permutations from $(wc -l < dnsgen_input.txt) subdomains..."
 
-            # -f fast mode: uses only the low-yield permutators (number
-            # mutations, common ports). Default mode's word-insertion
-            # permutator generates ~700+ candidates/domain, which is what
-            # caused the 885K-candidate explosion. Fast mode is the
-            # maintainer's official answer to output volume (issue #7).
-            timeout "${DNSGEN_TIMEOUT:-120}" dnsgen -f dnsgen_input.txt \
+            # Default mode (no -f): includes the word-insertion permutator,
+            # which is where permutation value is (dev→dev-staging,
+            # api→api-internal neighbors). v2's -f "fast mode" only does
+            # number mutations and port suffixes — a near-no-op for domains
+            # without digits/ports in their subdomains (verified on
+            # mydigipay.com: fast mode → 0 permutations).
+            # Volume is controlled by DNSGEN_MAX_INPUT (500) upstream and
+            # this byte cap downstream (head -c cuts mid-generation, so a
+            # runaway generator can't outlast DNSGEN_TIMEOUT either).
+            timeout "${DNSGEN_TIMEOUT:-120}" dnsgen dnsgen_input.txt \
                 < /dev/null 2>/dev/null \
                 | head -c "${DNSGEN_MAX_OUTPUT_BYTES:-26214400}" \
                 > dnsgen_permutations.txt || true
