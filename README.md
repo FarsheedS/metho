@@ -189,7 +189,7 @@ Options:
 
 > **Flag scope notes:** `--rate-limit` applies only to httpx (Waymore, Katana, and the DNS tools use their own fixed/internal limits); `--threads` applies only to dnsx and Cloud_Enum.
 >
-> **`--proxy` scope:** the proxy is applied **only** to passive OSINT sources (crt.name, GitHub pre-flight + github-subdomains, subfaster, waymore) — use it when those APIs are geo-blocked/filtered on your direct network. Target DNS resolution, HTTPX, and the Nmap/naabu port scan deliberately stay **direct** so scanning sees real IPs. `curl` and `waymore` route cleanly over SOCKS or HTTP; statically-linked Go tools (subfaster, github-subdomains) honor `HTTP(S)_PROXY` only for an `http://` proxy, so prefer an HTTP proxy URL for full coverage. Note `localhost` inside the container is the container itself — use `host.docker.internal` for a proxy running on the Docker host.
+> **`--proxy` scope:** when set, the proxy is applied **only** to the passive OSINT sources (crt.name, GitHub pre-flight + github-subdomains, subfaster, waymore). Target DNS resolution, HTTPX, and the Nmap/naabu port scan deliberately stay **direct** so scanning sees real IPs. `curl` and `waymore` route cleanly over SOCKS or HTTP; statically-linked Go tools (subfaster, github-subdomains) honor `HTTP(S)_PROXY` only for an `http://` proxy, so prefer an HTTP proxy URL for full coverage. Note `localhost` inside the container is the container itself — use `host.docker.internal` for a proxy running on the Docker host.
 >
 > **`--nmap-top-ports`:** naabu still records every open port (all are kept in the final `ip_port_pairs.txt`); this flag only bounds how many ports nmap `-sV` service-detects, preventing the port union across hundreds of hosts from turning Phase 3 into a ~1000-port × N-host scan.
 
@@ -237,7 +237,7 @@ docker run --rm -it \
   --auto
 ```
 
-**Routing passive OSINT through a proxy (e.g. when crt.sh / GitHub are filtered), scanning stays direct:**
+**Routing the passive OSINT sources through a proxy (scanning stays direct):**
 ```bash
 docker run --rm -it \
   -v $(pwd)/results:/output \

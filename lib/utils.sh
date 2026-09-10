@@ -185,8 +185,8 @@ log_skip()    { local msg="[SKIP] $*"; echo -e "${YELLOW}${msg}${NC}"; { [[ -n "
 # ── Passive-source proxy ─────────────────────────────────────────────────────
 # Run a command with proxy env vars set ONLY when --proxy/PASSIVE_PROXY is
 # given. Applied exclusively to passive OSINT sources (crt.name, GitHub,
-# subfaster, waymore) so blocked/geo-filtered APIs are reachable, while target
-# DNS resolution, HTTPX and Nmap keep using the direct network (real IPs).
+# subfaster, waymore), while target DNS resolution, HTTPX and Nmap keep using
+# the direct network (real IPs).
 # curl and Python (requests+PySocks) honor these for SOCKS and HTTP proxies;
 # statically-linked Go tools honor an http:// proxy via net/http but may ignore
 # a socks5:// one — prefer an HTTP proxy URL for full coverage.
