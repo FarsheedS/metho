@@ -88,7 +88,7 @@ Resolves any still-pending hostnames from the canonical DNS dataset, performs de
 | 1b | Reverse DNS (PTR) lookups on resolved IPs → new in-scope hostnames | dnsx |
 | 2 | IP → ASN lookup via whois.cymru.com | nc |
 | 3 | Deterministic IP classification (CDN/cloud/dedicated/unknown) | Built-in classification engine |
-| 4 | Fast port scan (naabu, top 1000 ports) then service detection (nmap -sV on hosts naabu found open) — skipped with `--no-port-scan` | naabu, nmap |
+| 4 | Fast port scan (naabu, top 1000 ports) then service detection (nmap -sV on hosts naabu found open, capped to the top `--nmap-top-ports` most-common ports) — skipped with `--no-port-scan` | naabu, nmap |
 
 ---
 
@@ -167,6 +167,9 @@ Required (one of):
 Options:
   -h, --help                Show this help and exit
   --subfaster-config FILE   Path to subfaster provider-config.yaml (API keys)
+  --proxy URL               Proxy for PASSIVE sources only — crt.name, GitHub, subfaster,
+                            waymore. Target DNS/HTTPX/Nmap stay on the direct network.
+                            e.g. socks5h://host.docker.internal:12334 or http://host.docker.internal:8080
   --asn-config FILE         Path to ASN provider classification config (default: built-in)
   --waymore-mode MODE       Waymore mode: U (URLs, default) or B (URLs+responses). R
                             (responses only) is not supported — the pipeline consumes URL output
@@ -178,12 +181,17 @@ Options:
   --parallel-hosts N        Hosts crawled in parallel per per-host tool (default: 5)
   --parallel-domains N      Root domains processed in parallel in Phase 1 (default: 3)
   --rate-limit N            httpx requests/second (default: 100)
+  --nmap-top-ports N        Cap nmap -sV (Phase 3) to the N most-common open ports (default: 100; 0 = no cap)
   --timeout N               Checkpoint auto-continue timeout in seconds; 0 = wait forever (default: 30)
   --output DIR              Output directory (default: /output)
   --cloud-enum-keywords KW Keywords for cloud_enum brute force (comma-sep, auto-derived from domains)
 ```
 
 > **Flag scope notes:** `--rate-limit` applies only to httpx (Waymore, Katana, and the DNS tools use their own fixed/internal limits); `--threads` applies only to dnsx and Cloud_Enum.
+>
+> **`--proxy` scope:** the proxy is applied **only** to passive OSINT sources (crt.name, GitHub pre-flight + github-subdomains, subfaster, waymore) — use it when those APIs are geo-blocked/filtered on your direct network. Target DNS resolution, HTTPX, and the Nmap/naabu port scan deliberately stay **direct** so scanning sees real IPs. `curl` and `waymore` route cleanly over SOCKS or HTTP; statically-linked Go tools (subfaster, github-subdomains) honor `HTTP(S)_PROXY` only for an `http://` proxy, so prefer an HTTP proxy URL for full coverage. Note `localhost` inside the container is the container itself — use `host.docker.internal` for a proxy running on the Docker host.
+>
+> **`--nmap-top-ports`:** naabu still records every open port (all are kept in the final `ip_port_pairs.txt`); this flag only bounds how many ports nmap `-sV` service-detects, preventing the port union across hundreds of hosts from turning Phase 3 into a ~1000-port × N-host scan.
 
 ### Checkpoints
 
@@ -226,6 +234,20 @@ docker run --rm -it \
   metho \
   --domains-file /input/domains.txt \
   --subfaster-config /input/provider-config.yaml \
+  --auto
+```
+
+**Routing passive OSINT through a proxy (e.g. when crt.sh / GitHub are filtered), scanning stays direct:**
+```bash
+docker run --rm -it \
+  -v $(pwd)/results:/output \
+  -v $(pwd)/targets.txt:/input/domains.txt:ro \
+  -v $(pwd)/provider-config.yaml:/input/provider-config.yaml:ro \
+  metho \
+  --domains-file /input/domains.txt \
+  --subfaster-config /input/provider-config.yaml \
+  --proxy socks5h://host.docker.internal:12334 \
+  --nmap-top-ports 100 \
   --auto
 ```
 

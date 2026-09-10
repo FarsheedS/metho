@@ -93,7 +93,9 @@ crtname_query() {
     log_info "Querying crt.name for $domain (apex: $apex)..."
     local api_url="https://crt.name/v1/search?apex=${apex}&format=json"
     local http_code
-    http_code=$(curl -s -w '%{http_code}' -o "$raw_file" "$api_url" 2>/dev/null || echo "000")
+    # --max-time guards against a proxy/endpoint that accepts the connection
+    # then stalls (crt.name has no server-side timeout of its own).
+    http_code=$(with_passive_proxy curl -s --max-time 30 -w '%{http_code}' -o "$raw_file" "$api_url" 2>/dev/null || echo "000")
 
     if [[ "$http_code" != "200" ]]; then
         log_warn "crt.name: API returned HTTP $http_code for $domain"
@@ -180,6 +182,24 @@ log_warn()    { local msg="[!] $*"; echo -e "${YELLOW}${msg}${NC}"; { [[ -n "$LO
 log_error()   { local msg="[-] $*"; echo -e "${RED}${msg}${NC}"; { [[ -n "$LOG_FILE" ]] && echo "$(_log_ts) ${msg}" >> "$LOG_FILE"; } || true; }
 log_skip()    { local msg="[SKIP] $*"; echo -e "${YELLOW}${msg}${NC}"; { [[ -n "$LOG_FILE" ]] && echo "$(_log_ts) ${msg}" >> "$LOG_FILE"; } || true; }
 
+# ── Passive-source proxy ─────────────────────────────────────────────────────
+# Run a command with proxy env vars set ONLY when --proxy/PASSIVE_PROXY is
+# given. Applied exclusively to passive OSINT sources (crt.name, GitHub,
+# subfaster, waymore) so blocked/geo-filtered APIs are reachable, while target
+# DNS resolution, HTTPX and Nmap keep using the direct network (real IPs).
+# curl and Python (requests+PySocks) honor these for SOCKS and HTTP proxies;
+# statically-linked Go tools honor an http:// proxy via net/http but may ignore
+# a socks5:// one — prefer an HTTP proxy URL for full coverage.
+with_passive_proxy() {
+    if [[ -n "${PASSIVE_PROXY:-}" ]]; then
+        HTTP_PROXY="$PASSIVE_PROXY"  HTTPS_PROXY="$PASSIVE_PROXY"  ALL_PROXY="$PASSIVE_PROXY" \
+        http_proxy="$PASSIVE_PROXY"  https_proxy="$PASSIVE_PROXY"  all_proxy="$PASSIVE_PROXY" \
+        "$@"
+    else
+        "$@"
+    fi
+}
+
 # ── CLI Argument Parsing ────────────────────────────────────────────────────
 DOMAINS=""
 DOMAINS_FILE=""
@@ -187,6 +207,9 @@ DOMAINS_FILE=""
 # Previously this was hardcoded to "" which silently overwrote the env var;
 # users had to pass --subfaster-config on the CLI to get it recognized.
 SUBFASTER_PROVIDER_CONFIG="${SUBFASTER_PROVIDER_CONFIG:-}"
+# Proxy for passive OSINT sources only (see with_passive_proxy). Env-supplied
+# value is preserved so `-e PASSIVE_PROXY=...` works like the CLI flag.
+PASSIVE_PROXY="${PASSIVE_PROXY:-}"
 AUTO=false
 SKIP_PHASES=()
 THREADS=50
@@ -263,6 +286,15 @@ NAABU_RATE=1000
 # without multiplying noise on filtered ports.
 NAABU_RETRIES=2
 
+# Cap on how many ports nmap -sV service-detects in Stage 4b. naabu already
+# records EVERY open port (they are merged into the final ip_port_pairs), so
+# this only bounds which ports get version detection. Without a cap, the union
+# of open ports across hundreds of hosts approaches the full top-1000 set and
+# nmap re-scans every host against all of them — the single biggest time sink
+# in Phase 3. The cap keeps the N ports open on the MOST hosts (highest signal).
+# 0 = no cap (scan the full union). Override with --nmap-top-ports.
+NMAP_TOP_PORTS=100
+
 # Numeric-argument guard: rejects non-integer values up-front so a typo like
 # `--threads abc` fails immediately with a clear message instead of deep inside
 # dnsx/cloud_enum at runtime.
@@ -280,6 +312,7 @@ parse_args() {
             --domains)        DOMAINS="$2"; shift 2 ;;
             --domains-file)   DOMAINS_FILE="$2"; shift 2 ;;
             --subfaster-config) SUBFASTER_PROVIDER_CONFIG="$2"; shift 2 ;;
+            --proxy)          PASSIVE_PROXY="$2"; shift 2 ;;
             --asn-config)     ASN_CONFIG_FILE="$2"; shift 2 ;;
             --waymore-mode)   WAYMORE_MODE="$2"; shift 2 ;;
             --auto)           AUTO=true; shift ;;
@@ -294,6 +327,7 @@ parse_args() {
             --parallel-domains) _require_int "$1" "$2"; PARALLEL_DOMAINS="$2"; shift 2 ;;
             --domain-timeout) _require_int "$1" "$2"; DOMAIN_TIMEOUT="$2"; shift 2 ;;
             --rate-limit)     _require_int "$1" "$2"; RATE_LIMIT="$2"; shift 2 ;;
+            --nmap-top-ports) _require_int "$1" "$2"; NMAP_TOP_PORTS="$2"; shift 2 ;;
             --timeout)        _require_int "$1" "$2"; CHECKPOINT_TIMEOUT="$2"; shift 2 ;;
             --output)         OUTPUT_DIR="$2"; shift 2 ;;
             --cloud-enum-keywords) CLOUD_ENUM_KEYWORDS="$2"; shift 2 ;;
@@ -306,6 +340,9 @@ parse_args() {
                 echo ""
                 echo "Options:"
                 echo "  --subfaster-config FILE   Path to subfaster provider-config.yaml (API keys)"
+                echo "  --proxy URL               Proxy for PASSIVE sources only (crt.name, GitHub,"
+                echo "                            subfaster, waymore). Scanning/DNS/Nmap stay direct."
+                echo "                            e.g. socks5h://host.docker.internal:12334 or http://host.docker.internal:8080"
                 echo "  --asn-config FILE         Path to ASN provider classification config (default: built-in)"
                 echo "  --waymore-mode MODE       Waymore mode: U (URLs, default) or B (URLs+responses)"
                 echo "  --auto                    Skip all checkpoint prompts"
@@ -317,6 +354,7 @@ parse_args() {
                 echo "  --parallel-domains N       Root domains processed in parallel in Phase 1 (default: 3)"
                 echo "  --domain-timeout N        Per-domain wall-clock cap in seconds (default: 5400; 0=off)"
                 echo "  --rate-limit N            Requests/second (default: 100)"
+                echo "  --nmap-top-ports N        Cap nmap -sV to the N most-common open ports (default: 100; 0=no cap)"
                 echo "  --timeout N               Checkpoint auto-continue seconds (default: 30)"
                 echo "  --output DIR              Output directory (default: /output)"
                 echo "  --cloud-enum-keywords KW  Keywords for cloud_enum brute force (comma-sep)"
@@ -350,6 +388,20 @@ validate_args() {
     if [[ -n "$SUBFASTER_PROVIDER_CONFIG" ]]; then
         export SUBFASTER_PROVIDER_CONFIG
         log_info "Subfaster provider config: $SUBFASTER_PROVIDER_CONFIG"
+    fi
+    # Normalize and sanity-check the passive proxy.
+    if [[ -n "$PASSIVE_PROXY" ]]; then
+        # A bare socks:// is ambiguous to curl; assume SOCKS5 with remote DNS.
+        case "$PASSIVE_PROXY" in
+            socks://*)
+                PASSIVE_PROXY="socks5h://${PASSIVE_PROXY#socks://}"
+                log_warn "Proxy scheme 'socks://' is ambiguous; using ${PASSIVE_PROXY} (SOCKS5, remote DNS)" ;;
+        esac
+        case "$PASSIVE_PROXY" in
+            *://localhost:*|*://127.0.0.1:*)
+                log_warn "Proxy host is localhost/127.0.0.1 — inside the container that resolves to the container itself, not the Docker host. If the proxy runs on the host, use host.docker.internal instead (e.g. ${PASSIVE_PROXY%%://*}://host.docker.internal:PORT)." ;;
+        esac
+        export PASSIVE_PROXY
     fi
     # Validate waymore mode
     case "$WAYMORE_MODE" in

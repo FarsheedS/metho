@@ -147,7 +147,7 @@ process_domain() {
             # and the configured API keys are silently unused.
             sf_opts+=(-all -provider-config "$SUBFASTER_PROVIDER_CONFIG")
         fi
-        subfaster "${sf_opts[@]}" 2>/dev/null || true
+        with_passive_proxy subfaster "${sf_opts[@]}" 2>/dev/null || true
         local sf_count=0
         [[ -s subfaster_results.txt ]] && sf_count=$(wc -l < subfaster_results.txt)
         log_success "Subfaster subdomains: $sf_count"
@@ -180,7 +180,7 @@ process_domain() {
             # is surfaced instead of a misleading "0 subdomains".
             local _gh_probe_tok="${gh_token%%,*}"
             local _gh_probe_code
-            _gh_probe_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+            _gh_probe_code=$(with_passive_proxy curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
                 -H "Authorization: token ${_gh_probe_tok}" \
                 https://api.github.com/rate_limit 2>/dev/null || echo 000)
             if [[ "$_gh_probe_code" == "401" ]]; then
@@ -188,7 +188,7 @@ process_domain() {
             else
                 [[ "$_gh_probe_code" != "200" ]] && log_warn "GitHub token pre-flight returned HTTP ${_gh_probe_code} (not 200) — running anyway"
                 log_info "Running GitHub-subdomains..."
-                timeout "${GITHUB_SUBDOMAINS_TIMEOUT:-300}" github-subdomains \
+                with_passive_proxy timeout "${GITHUB_SUBDOMAINS_TIMEOUT:-300}" github-subdomains \
                     -d "$domain" -t "$gh_token" -o github_subdomains.txt \
                     < /dev/null 2>/dev/null || true
                 local gh_count=0
@@ -244,7 +244,7 @@ process_domain() {
         # file and only the FIRST root domain is ever processed — the rest are
         # silently consumed as waymore's stdin. This is the same bug class that
         # katana/cewl exhibited; they already carry < /dev/null guards.
-        timeout "${WAYMORE_TIMEOUT:-600}" waymore \
+        with_passive_proxy timeout "${WAYMORE_TIMEOUT:-600}" waymore \
             -i "$domain" \
             -mode "${WAYMORE_MODE:-U}" \
             -oU "$wm_urls" \

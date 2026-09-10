@@ -285,7 +285,19 @@ run_phase3() {
         if command -v nmap &>/dev/null; then
             local nmap_ports="" nmap_targets="${pdir}/nmap_candidates.txt"
             if [[ "$naabu_found" -gt 0 ]]; then
-                nmap_ports=$(cut -d: -f2 "${pdir}/naabu_ip_ports.txt" | sort -un | paste -sd, -)
+                # Cap -sV to the top-N most-common open ports (ports open on the
+                # most hosts) to stop the port union from ballooning into a
+                # ~1000-port × N-host scan. naabu's full per-host results are
+                # still merged into ip_port_pairs below, so no port is lost from
+                # the inventory — only version detection is bounded.
+                if [[ "${NMAP_TOP_PORTS:-100}" -gt 0 ]]; then
+                    nmap_ports=$(cut -d: -f2 "${pdir}/naabu_ip_ports.txt" \
+                        | sort | uniq -c | sort -rn \
+                        | awk -v n="${NMAP_TOP_PORTS:-100}" 'NR<=n {print $2}' \
+                        | sort -un | paste -sd, -)
+                else
+                    nmap_ports=$(cut -d: -f2 "${pdir}/naabu_ip_ports.txt" | sort -un | paste -sd, -)
+                fi
                 # Target list = only hosts with naabu-confirmed open ports
                 cut -d: -f1 "${pdir}/naabu_ip_ports.txt" | sort -u > "${pdir}/nmap_target_hosts.txt"
                 if [[ -s "${pdir}/nmap_target_hosts.txt" ]]; then
@@ -297,9 +309,10 @@ run_phase3() {
                 nmap_targets="${pdir}/nmap_candidates.txt"
             fi
 
-            local _nmap_target_count
+            local _nmap_target_count _nmap_port_count
             _nmap_target_count=$(wc -l < "$nmap_targets")
-            log_info "  Stage 4b: Nmap service detection on ${_nmap_target_count} hosts (ports: ${nmap_ports})"
+            _nmap_port_count=$(printf '%s' "$nmap_ports" | tr ',' '\n' | grep -c .)
+            log_info "  Stage 4b: Nmap -sV on ${_nmap_target_count} hosts × ${_nmap_port_count} ports (cap: top ${NMAP_TOP_PORTS:-100})"
             nmap -Pn -n -iL "$nmap_targets" \
                 -p "$nmap_ports" \
                 -sV --open --max-retries 2 \
