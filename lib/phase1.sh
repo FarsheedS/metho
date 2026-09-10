@@ -209,7 +209,7 @@ process_domain() {
     printf '%s\n' "$domain" > axfr_input.txt
     timeout 30 dnsx -silent -axfr -resp-only \
         -l axfr_input.txt \
-        -r /opt/scripts/wordlists/resolvers.txt \
+        -r ${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt} \
         < /dev/null > axfr_results.txt 2>/dev/null || true
     if [[ -s axfr_results.txt ]]; then
         extract_domains axfr_results.txt axfr_all_domains.txt || true
@@ -463,8 +463,8 @@ WORDBASE
     if [[ "$_dns_dead" == 1 ]]; then
         log_skip "Stage 4 brute-force skipped for $domain (DNS broken — see Stage 3)"
     elif command -v dnsx &>/dev/null; then
-        if [[ ! -s /opt/scripts/wordlists/resolvers.txt ]]; then
-            log_warn "resolvers file missing or empty: /opt/scripts/wordlists/resolvers.txt — dnsx bruteforce will fail"
+        if [[ ! -s ${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt} ]]; then
+            log_warn "resolvers file missing or empty: ${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt} — dnsx bruteforce will fail"
         fi
 
         log_info "Running dnsx brute force on $(wc -l < wordlists/custom_wordlist.txt) words against $domain..."
@@ -475,7 +475,7 @@ WORDBASE
         timeout "${BRUTEFORCE_TIMEOUT:-900}" dnsx \
             -d "$domain" \
             -w wordlists/custom_wordlist.txt \
-            -r /opt/scripts/wordlists/resolvers.txt \
+            -r ${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt} \
             -auto-wildcard \
             -duc -silent \
             -t 500 \
@@ -621,7 +621,7 @@ WORDBASE
                 timeout "$_resolve_timeout" dnsx \
                     -l dnsgen_permutations.txt \
                     -silent -wd "$domain" -wt 1 \
-                    -r /opt/scripts/wordlists/resolvers.txt \
+                    -r ${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt} \
                     -t 500 -timeout 5 -json \
                     < /dev/null 2>/dev/null > dnsgen_results.json || true
 

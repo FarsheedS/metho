@@ -230,7 +230,7 @@ canonical_dns_resolve_pending() {
 
     cat "$pending_file" | timeout "${DNSX_TIMEOUT:-600}" dnsx \
         -silent -a -aaaa -cname -json -retry 2 \
-        -r /opt/scripts/wordlists/resolvers.txt \
+        -r "${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt}" \
         -timeout 5 \
         2>"${dnsx_json}.stderr" > "$dnsx_json" || true
 

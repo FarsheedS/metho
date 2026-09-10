@@ -50,7 +50,7 @@ run_phase2() {
             cat "$canonical_hosts" \
                 | timeout "${DNSX_TIMEOUT:-600}" dnsx -cname -mx -ns -txt \
                     -json -retry 3 \
-                    -r /opt/scripts/wordlists/resolvers.txt \
+                    -r ${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt} \
                     -timeout 5 \
                     2>>"$dnsx_log" \
                 | tee "${pdir}/dnsx_output.json" >/dev/null || \
@@ -132,7 +132,7 @@ run_phase2() {
             log_info "  Cloud_Enum keywords: $_kw_list (wall-clock cap ${CLOUD_ENUM_TIMEOUT:-1800}s)"
 
             # Emit one -k per keyword.
-            local -a ce_args=(-nsf /opt/scripts/wordlists/resolvers.txt)
+            local -a ce_args=(-nsf ${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt})
             for kw in "${ce_kw[@]}"; do
                 ce_args+=(-k "$kw")
             done

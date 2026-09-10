@@ -68,7 +68,7 @@ run_phase3() {
 
         cat "${pdir}/all_ips.txt" | timeout "${DNSX_TIMEOUT:-600}" dnsx \
             -silent -ptr -resp-only \
-            -r /opt/scripts/wordlists/resolvers.txt \
+            -r "${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt}" \
             -timeout 5 \
             2>/dev/null | sort -u > "${pdir}/ptr_hostnames.txt" || true
 
