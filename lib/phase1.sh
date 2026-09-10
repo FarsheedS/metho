@@ -24,7 +24,25 @@ run_phase1() {
     # complete, merge_per_domain_dns combines them into the global TSV that
     # Phase 2 and Phase 3 consume.
     _process_domain_wrapper() {
-        process_domain "$1" "$pdir"
+        local _d="$1" _cap="${DOMAIN_TIMEOUT:-5400}"
+        if [[ "$_cap" -le 0 ]]; then
+            process_domain "$_d" "$pdir"
+            return 0
+        fi
+        # Run the domain as a background job in THIS shell so it keeps every
+        # sourced function (`timeout` cannot wrap a shell function), guarded by
+        # a watchdog that TERMs then KILLs it if it outlives the cap. One stuck
+        # domain can no longer gate the whole pool; partial results are kept.
+        process_domain "$_d" "$pdir" &
+        local _worker=$!
+        ( sleep "$_cap"; kill -TERM "$_worker" 2>/dev/null; sleep 10; kill -KILL "$_worker" 2>/dev/null ) &
+        local _watch=$!
+        wait "$_worker" 2>/dev/null; local _rc=$?
+        kill -TERM "$_watch" 2>/dev/null; wait "$_watch" 2>/dev/null
+        if [[ "$_rc" -gt 128 ]]; then
+            log_warn "Domain $_d exceeded ${_cap}s wall-clock cap — worker killed, moving on (partial results kept)"
+        fi
+        return 0
     }
 
     log_info "Processing ${domain_count} domains with ${PARALLEL_DOMAINS:-3} parallel workers..."
@@ -86,6 +104,12 @@ process_domain() {
     local pdir="$2"
     local ddir="${pdir}/${domain}"
     mkdir -p "$ddir"
+
+    # Set when Stage 3 shows DNS is broken (fake-IP VPN / dead resolvers):
+    # nothing resolves and every host is bogon/timeout. Gates the brute-force
+    # and dnsgen stages, which would otherwise grind for many minutes on names
+    # that cannot resolve.
+    local _dns_dead=0
 
     log_info "────────────────────────────────────────────"
     log_info "Processing domain: $domain"
@@ -150,13 +174,27 @@ process_domain() {
                 | sort -u | paste -sd, -) || true
         fi
         if [[ -n "$gh_token" ]]; then
-            log_info "Running GitHub-subdomains..."
-            timeout "${GITHUB_SUBDOMAINS_TIMEOUT:-300}" github-subdomains \
-                -d "$domain" -t "$gh_token" -o github_subdomains.txt \
-                < /dev/null 2>/dev/null || true
-            local gh_count=0
-            [[ -s github_subdomains.txt ]] && gh_count=$(wc -l < github_subdomains.txt)
-            log_success "GitHub-subdomains: $gh_count subdomains"
+            # Pre-flight token check: an expired/revoked PAT makes
+            # github-subdomains silently return 0, which reads like "no results"
+            # rather than "auth failed". Probe the first token so the real cause
+            # is surfaced instead of a misleading "0 subdomains".
+            local _gh_probe_tok="${gh_token%%,*}"
+            local _gh_probe_code
+            _gh_probe_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+                -H "Authorization: token ${_gh_probe_tok}" \
+                https://api.github.com/rate_limit 2>/dev/null || echo 000)
+            if [[ "$_gh_probe_code" == "401" ]]; then
+                log_warn "GitHub-subdomains skipped: token(s) invalid/expired (api.github.com returned HTTP 401). Regenerate the PAT(s) in the provider config."
+            else
+                [[ "$_gh_probe_code" != "200" ]] && log_warn "GitHub token pre-flight returned HTTP ${_gh_probe_code} (not 200) — running anyway"
+                log_info "Running GitHub-subdomains..."
+                timeout "${GITHUB_SUBDOMAINS_TIMEOUT:-300}" github-subdomains \
+                    -d "$domain" -t "$gh_token" -o github_subdomains.txt \
+                    < /dev/null 2>/dev/null || true
+                local gh_count=0
+                [[ -s github_subdomains.txt ]] && gh_count=$(wc -l < github_subdomains.txt)
+                log_success "GitHub-subdomains: $gh_count subdomains"
+            fi
         else
             log_skip "GitHub-subdomains skipped (set GITHUB_TOKEN env var or add github tokens to provider-config)"
         fi
@@ -248,6 +286,19 @@ process_domain() {
 
         # Resolve all pending hostnames through DNSx into the canonical dataset
         canonical_dns_resolve_pending
+
+        # Circuit breaker: if NOTHING resolved and every host is bogon/timeout,
+        # DNS is broken (fake-IP VPN hijacking UDP/53 -> 198.18.x.x, or public
+        # resolvers unreachable). Brute-force + dnsgen would then spend many
+        # minutes resolving names that cannot resolve. Skip them for this
+        # domain; passive results are already saved, so no data is lost.
+        if [[ "${CANONICAL_LAST_RESOLVED:-0}" -eq 0 \
+              && $(( ${CANONICAL_LAST_BOGON:-0} + ${CANONICAL_LAST_TIMEOUT:-0} )) -ge 5 ]]; then
+            _dns_dead=1
+            log_warn "DNS looks BROKEN for $domain: 0 resolved, ${CANONICAL_LAST_BOGON:-0} bogon / ${CANONICAL_LAST_TIMEOUT:-0} timeout"
+            log_warn "  Likely a fake-IP VPN hijacking UDP/53 (198.18.x.x) or blocked public resolvers."
+            log_warn "  Skipping brute-force + dnsgen for $domain (cannot resolve). Fix DNS (disconnect VPN / use TCP resolvers) and re-run."
+        fi
 
         # Extract resolved hostnames for HTTPx probing. Scope to THIS domain
         # (the canonical dataset holds every domain processed so far) so a host
@@ -409,7 +460,9 @@ WORDBASE
     # Step 4b: dnsx brute force (replaces shuffledns — same wildcard detection,
     # faster, no massdns dependency). dnsx -auto-wildcard filters wildcard
     # subdomains (equivalent to shuffledns -sw). -t 500 for high throughput.
-    if command -v dnsx &>/dev/null; then
+    if [[ "$_dns_dead" == 1 ]]; then
+        log_skip "Stage 4 brute-force skipped for $domain (DNS broken — see Stage 3)"
+    elif command -v dnsx &>/dev/null; then
         if [[ ! -s /opt/scripts/wordlists/resolvers.txt ]]; then
             log_warn "resolvers file missing or empty: /opt/scripts/wordlists/resolvers.txt — dnsx bruteforce will fail"
         fi
@@ -468,7 +521,10 @@ WORDBASE
     # in no passive source, CT log, or archive.
     log_info "Stage 4b: Subdomain permutation (dnsgen)"
 
-    if command -v dnsgen &>/dev/null; then
+    if [[ "$_dns_dead" == 1 ]]; then
+        log_skip "  dnsgen skipped for $domain (DNS broken — permutations cannot resolve)"
+        : > dnsgen_results.txt
+    elif command -v dnsgen &>/dev/null; then
         # Build input from all subdomains discovered so far (passive + brute).
         # Keep only valid hostname characters — passive sources (esp. waymore
         # URL parsing) leak debris like "2Fapp.example.com" (URL-encoding

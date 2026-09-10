@@ -54,6 +54,29 @@ normalize_hostname() {
 # The crt.name API returns JSON: [{"sub":"hostname.example.com"}, ...]
 # We normalize hostnames, filter to in-scope (matching the root domain),
 # deduplicate, and preserve the raw API response.
+# Registrable apex for a hostname. crt.name's ?apex= param expects a
+# REGISTRABLE domain and returns HTTP 400 for a deep subdomain
+# (automotive.vodafone.co.uk -> 400, abcom.al -> 200). A full Public Suffix
+# List is unnecessary here — this covers the multi-label ccTLD suffixes the
+# target scope actually contains (co.uk, com.tr, co.za, co.tz, co.ke, co.mz,
+# co.ls, com.eg, ...) plus common extras. Single-label TLDs fall through to
+# last-two-labels. Callers still filter results to the exact in-scope host.
+_METHO_MULTI_SUFFIXES=" co.uk org.uk gov.uk ac.uk me.uk com.tr net.tr org.tr gov.tr co.za org.za co.tz co.ke co.mz com.mz co.ls com.eg net.eg co.nz com.au net.au org.au co.in co.id com.br com.mx co.jp com.sg com.my "
+registrable_apex() {
+    local host="${1%.}"
+    local IFS='.'
+    local -a parts=()
+    read -ra parts <<< "$host"
+    local n=${#parts[@]}
+    if (( n < 2 )); then printf '%s\n' "$host"; return; fi
+    local last2="${parts[n-2]}.${parts[n-1]}"
+    if (( n >= 3 )) && [[ "$_METHO_MULTI_SUFFIXES" == *" $last2 "* ]]; then
+        printf '%s\n' "${parts[n-3]}.$last2"
+    else
+        printf '%s\n' "$last2"
+    fi
+}
+
 crtname_query() {
     local domain="$1" output_file="$2" raw_file="$3"
 
@@ -65,8 +88,10 @@ crtname_query() {
         return
     fi
 
-    log_info "Querying crt.name for $domain..."
-    local api_url="https://crt.name/v1/search?apex=${domain}&format=json"
+    local apex
+    apex=$(registrable_apex "$domain")
+    log_info "Querying crt.name for $domain (apex: $apex)..."
+    local api_url="https://crt.name/v1/search?apex=${apex}&format=json"
     local http_code
     http_code=$(curl -s -w '%{http_code}' -o "$raw_file" "$api_url" 2>/dev/null || echo "000")
 
@@ -107,7 +132,16 @@ bounded_parallel() {
     [[ "$concurrency" -lt 1 ]] && concurrency=1
     # Detect `wait -n` support (bash >= 4.3). Done once; cheap.
     if [[ -z "${_METHO_HAS_WAIT_N+x}" ]]; then
-        if (wait -n) 2>/dev/null; then _METHO_HAS_WAIT_N=1; else _METHO_HAS_WAIT_N=0; fi
+        # Do NOT probe with `(wait -n)`: with no child jobs it returns non-zero
+        # on EVERY bash (unknown-option 2 on <4.3, "no more children" 127 on
+        # >=4.3), so the probe ALWAYS failed and silently forced slow
+        # whole-batch mode (a stuck domain then gates the entire pool). Gate on
+        # the interpreter version directly, which is what actually matters.
+        if (( BASH_VERSINFO[0] > 4 || ( BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3 ) )); then
+            _METHO_HAS_WAIT_N=1
+        else
+            _METHO_HAS_WAIT_N=0
+        fi
     fi
     # Temporarily disable errexit AND save/restore it. A worker that returns
     # non-zero must NOT abort the pool (its exit surfaces through `wait`), and
@@ -171,6 +205,12 @@ PARALLEL_HOSTS=5
 # merge_per_domain_dns combines them into the global TSV. I/O-bound workloads
 # (DNS, HTTP) tolerate higher concurrency than CPU-bound ones.
 PARALLEL_DOMAINS=3
+# Per-domain wall-clock cap (seconds) for Phase 1. A single pathological domain
+# (huge permutation set, or DNS grinding through per-query timeouts) must never
+# gate the whole parallel pool. A watchdog TERMs then KILLs that domain's worker
+# once it outlives the cap; already-written partial results are kept. 0 =
+# unlimited. Default 5400s (90m) is generous — it only catches genuine hangs.
+DOMAIN_TIMEOUT=5400
 # ASN classification config file (shell-sourceable)
 ASN_CONFIG_FILE=""
 # Waymore mode: U (URLs only, default), B (URLs + response bodies).
@@ -252,6 +292,7 @@ parse_args() {
             --threads)        _require_int "$1" "$2"; THREADS="$2"; shift 2 ;;
             --parallel-hosts) _require_int "$1" "$2"; PARALLEL_HOSTS="$2"; shift 2 ;;
             --parallel-domains) _require_int "$1" "$2"; PARALLEL_DOMAINS="$2"; shift 2 ;;
+            --domain-timeout) _require_int "$1" "$2"; DOMAIN_TIMEOUT="$2"; shift 2 ;;
             --rate-limit)     _require_int "$1" "$2"; RATE_LIMIT="$2"; shift 2 ;;
             --timeout)        _require_int "$1" "$2"; CHECKPOINT_TIMEOUT="$2"; shift 2 ;;
             --output)         OUTPUT_DIR="$2"; shift 2 ;;
@@ -274,6 +315,7 @@ parse_args() {
                 echo "  --threads N               Thread count (default: 50)"
                 echo "  --parallel-hosts N         Hosts crawled in parallel per tool (default: 5)"
                 echo "  --parallel-domains N       Root domains processed in parallel in Phase 1 (default: 3)"
+                echo "  --domain-timeout N        Per-domain wall-clock cap in seconds (default: 5400; 0=off)"
                 echo "  --rate-limit N            Requests/second (default: 100)"
                 echo "  --timeout N               Checkpoint auto-continue seconds (default: 30)"
                 echo "  --output DIR              Output directory (default: /output)"

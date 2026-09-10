@@ -360,6 +360,14 @@ canonical_dns_resolve_pending() {
 
     log_success "Canonical DNS: resolved=$resolved, nxdomain=$nxdomain, timeout=$timeout, bogon=$bogon, pending=$still_pending"
 
+    # Expose last-pass counts so callers can detect a dead-DNS environment
+    # (fake-IP VPN or unreachable resolvers: nothing resolves, everything
+    # bogon/timeout). Set in the current shell (this is a function, not a
+    # subshell) so the calling stage can read them right after.
+    CANONICAL_LAST_RESOLVED=$resolved
+    CANONICAL_LAST_BOGON=$bogon
+    CANONICAL_LAST_TIMEOUT=$timeout
+
     if [[ "$bogon" -gt 0 ]]; then
         log_warn "Canonical DNS: $bogon host(s) resolved to reserved/bogon IPs (e.g. 198.18.x.x fake-IP VPN, RFC1918). Excluded from downstream probing/nmap. Verify Docker DNS bypasses fake-ip mode."
     fi
