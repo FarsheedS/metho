@@ -521,7 +521,10 @@ WORDBASE
     # in no passive source, CT log, or archive.
     log_info "Stage 4b: Subdomain permutation (dnsgen)"
 
-    if [[ "$_dns_dead" == 1 ]]; then
+    if [[ "${SKIP_PERMUTATION:-false}" == true ]]; then
+        log_skip "  dnsgen skipped (--skip-permutation): permutation brute force disabled"
+        : > dnsgen_results.txt
+    elif [[ "$_dns_dead" == 1 ]]; then
         log_skip "  dnsgen skipped for $domain (DNS broken — permutations cannot resolve)"
         : > dnsgen_results.txt
     elif command -v dnsgen &>/dev/null; then
@@ -548,7 +551,7 @@ WORDBASE
         #       (resolved hosts prioritized: they reveal live naming
         #       patterns) and bound the candidate volume.
         # 0 disables the skip (a threshold of 0 would otherwise skip always)
-        local _dnsgen_skip="${DNSGEN_SKIP_THRESHOLD:-1500}"
+        local _dnsgen_skip="${DNSGEN_SKIP_THRESHOLD:-100}"
         [[ "$_dnsgen_skip" -eq 0 ]] && _dnsgen_skip=$((1<<62))
         local _dnsgen_max="${DNSGEN_MAX_INPUT:-500}"
         local _dnsgen_in_count=0

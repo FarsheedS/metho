@@ -277,6 +277,11 @@ CHECKPOINT_TIMEOUT=30
 OUTPUT_DIR="/output"
 CLOUD_ENUM_KEYWORDS=""
 PORT_SCAN=true
+# Hard off-switch for dnsgen permutation brute force (Stage 4b). Independent of
+# DNSGEN_SKIP_THRESHOLD: when true, permutation is skipped for every domain
+# regardless of size. Recommended for large multi-domain sweeps where the
+# permutation multiplier would dominate runtime for little yield.
+SKIP_PERMUTATION=false
 # How many live hosts to crawl in parallel within a per-host tool (CeWL,
 # Katana, SubDomainizer). These stages spend the vast majority of wall-clock
 # time crawling hosts one-by-one; a small bounded pool cuts that ~Nx with no
@@ -320,15 +325,16 @@ CLOUD_ENUM_TIMEOUT=900
 # are prioritized. Set to 0 to disable the cap.
 DNSGEN_MAX_INPUT=500
 
-# Skip dnsgen entirely for large targets: when a domain has more than
-# this many discovered subdomains, permutation is skipped. 1500 matches
-# reconftw's DEEP_LIMIT2 — the point where their pipeline hard-skips
-# permutations ("Too Many Subdomains") rather than degrading further.
-# Our own E2E agrees: a 29K-subdomain target capped to 500 inputs still
-# produced 561K candidates whose resolution ran 1h+ and starved the
-# host network stack, while a smaller target's 38K candidates resolved
-# ZERO. Set to 0 to never skip.
-DNSGEN_SKIP_THRESHOLD=1500
+# Skip dnsgen entirely when a domain has more than this many discovered
+# subdomains. Default is deliberately AGGRESSIVE (100): permutation multiplies
+# every input by ~800-1100 candidates, so even a "small" domain explodes (307
+# subs → 273K candidates in E2E), and empirical yield on non-tiny corpora is
+# ~0 while the DNS cost is huge — a multiplier that is ruinous across a large
+# multi-domain sweep. So by default only genuinely tiny domains (≤100 subs)
+# permute; everything else relies on passive + brute coverage. Raise it for a
+# focused single-domain deep run, use --skip-permutation to disable entirely,
+# or set to 0 to never skip (permute every domain — not recommended at scale).
+DNSGEN_SKIP_THRESHOLD=100
 
 # Hard cap on dnsgen output size in bytes (default 25MB ≈ ~350K
 # candidates). Safety net against permutation explosion before the
@@ -382,6 +388,7 @@ parse_args() {
                               esac; shift 2 ;;
             --skip-cloud)     SKIP_PHASES+=("2"); shift ;;
             --no-port-scan)   PORT_SCAN=false; shift ;;
+            --skip-permutation) SKIP_PERMUTATION=true; shift ;;
             --threads)        _require_int "$1" "$2"; THREADS="$2"; shift 2 ;;
             --parallel-hosts) _require_int "$1" "$2"; PARALLEL_HOSTS="$2"; shift 2 ;;
             --parallel-domains) _require_int "$1" "$2"; PARALLEL_DOMAINS="$2"; shift 2 ;;
@@ -411,6 +418,7 @@ parse_args() {
                 echo "  --skip-phase {1,2,3}      Skip specific phase(s)"
                 echo "  --skip-cloud              Shorthand for --skip-phase 2"
                 echo "  --no-port-scan            Skip port scanning phase"
+                echo "  --skip-permutation        Disable dnsgen permutation brute force (Stage 4b) for all domains"
                 echo "  --threads N               Thread count (default: 50)"
                 echo "  --parallel-hosts N         Hosts crawled in parallel per tool (default: 5)"
                 echo "  --parallel-domains N       Root domains processed in parallel in Phase 1 (default: 3)"

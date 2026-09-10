@@ -54,6 +54,11 @@ log_info "Rate limit: ${RATE_LIMIT}/s"
 log_info "Parallel hosts (per-tool): ${PARALLEL_HOSTS}"
 log_info "Parallel domains (Phase 1): ${PARALLEL_DOMAINS}"
 log_info "Port scan:  ${PORT_SCAN} (nmap -sV cap: top ${NMAP_TOP_PORTS} ports)"
+if [[ "$SKIP_PERMUTATION" == true ]]; then
+    log_info "Permutation: DISABLED (--skip-permutation)"
+else
+    log_info "Permutation: dnsgen enabled (skip if > ${DNSGEN_SKIP_THRESHOLD} subdomains)"
+fi
 [[ -n "$SUBFASTER_PROVIDER_CONFIG" ]] && log_info "Subfaster config: ${SUBFASTER_PROVIDER_CONFIG}"
 [[ -n "$PASSIVE_PROXY" ]] && log_info "Passive proxy: ${PASSIVE_PROXY} (crt.name, GitHub, subfaster, waymore only — scanning stays direct)"
 [[ -n "$ASN_CONFIG_FILE" ]] && log_info "ASN config: ${ASN_CONFIG_FILE}"

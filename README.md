@@ -170,6 +170,8 @@ Options:
   --proxy URL               Proxy for PASSIVE sources only — crt.name, GitHub, subfaster,
                             waymore. Target DNS/HTTPX/Nmap stay on the direct network.
                             e.g. socks5h://host.docker.internal:12334 or http://host.docker.internal:8080
+  --resolvers FILE          DNS resolver list, health-checked at startup so only resolvers
+                            reachable from this network are used (default: built-in list)
   --asn-config FILE         Path to ASN provider classification config (default: built-in)
   --waymore-mode MODE       Waymore mode: U (URLs, default) or B (URLs+responses). R
                             (responses only) is not supported — the pipeline consumes URL output
@@ -177,6 +179,8 @@ Options:
   --skip-phase {1,2,3}      Skip specific phase(s) — value is validated
   --skip-cloud              Shorthand for --skip-phase 2
   --no-port-scan            Skip the port-scan stage inside Phase 3 (classification still runs)
+  --skip-permutation        Disable dnsgen permutation brute force (Stage 4b) for all domains
+                            (recommended for large multi-domain sweeps)
   --threads N               Threads for dnsx and Cloud_Enum (default: 50)
   --parallel-hosts N        Hosts crawled in parallel per per-host tool (default: 5)
   --parallel-domains N      Root domains processed in parallel in Phase 1 (default: 3)
