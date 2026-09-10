@@ -107,14 +107,17 @@ crtname_query() {
         return
     fi
 
-    # Extract "sub" fields from JSON, normalize, filter to in-scope, deduplicate
+    # Extract "sub" fields from JSON, normalize, filter to in-scope, deduplicate.
+    # Normalization is a SINGLE streamed pass (strip *. and trailing dot, then
+    # lowercase) — the previous per-line shell loop forked sed+tr per hostname
+    # and cost minutes on large-CT apexes (~28k names for vodafone.com, far
+    # worse under amd64 emulation). Mirrors canonical_dns_add_sources' batch idiom.
     local escaped_domain="${domain//./\\.}"
-    jq -r '.[].sub // empty' "$raw_file" 2>/dev/null | \
-        while IFS= read -r raw_host; do
-            normalize_hostname "$raw_host"
-        done | \
-        grep -E "(^|\.)${escaped_domain}$" | \
-        sort -u > "$output_file"
+    jq -r '.[].sub // empty' "$raw_file" 2>/dev/null \
+        | sed 's/^\*\.//;s/\.$//' \
+        | tr '[:upper:]' '[:lower:]' \
+        | grep -E "(^|\.)${escaped_domain}$" \
+        | sort -u > "$output_file"
 
     local count=0
     [[ -s "$output_file" ]] && count=$(wc -l < "$output_file")
