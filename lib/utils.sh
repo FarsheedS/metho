@@ -111,11 +111,15 @@ _health_check_resolvers() {
 
     # -P 400, single probe domain, 2s timeout: worst case (13K entries, all
     # dead) finishes in ~2 min (13K / 400 × 2 attempts × 2s), live lists in
-    # seconds. One probe domain is enough — we only care whether the resolver
-    # answers AT ALL from this vantage point.
+    # seconds. Probe domain is deliberately whoami.akamai.net, NOT a common
+    # name like one.one.one.one: some DNS-security appliances sinkhole known
+    # DoH-endpoint hostnames (one.one.one.one → a local 10.x IP) for ANY
+    # destination resolver, which makes every dead resolver look alive.
+    # whoami.akamai.net is answered only by genuine recursive resolvers (the
+    # answer embeds the resolver's own egress IP), so the result is honest.
     grep -vE '^[[:space:]]*(#|$)' "$src" \
         | xargs -P 400 -I RV sh -c '
-            if printf "one.one.one.one\n" \
+            if printf "whoami.akamai.net\n" \
                  | dnsx -silent -a -r "$1" -timeout 2 -retry 1 2>/dev/null | grep -q .; then
                 echo "$1"
             fi' _ RV 2>/dev/null \
@@ -150,12 +154,14 @@ _health_check_resolvers() {
 # Find a working system resolver and echo its IP (empty if none answers).
 # Tries Docker's embedded DNS (127.0.0.11) first — inside a container it
 # forwards to the host's resolv.conf — then the host-facing resolv.conf entries.
+# Probe domain: whoami.akamai.net (see _health_check_resolvers) — immune to
+# DoH-endpoint sinkholing that would fake-OK a dead path.
 _probe_system_resolver() {
     local candidate ip
     for candidate in 127.0.0.11 $(grep -E '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}'); do
         [[ -z "$candidate" ]] && continue
         if [[ -s /etc/resolv.conf ]] || [[ "$candidate" == "127.0.0.11" ]]; then
-            if printf 'one.one.one.one\n' \
+            if printf 'whoami.akamai.net\n' \
                 | dnsx -silent -a -r "$candidate" -timeout 3 -retry 1 2>/dev/null | grep -q .; then
                 echo "$candidate"
                 return 0
