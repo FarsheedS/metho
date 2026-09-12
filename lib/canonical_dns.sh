@@ -183,11 +183,29 @@ canonical_dns_add_sources() {
 }
 
 # ── Resolve pending hostnames via DNSx ─────────────────────────────────────────
-# canonical_dns_resolve_pending [extra_flags...]
+# canonical_dns_resolve_pending [include_timeouts]
 #
 # Extracts all hostnames with resolution_status=pending, runs them through
 # dnsx for A/AAAA/CNAME resolution, and updates the TSV in-place.
 # Any extra flags (e.g., -r resolvers.txt) are passed through to dnsx.
+#
+# With the argument "include_timeouts" (and only if DNS has been seen working
+# in this run — METHO_DNS_WORKING=1), previously-timed-out hosts are retried
+# once more. Used by the FINAL passes (Phase 1 Stage 7, Phase 3 Stage 1) so
+# hosts lost to a transient resolver slowdown get a second chance without
+# re-grinding the whole corpus on every delta round.
+#
+# Robustness:
+#   * Effective dnsx wall-clock cap scales with the batch size
+#     (max(DNSX_TIMEOUT, pending/50), capped at 3600s) — a fixed 600s cap on a
+#     300K-host batch killed dnsx mid-run and permanently mislabeled every
+#     unprocessed host as "timeout" (never retried: only "pending" re-resolves).
+#   * Total-failure fallback: if dnsx returns NOTHING for the batch, the
+#     system resolver (Docker's 127.0.0.11 / resolv.conf) is probed and, if it
+#     answers, the whole batch is retried through it. Covers networks that
+#     block direct UDP/53 to external resolvers (corporate VPN etc.) while
+#     their own resolver keeps working — no startup health-check can catch a
+#     network that breaks (or recovers) mid-run.
 canonical_dns_resolve_pending() {
     local tsv="${CANONICAL_DNS_TSV:-${OUTPUT_DIR}/canonical_dns.tsv}"
     local pending_file="${tsv}.pending_hosts"
@@ -198,8 +216,13 @@ canonical_dns_resolve_pending() {
         return
     fi
 
-    # Extract pending hostnames
-    awk -F'\t' '$7 == "pending" {print $1}' "$tsv" > "$pending_file"
+    # Extract pending hostnames — plus, on final passes, timed-out ones (retry)
+    # but only when DNS has been seen working this run.
+    if [[ "${1:-}" == "include_timeouts" && "${METHO_DNS_WORKING:-0}" == "1" ]]; then
+        awk -F'\t' '$7 == "pending" || $7 == "timeout" {print $1}' "$tsv" > "$pending_file"
+    else
+        awk -F'\t' '$7 == "pending" {print $1}' "$tsv" > "$pending_file"
+    fi
 
     local pending_count=0
     [[ -s "$pending_file" ]] && pending_count=$(wc -l < "$pending_file")
@@ -226,9 +249,17 @@ canonical_dns_resolve_pending() {
         return 1
     fi
 
+    # Scale the wall-clock cap with batch size: a fixed 600s cap killed dnsx
+    # mid-batch on large corpora and permanently mislabeled unprocessed hosts
+    # as "timeout". 1s per 50 hosts ≈ 2.5× headroom at ~2000 q/s, capped at 1h.
+    local eff_timeout="${DNSX_TIMEOUT:-600}"
+    local _scaled=$(( pending_count / 50 ))
+    (( _scaled > eff_timeout )) && eff_timeout=$_scaled
+    (( eff_timeout > 3600 )) && eff_timeout=3600
+
     : > "$dnsx_json"
 
-    cat "$pending_file" | timeout "${DNSX_TIMEOUT:-600}" dnsx \
+    cat "$pending_file" | timeout "$eff_timeout" dnsx \
         -silent -a -aaaa -cname -json -retry 2 \
         -r "${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt}" \
         -timeout 5 \
@@ -246,6 +277,26 @@ canonical_dns_resolve_pending() {
             log_warn "dnsx failed to resolve ${_failed_n}/${pending_count} hosts — if this is ALL of them, the resolvers list (wordlists/resolvers.txt) is likely unreachable from this network"
         fi
     fi
+
+    # ── Total-failure fallback: retry the batch through the system resolver ──
+    # Zero results for a non-empty batch means the configured resolvers are
+    # unreachable (blocked UDP/53, dead custom list, network flap). If the
+    # network's own resolver answers, redo the batch through it — a working
+    # pipeline beats a dead one. (No-op when RESOLVERS_FILE already IS the
+    # system resolver, e.g. after a custom-list health-check fallback.)
+    if [[ ! -s "$dnsx_json" ]]; then
+        local sys_dns
+        sys_dns=$(_probe_system_resolver)
+        if [[ -n "$sys_dns" && "$sys_dns" != "${RESOLVERS_FILE:-}" ]]; then
+            log_warn "Canonical DNS: dnsx returned 0 results for ${pending_count} hosts — retrying via system resolver (${sys_dns}) ..."
+            cat "$pending_file" | timeout "$eff_timeout" dnsx \
+                -silent -a -aaaa -cname -json -retry 2 \
+                -r "$sys_dns" \
+                -timeout 5 \
+                2>>"${dnsx_json}.stderr" >> "$dnsx_json" || true
+        fi
+    fi
+
     rm -f "${dnsx_json}.stderr"
 
     # Single-pass merge: stream the TSV once, applying the dnsx results held
@@ -367,6 +418,12 @@ canonical_dns_resolve_pending() {
     CANONICAL_LAST_RESOLVED=$resolved
     CANONICAL_LAST_BOGON=$bogon
     CANONICAL_LAST_TIMEOUT=$timeout
+    # Remember across the whole run that DNS has worked at least once. Final
+    # passes use this to decide whether retrying "timeout" hosts is worthwhile
+    # (never true if nothing has EVER resolved — the network is just dead).
+    if [[ "$resolved" -gt 0 ]]; then
+        METHO_DNS_WORKING=1
+    fi
 
     if [[ "$bogon" -gt 0 ]]; then
         log_warn "Canonical DNS: $bogon host(s) resolved to reserved/bogon IPs (e.g. 198.18.x.x fake-IP VPN, RFC1918). Excluded from downstream probing/nmap. Verify Docker DNS bypasses fake-ip mode."
@@ -601,6 +658,12 @@ merge_per_domain_dns() {
         local entry_count=0
         [[ -s "$global_tsv" ]] && entry_count=$(tail -n +2 "$global_tsv" | wc -l)
         log_success "Merged canonical DNS: $entry_count entries from ${#per_domain_tsvs[@]} per-domain TSVs"
+        # METHO_DNS_WORKING is set inside the per-domain subshells during Phase 1
+        # and does not survive into this (parent) shell — re-derive it from the
+        # merged dataset so Phase 3's final timeout-retry pass knows DNS worked.
+        if awk -F'\t' 'NR>1 && $7 == "resolved" { found=1; exit } END { exit !found }' "$global_tsv"; then
+            METHO_DNS_WORKING=1
+        fi
     else
         log_warn "No per-domain canonical_dns.tsv files found to merge"
     fi

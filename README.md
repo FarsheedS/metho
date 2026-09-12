@@ -170,8 +170,11 @@ Options:
   --proxy URL               Proxy for PASSIVE sources only — crt.name, GitHub, subfaster,
                             waymore. Target DNS/HTTPX/Nmap stay on the direct network.
                             e.g. socks5h://host.docker.internal:12334 or http://host.docker.internal:8080
-  --resolvers FILE          DNS resolver list, health-checked at startup so only resolvers
-                            reachable from this network are used (default: built-in list)
+  --resolvers FILE|URL      DNS resolver list (file path or http(s) URL). The built-in list
+                            (~12.7K validated trickest resolvers) is used as-is with no
+                            health-check — dnsx retries across the pool, so dead entries in a
+                            large list cost nothing. A custom list IS health-checked at startup;
+                            only resolvers answering from this network are kept.
   --asn-config FILE         Path to ASN provider classification config (default: built-in)
   --waymore-mode MODE       Waymore mode: U (URLs, default) or B (URLs+responses). R
                             (responses only) is not supported — the pipeline consumes URL output
@@ -293,7 +296,7 @@ Some tools can stall on misbehaving hosts. Each one has a configurable wall-cloc
 | `KATANA_TIMEOUT` | `600` | Katana crawl in Phase 1 (per live host) |
 | `KATANA_CRAWL_DURATION` | `15m` | Katana per-host wall-clock cap (Phase 1) |
 | `SUBDOMAINIZER_TIMEOUT` | `300` | SubDomainizer JS scan (per live host) |
-| `DNSX_TIMEOUT` | `600` | DNSx bulk resolution |
+| `DNSX_TIMEOUT` | `600` | DNSx bulk resolution — floor value; the effective cap auto-scales with batch size (max of this and pending-hosts/50, capped at 3600s) so large corpora are never cut off mid-batch |
 | `CLOUD_ENUM_TIMEOUT` | `900` | Cloud_Enum keyword mutation (single call per Phase 2 run) |
 | `CEWL_TIMEOUT` | `600` | CeWL word-crawl (per live host) |
 | `CEWL_DEPTH` | `2` | CeWL spider depth on first pass (retries at depth 1 on failure) |
@@ -302,7 +305,7 @@ Some tools can stall on misbehaving hosts. Each one has a configurable wall-cloc
 | `GITHUB_SUBDOMAINS_TIMEOUT` | `300` | GitHub-subdomains code search (per root domain) |
 | `DNSGEN_TIMEOUT` | `120` | dnsgen permutation generation |
 | `DNSGEN_MAX_INPUT` | `500` | Max subdomains fed to dnsgen (resolved hosts prioritized; 0 disables) |
-| `DNSGEN_SKIP_THRESHOLD` | `1500` | Domains with more discovered subs than this skip dnsgen entirely (large targets: ~0 yield, hours of DNS; 0 disables) |
+| `DNSGEN_SKIP_THRESHOLD` | `100` | Domains with more discovered subs than this skip dnsgen entirely (large targets: ~0 yield, hours of DNS; 0 disables) |
 | `DNSGEN_MAX_OUTPUT_BYTES` | `26214400` | Hard cap on dnsgen permutation output size (25MB) |
 | `NAABU_TIMEOUT` | `600` | Naabu fast port scan |
 | `NAABU_TOP_PORTS` | `1000` | Naabu top-N ports to scan |
@@ -556,6 +559,7 @@ The build uses a multi-stage Dockerfile:
 
 ## Tips
 
+- **DNS resolvers.** Metho ships a static ~12.7K-resolver list (trickest) and uses it as-is — dnsx round-robins the pool and each retry moves to the next resolver, so dead entries in a large list cost nothing. If your network blocks direct UDP/53 to external resolvers (common on corporate/VPN networks), pass `--resolvers FILE|URL` with resolvers that work from your vantage point (custom lists are health-checked first) — or rely on the automatic fallback: when a resolution batch returns zero results, the pipeline retries it through the container's system resolver. On very large sweeps through a single corporate resolver, consider running a local DoH forwarder (e.g. `cloudflared proxy-dns`) and pointing `--resolvers` at it.
 - **Rate limiting matters.** If httpx is getting timeouts or empty results, lower `--rate-limit` (e.g., 50 or 25) — note this flag affects httpx only.
 - **ASN occurrence matters.** In `final_asn_summary.txt`, ASNs with fewer IPs are more interesting — they may represent niche hosting or forgotten infrastructure.
 - **Cloud enum keywords.** By default, the base name of each root domain is used as a keyword. Use `--cloud-enum-keywords` to add extra keywords.

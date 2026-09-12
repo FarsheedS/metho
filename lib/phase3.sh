@@ -24,8 +24,11 @@ run_phase3() {
     # ── Stage 1: Extract IPs from Canonical DNS Dataset ─────────────────────
     log_info "Stage 1: Extracting IPs from canonical DNS dataset"
 
-    # Final resolution pass — resolve any hostnames still pending
-    canonical_dns_resolve_pending
+    # Final resolution pass — resolve any hostnames still pending, and retry
+    # ones lost to transient timeouts earlier in the run (the include_timeouts
+    # mode only fires if DNS has actually worked at some point, so a dead
+    # network never triggers a pointless re-grind).
+    canonical_dns_resolve_pending include_timeouts
 
     # Extract the domain→IP mapping from the canonical DNS dataset
     local dns_tsv="${CANONICAL_DNS_TSV:-${OUTPUT_DIR}/canonical_dns.tsv}"

@@ -274,10 +274,17 @@ process_domain() {
     # ── Stage 3: Consolidate + DNSx Canonical Resolution + HTTPx Round 1 ────
     log_info "Stage 3: Consolidating passive results + DNSx resolution + HTTPx Round 1"
 
-    # Merge all discovered subdomains so far
+    # Merge all discovered subdomains so far. ALL Stage-1 sources must be here:
+    # this file drives the "passive enumeration" count, dnsgen's input, and
+    # Stage 5's new-subdomains delta (comm -13). github and axfr results were
+    # previously missing — they were in the canonical dataset but absent here,
+    # so dnsgen never permuted them and Stage 5 miscounted them as
+    # "new from brute force".
     cat \
         subfaster_results.txt \
         crtname_results.txt \
+        github_subdomains.txt \
+        axfr_subdomains.txt \
         waymore_subdomains.txt \
         2>/dev/null | sort -u > all_subdomains_round1.txt || true
 
@@ -892,8 +899,10 @@ WORDBASE
     # Add any newly discovered subdomains from crawling to the canonical dataset
     [[ -s all_subdomains_final.txt ]] && canonical_dns_add_sources "final" "all_subdomains_final.txt" "$domain"
 
-    # Resolve any remaining pending hostnames
-    canonical_dns_resolve_pending
+    # Resolve any remaining pending hostnames. Final pass: also retry hosts
+    # lost to transient timeouts (only if DNS has worked this run — guarded
+    # inside the function via METHO_DNS_WORKING).
+    canonical_dns_resolve_pending include_timeouts
 
     # Probe ONLY the subdomains discovered since Round 2 (crawling
     # candidates that aren't already probed). Merge their live URLs with

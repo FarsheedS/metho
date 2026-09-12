@@ -34,10 +34,10 @@ init_canonical_dns
 # Load the ASN provider configuration for deterministic IP classification
 load_asn_config
 
-# Health-check the DNS resolvers up-front: keep only the ones reachable from
-# this network so every dnsx stage resolves accurately instead of timing out on
-# dead resolvers. Sets RESOLVERS_FILE (used by all dnsx calls).
-build_live_resolvers
+# Load the DNS resolver list: built-in static trickest list used as-is (no
+# health-check — dnsx retries across the pool), a custom --resolvers FILE|URL
+# health-checked before use. Sets RESOLVERS_FILE (used by all dnsx calls).
+load_resolvers
 
 # Banner
 echo ""

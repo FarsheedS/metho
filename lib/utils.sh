@@ -41,18 +41,66 @@ _safe_name() {
     printf '%s' "$1" | tr -c '[:alnum:].-' '_'
 }
 
-# ── Resolver health-check ────────────────────────────────────────────────────
-# Probe every resolver in RESOLVERS_SOURCE and keep only those that actually
-# answer from THIS network, writing the survivors to $OUTPUT_DIR/live_resolvers.txt
-# and pointing RESOLVERS_FILE at it. A "trusted" public list (e.g. trickest) is
-# validated from the author's vantage point, not yours — on a restricted network
-# most of its entries are unreachable and every dnsx query that lands on a dead
-# resolver just times out (the "resolved=few, timeout=most, nxdomain=0" pattern).
-# Pruning to live resolvers up-front makes resolution both accurate and fast, and
-# adapts automatically to whatever network Metho runs on. Falls back to the full
-# source list if the probe cannot run or nothing responds.
-build_live_resolvers() {
+# ── Resolver loading ─────────────────────────────────────────────────────────
+# RESOLVERS_FILE is used by every dnsx call. Two paths:
+#
+#   * Built-in static list (wordlists/resolvers.txt, ~12.7K trickest entries):
+#     used as-is with NO health-check. retryabledns (dnsx's engine) round-robins
+#     resolvers and each retry automatically moves to the NEXT resolver in the
+#     list (client.go: Do → index%len(resolvers) → continue on error), so dead
+#     entries in a large mostly-alive list cost nothing: a query only fails if
+#     it lands on ≥ MaxRetries+1 consecutive dead resolvers. Health-checking
+#     12K+ resolvers at startup would burn minutes for zero benefit.
+#   * Custom list via --resolvers FILE or URL: if the value is an http(s) URL it
+#     is downloaded first. A user-supplied list may be mostly dead (which DOES
+#     tank throughput — success rate ≈ alive_fraction^(retries+1)), so it IS
+#     health-checked, at high parallelism so even 13K entries take ~2 min. If
+#     nothing survives, fall back to the system resolver (which answers where
+#     corporate firewalls block external UDP/53) rather than a dead list.
+#
+# Also detects total-DNS-failure AT RUNTIME (system-resolver fallback inside
+# canonical_dns_resolve_pending) — a network can break or recover mid-run, so a
+# startup check is the wrong place for that.
+load_resolvers() {
     local src="${RESOLVERS_SOURCE:-/opt/scripts/wordlists/resolvers.txt}"
+    RESOLVERS_FILE="$src"
+
+    # Accept a URL for --resolvers: download once, use the local copy.
+    if [[ "$src" =~ ^https?:// ]]; then
+        local dl="${OUTPUT_DIR}/resolvers_custom.txt"
+        log_info "Downloading resolver list from $src ..."
+        if curl -sL --max-time 120 -o "$dl" "$src" && [[ -s "$dl" ]]; then
+            src="$dl"
+            RESOLVERS_FILE="$src"
+            log_success "Resolver list downloaded: $(grep -cvE '^[[:space:]]*(#|$)' "$src") resolvers → $src"
+        else
+            log_error "Failed to download resolver list from $src — falling back to built-in list"
+            src="${RESOLVERS_SOURCE_BUILTIN:-/opt/scripts/wordlists/resolvers.txt}"
+            RESOLVERS_FILE="$src"
+        fi
+    fi
+
+    if [[ ! -s "$src" ]]; then
+        log_warn "Resolver list missing/empty: $src — DNS resolution will likely fail"
+        return
+    fi
+
+    # Built-in static list → trust it, no health-check (see rationale above).
+    if [[ "$src" == "${RESOLVERS_SOURCE_BUILTIN:-/opt/scripts/wordlists/resolvers.txt}" ]]; then
+        log_info "Resolvers: using built-in list ($(grep -cvE '^[[:space:]]*(#|$)' "$src") entries, no health-check — dnsx retries across the pool)"
+        return
+    fi
+
+    # Custom list → health-check it, then use only the survivors.
+    log_info "Custom resolver list: health-checking $(grep -cvE '^[[:space:]]*(#|$)' "$src") resolvers ..."
+    _health_check_resolvers "$src"
+}
+
+# Probe every resolver in $1 and keep only those that answer from THIS network,
+# writing survivors to $OUTPUT_DIR/live_resolvers.txt and pointing
+# RESOLVERS_FILE at it. Falls back to the system resolver if nothing survives.
+_health_check_resolvers() {
+    local src="$1"
     local out="${OUTPUT_DIR}/live_resolvers.txt"
     RESOLVERS_FILE="$src"
 
@@ -60,35 +108,61 @@ build_live_resolvers() {
         log_warn "Resolver health-check skipped (dnsx not found); using $src as-is"
         return
     fi
-    if [[ ! -s "$src" ]]; then
-        log_warn "Resolver source list missing/empty: $src — DNS resolution will likely fail"
-        return
-    fi
 
-    local total
-    total=$(grep -cvE '^[[:space:]]*(#|$)' "$src" 2>/dev/null || echo 0)
-    log_info "Health-checking $total DNS resolvers (keeping only those reachable from this network)..."
-
-    # Probe each resolver in parallel: it is "live" if it answers an A query for
-    # a stable, always-resolvable probe domain. IP-only input, so passing the
-    # resolver as an argument to sh -c is safe.
+    # -P 400, single probe domain, 2s timeout: worst case (13K entries, all
+    # dead) finishes in ~2 min (13K / 400 × 2 attempts × 2s), live lists in
+    # seconds. One probe domain is enough — we only care whether the resolver
+    # answers AT ALL from this vantage point.
     grep -vE '^[[:space:]]*(#|$)' "$src" \
-        | xargs -P 20 -I RV sh -c '
-            if printf "one.one.one.one\ncloudflare.com\n" \
-                 | dnsx -silent -a -r "$1" -timeout 3 -retry 1 2>/dev/null | grep -q .; then
+        | xargs -P 400 -I RV sh -c '
+            if printf "one.one.one.one\n" \
+                 | dnsx -silent -a -r "$1" -timeout 2 -retry 1 2>/dev/null | grep -q .; then
                 echo "$1"
             fi' _ RV 2>/dev/null \
         | sort -u > "$out" || true
 
-    local live=0
+    local live=0 total
     [[ -s "$out" ]] && live=$(wc -l < "$out")
+    total=$(grep -cvE '^[[:space:]]*(#|$)' "$src" 2>/dev/null || echo 0)
     if [[ "$live" -gt 0 ]]; then
         RESOLVERS_FILE="$out"
         log_success "Resolver health-check: ${live}/${total} resolvers live — using $out"
     else
-        log_warn "Resolver health-check: none of the ${total} resolvers responded — keeping full list ($src). DNS is likely broken on this network (VPN/TUN? blocked UDP/53?)."
-        RESOLVERS_FILE="$src"
+        # Nothing survived: prefer the network's own resolver over a dead list.
+        # On corporate/home networks that force all DNS through internal
+        # resolvers (direct UDP/53 to external IPs firewalled), the system
+        # resolver still works — inside Docker at 127.0.0.11, or whatever
+        # /etc/resolv.conf names the host configured.
+        local sys_dns
+        sys_dns=$(_probe_system_resolver)
+        if [[ -n "$sys_dns" ]]; then
+            echo "$sys_dns" > "$out"
+            RESOLVERS_FILE="$out"
+            log_warn "Resolver health-check: none of the ${total} custom resolvers responded — falling back to the system resolver (${sys_dns}), which answered the probe."
+            log_warn "  Expect lower throughput (one resolver, possibly rate-limited)."
+        else
+            log_warn "Resolver health-check: none of the ${total} resolvers responded and the system resolver is also dead — keeping full list ($src)."
+            RESOLVERS_FILE="$src"
+        fi
     fi
+}
+
+# Find a working system resolver and echo its IP (empty if none answers).
+# Tries Docker's embedded DNS (127.0.0.11) first — inside a container it
+# forwards to the host's resolv.conf — then the host-facing resolv.conf entries.
+_probe_system_resolver() {
+    local candidate ip
+    for candidate in 127.0.0.11 $(grep -E '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}'); do
+        [[ -z "$candidate" ]] && continue
+        if [[ -s /etc/resolv.conf ]] || [[ "$candidate" == "127.0.0.11" ]]; then
+            if printf 'one.one.one.one\n' \
+                | dnsx -silent -a -r "$candidate" -timeout 3 -retry 1 2>/dev/null | grep -q .; then
+                echo "$candidate"
+                return 0
+            fi
+        fi
+    done
+    echo ""
 }
 
 # ── Normalize a hostname ────────────────────────────────────────────────────
@@ -263,11 +337,15 @@ SUBFASTER_PROVIDER_CONFIG="${SUBFASTER_PROVIDER_CONFIG:-}"
 # Proxy for passive OSINT sources only (see with_passive_proxy). Env-supplied
 # value is preserved so `-e PASSIVE_PROXY=...` works like the CLI flag.
 PASSIVE_PROXY="${PASSIVE_PROXY:-}"
-# DNS resolvers. RESOLVERS_SOURCE is the candidate list; at startup it is
-# health-checked and only the resolvers that actually answer from THIS network
-# are kept in RESOLVERS_FILE (see build_live_resolvers). Every dnsx call uses
-# RESOLVERS_FILE. Override the source list with --resolvers.
-RESOLVERS_SOURCE="${RESOLVERS_SOURCE:-/opt/scripts/wordlists/resolvers.txt}"
+# DNS resolvers. RESOLVERS_SOURCE is the candidate list: the built-in static
+# file (trickest ~12.7K) is used as-is with no health-check — retryabledns
+# round-robins and each retry moves to the next resolver, so dead entries in a
+# large list cost nothing. A custom list passed via --resolvers (FILE or URL)
+# IS health-checked, since an arbitrary list can be mostly dead and destroy
+# throughput. Every dnsx call uses RESOLVERS_FILE. Total runtime failure falls
+# back to the system resolver inside canonical_dns_resolve_pending.
+RESOLVERS_SOURCE_BUILTIN="/opt/scripts/wordlists/resolvers.txt"
+RESOLVERS_SOURCE="${RESOLVERS_SOURCE:-${RESOLVERS_SOURCE_BUILTIN}}"
 RESOLVERS_FILE="${RESOLVERS_SOURCE}"
 AUTO=false
 SKIP_PHASES=()
@@ -410,8 +488,10 @@ parse_args() {
                 echo "  --proxy URL               Proxy for PASSIVE sources only (crt.name, GitHub,"
                 echo "                            subfaster, waymore). Scanning/DNS/Nmap stay direct."
                 echo "                            e.g. socks5h://host.docker.internal:12334 or http://host.docker.internal:8080"
-                echo "  --resolvers FILE          DNS resolver list to health-check at startup (default: built-in)."
-                echo "                            Only resolvers reachable from this network are used."
+                echo "  --resolvers FILE|URL      DNS resolver list (file path or http(s) URL, default:"
+                echo "                            built-in ~12.7K trickest list, used as-is with no"
+                echo "                            health-check — dnsx retries across the pool). A custom"
+                echo "                            list IS health-checked; survivors only."
                 echo "  --asn-config FILE         Path to ASN provider classification config (default: built-in)"
                 echo "  --waymore-mode MODE       Waymore mode: U (URLs, default) or B (URLs+responses)"
                 echo "  --auto                    Skip all checkpoint prompts"

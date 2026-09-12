@@ -64,11 +64,33 @@ run_phase2() {
                 local dnsx_cloud_count=0
                 [[ -s "${pdir}/dnsx_cloud_domains.txt" ]] && dnsx_cloud_count=$(wc -l < "${pdir}/dnsx_cloud_domains.txt")
 
-                # Extract newly discovered hostnames from CNAME chains and add
-                # to the canonical dataset. CNAME targets (e.g. s3-bucket.s3.amazonaws.com)
-                # are the primary source of new cloud hosts.
+                # Extract hostnames from the DNS records. Only IN-SCOPE ones
+                # (suffix of a user-supplied root domain) may enter the
+                # canonical dataset: records include third-party values (SPF
+                # "include:_spf.google.com", MX "aspmx.l.google.com", CNAME
+                # targets like "d3vfd.s3.amazonaws.com") that are cloud
+                # SIGNALS, not attack-surface hosts. Unfiltered, their IPs
+                # flowed into Phase 3 classification → nmap_candidates and got
+                # PORT-SCANNED — out-of-scope scanning against third parties.
+                # The full unfiltered list is kept (dnsx_all_domains.txt) and
+                # the cloud-relevant subset is reported via
+                # filter_cloud_domains above; only scope-matching hostnames
+                # are resolved/tracked below.
                 extract_domains "${pdir}/dnsx_all_records.txt" "${pdir}/dnsx_all_domains.txt" || true
-                [[ -s "${pdir}/dnsx_all_domains.txt" ]] && canonical_dns_add_sources "dnsx-cloud" "${pdir}/dnsx_all_domains.txt"
+                local in_scope_file="${pdir}/dnsx_in_scope_domains.txt"
+                : > "$in_scope_file"
+                if [[ -s "${pdir}/dnsx_all_domains.txt" && -s "${ROOT_DOMAINS_FILE:-/nonexistent}" ]]; then
+                    local rd
+                    while IFS= read -r rd; do
+                        [[ -z "$rd" ]] && continue
+                        rd=$(normalize_hostname "$rd")
+                        [[ -z "$rd" ]] && continue
+                        local escaped_rd="${rd//./\\.}"
+                        grep -E "(^|\.)${escaped_rd}$" "${pdir}/dnsx_all_domains.txt" >> "$in_scope_file" || true
+                    done < "$ROOT_DOMAINS_FILE"
+                    sort -u "$in_scope_file" -o "$in_scope_file"
+                fi
+                [[ -s "$in_scope_file" ]] && canonical_dns_add_sources "dnsx-cloud" "$in_scope_file"
 
                 # Resolve any newly discovered hostnames incrementally
                 canonical_dns_resolve_pending
