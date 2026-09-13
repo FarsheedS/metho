@@ -153,8 +153,15 @@ run_phase2() {
             done
             log_info "  Cloud_Enum keywords: $_kw_list (wall-clock cap ${CLOUD_ENUM_TIMEOUT:-1800}s)"
 
-            # Emit one -k per keyword.
-            local -a ce_args=(-nsf ${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt})
+            # Emit one -k per keyword. cloud_enum parses resolver files with
+            # dnspython (plain IPs only) — in DoH mode RESOLVERS_FILE contains
+            # doh: URLs it cannot read, so swap in a plain-IP file (system
+            # resolver) or drop the flag entirely (cloud_enum then uses its
+            # own default resolver).
+            local nsf_file
+            nsf_file=$(_plain_ip_resolver_file)
+            local -a ce_args=()
+            [[ -n "$nsf_file" ]] && ce_args+=(-nsf "$nsf_file")
             for kw in "${ce_kw[@]}"; do
                 ce_args+=(-k "$kw")
             done

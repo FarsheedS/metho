@@ -47,6 +47,7 @@ echo -e "${CYAN}╚════════════════════�
 echo ""
 log_info "Domains:    ${DOMAINS:-<not set>}"
 log_info "Domains file: ${DOMAINS_FILE:-<not set>}"
+log_info "DNS mode:   ${DNS_MODE:-udp}"
 log_info "Auto mode:  ${AUTO}"
 log_info "Output:     ${OUTPUT_DIR}"
 log_info "Threads:    ${THREADS}"

@@ -174,7 +174,15 @@ Options:
                             (~12.7K validated trickest resolvers) is used as-is with no
                             health-check — dnsx retries across the pool, so dead entries in a
                             large list cost nothing. A custom list IS health-checked at startup;
-                            only resolvers answering from this network are kept.
+                            only resolvers answering from this network are kept. Overrides
+                            --dns-mode.
+  --dns-mode {udp,doh}      udp (default): raw UDP/53 against the ~12.7K static pool — the
+                            normal behavior on networks that allow outbound UDP/53.
+                            doh: DNS-over-HTTPS to 3 trusted endpoints (Cloudflare 1.1.1.1,
+                            Google 8.8.8.8, Quad9 9.9.9.9) over TCP/443 — for networks that
+                            block or rate-limit outbound UDP/53 (corporate VPN split-DNS,
+                            ISP response-rate-limiting). Slower per-query than UDP+12K pool,
+                            but immune to UDP/53 filtering.
   --asn-config FILE         Path to ASN provider classification config (default: built-in)
   --waymore-mode MODE       Waymore mode: U (URLs, default) or B (URLs+responses). R
                             (responses only) is not supported — the pipeline consumes URL output
@@ -559,7 +567,7 @@ The build uses a multi-stage Dockerfile:
 
 ## Tips
 
-- **DNS resolvers.** Metho ships a static ~12.7K-resolver list (trickest) and uses it as-is — dnsx round-robins the pool and each retry moves to the next resolver, so dead entries in a large list cost nothing. If your network blocks direct UDP/53 to external resolvers (common on corporate/VPN networks), pass `--resolvers FILE|URL` with resolvers that work from your vantage point (custom lists are health-checked first) — or rely on the automatic fallback: when a resolution batch returns zero results, the pipeline retries it through the container's system resolver. On very large sweeps through a single corporate resolver, consider running a local DoH forwarder (e.g. `cloudflared proxy-dns`) and pointing `--resolvers` at it.
+- **DNS resolvers and transport.** Metho ships a static ~12.7K-resolver list (trickest) and uses it as-is over raw UDP/53 — dnsx round-robins the pool and each retry moves to the next resolver, so dead entries in a large list cost nothing. On networks that **block or tarpit outbound UDP/53** (corporate VPN split-DNS, ISP response-rate-limiting after bulk NXDOMAIN queries — both observed in practice), use `--dns-mode doh`: resolution then rides DNS-over-HTTPS on TCP/443 to three trusted endpoints (1.1.1.1, 8.8.8.8, 9.9.9.9), which no UDP filter can touch. DoH trades raw throughput (~50–300 q/s vs UDP's 1,000+) for reachability — plenty for passive corpora; keep `udp` mode for big brute-force wordlists on open networks. For full control, pass your own list via `--resolvers FILE|URL` (custom lists are health-checked first; an all-dead list falls back to the system resolver). As a last-resort runtime safety net, a resolution batch that returns zero results is retried through the container's system resolver.
 - **Rate limiting matters.** If httpx is getting timeouts or empty results, lower `--rate-limit` (e.g., 50 or 25) — note this flag affects httpx only.
 - **ASN occurrence matters.** In `final_asn_summary.txt`, ASNs with fewer IPs are more interesting — they may represent niche hosting or forgotten infrastructure.
 - **Cloud enum keywords.** By default, the base name of each root domain is used as a keyword. Use `--cloud-enum-keywords` to add extra keywords.

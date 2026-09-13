@@ -42,21 +42,31 @@ _safe_name() {
 }
 
 # ── Resolver loading ─────────────────────────────────────────────────────────
-# RESOLVERS_FILE is used by every dnsx call. Two paths:
+# RESOLVERS_FILE is used by every dnsx call. Three paths:
 #
-#   * Built-in static list (wordlists/resolvers.txt, ~12.7K trickest entries):
-#     used as-is with NO health-check. retryabledns (dnsx's engine) round-robins
-#     resolvers and each retry automatically moves to the NEXT resolver in the
-#     list (client.go: Do → index%len(resolvers) → continue on error), so dead
-#     entries in a large mostly-alive list cost nothing: a query only fails if
-#     it lands on ≥ MaxRetries+1 consecutive dead resolvers. Health-checking
+#   * --dns-mode udp (DEFAULT): built-in static list
+#     (wordlists/resolvers.txt, ~12.7K trickest entries) used as-is with NO
+#     health-check. retryabledns (dnsx's engine) round-robins resolvers and
+#     each retry automatically moves to the NEXT resolver in the list
+#     (client.go: Do → index%len(resolvers) → continue on error), so dead
+#     entries in a large mostly-alive list cost nothing: a query only fails
+#     if it lands on ≥ MaxRetries+1 consecutive dead resolvers. Health-checking
 #     12K+ resolvers at startup would burn minutes for zero benefit.
-#   * Custom list via --resolvers FILE or URL: if the value is an http(s) URL it
-#     is downloaded first. A user-supplied list may be mostly dead (which DOES
-#     tank throughput — success rate ≈ alive_fraction^(retries+1)), so it IS
-#     health-checked, at high parallelism so even 13K entries take ~2 min. If
-#     nothing survives, fall back to the system resolver (which answers where
-#     corporate firewalls block external UDP/53) rather than a dead list.
+#   * --dns-mode doh: three trusted IP-literal DoH endpoints (Cloudflare,
+#     Google, Quad9) in dnsx's native doh: URL format — verified in
+#     retryabledns resolver.go parseResolver() and documented at
+#     docs.projectdiscovery.io/tools/dnsx. Use on networks that block or
+#     tarpit raw UDP/53 (corporate VPN split-DNS, ISP response-rate-limiting)
+#     while TCP/443 stays open. IP literals avoid the chicken-and-egg of
+#     resolving the endpoint's hostname first; dnsx's DoH client skips TLS
+#     verification, so cert-name mismatches on bare IPs are not an issue.
+#   * Custom list via --resolvers FILE or URL (takes precedence over
+#     --dns-mode): if the value is an http(s) URL it is downloaded first. A
+#     user-supplied list may be mostly dead (which DOES tank throughput —
+#     success rate ≈ alive_fraction^(retries+1)), so it IS health-checked, at
+#     high parallelism so even 13K entries take ~2 min. If nothing survives,
+#     fall back to the system resolver (which answers where corporate
+#     firewalls block external UDP/53) rather than a dead list.
 #
 # Also detects total-DNS-failure AT RUNTIME (system-resolver fallback inside
 # canonical_dns_resolve_pending) — a network can break or recover mid-run, so a
@@ -85,15 +95,42 @@ load_resolvers() {
         return
     fi
 
-    # Built-in static list → trust it, no health-check (see rationale above).
+    # Built-in static list + doh mode → switch to the DoH endpoint file.
+    # (An explicit --resolvers file/URL wins over --dns-mode.)
     if [[ "$src" == "${RESOLVERS_SOURCE_BUILTIN:-/opt/scripts/wordlists/resolvers.txt}" ]]; then
-        log_info "Resolvers: using built-in list ($(grep -cvE '^[[:space:]]*(#|$)' "$src") entries, no health-check — dnsx retries across the pool)"
+        if [[ "${DNS_MODE:-udp}" == "doh" ]]; then
+            _load_doh_resolvers
+        else
+            log_info "Resolvers: using built-in list ($(grep -cvE '^[[:space:]]*(#|$)' "$src") entries, no health-check — dnsx retries across the pool)"
+        fi
         return
     fi
 
     # Custom list → health-check it, then use only the survivors.
     log_info "Custom resolver list: health-checking $(grep -cvE '^[[:space:]]*(#|$)' "$src") resolvers ..."
     _health_check_resolvers "$src"
+}
+
+# DoH mode: generate the 3-endpoint resolver file and probe it once so a
+# fully-blocked 443 is surfaced at startup (with a loud warning) instead of as
+# 28K timeouts mid-run. Failures are non-fatal: dnsx stages already degrade
+# gracefully, and 443 may recover mid-run.
+_load_doh_resolvers() {
+    local doh_file="${OUTPUT_DIR}/doh_resolvers.txt"
+    printf 'doh:https://1.1.1.1/dns-query:post\ndoh:https://8.8.8.8/dns-query:post\ndoh:https://9.9.9.9/dns-query:post\n' > "$doh_file"
+    RESOLVERS_FILE="$doh_file"
+
+    log_info "DoH mode: probing 3 endpoints (Cloudflare 1.1.1.1, Google 8.8.8.8, Quad9 9.9.9.9) over TCP/443 ..."
+    local answered
+    answered=$(printf 'whoami.akamai.net\n' \
+        | timeout 20 dnsx -silent -a -r "$doh_file" -timeout 5 -retry 1 2>/dev/null | grep -c . || true)
+
+    if [[ "${answered:-0}" -gt 0 ]]; then
+        log_success "DoH mode: ${answered}/3 endpoint(s) answered the probe — using $doh_file"
+    else
+        log_warn "DoH mode: none of the 3 DoH endpoints answered the probe — TCP/443 may be filtered on this network."
+        log_warn "  Continuing with the DoH file anyway; if 443 is truly dead every dnsx call will time out."
+    fi
 }
 
 # Probe every resolver in $1 and keep only those that answer from THIS network,
@@ -151,8 +188,36 @@ _health_check_resolvers() {
     fi
 }
 
+# Return a resolver file usable by NON-dnsx consumers (cloud_enum's dnspython
+# parses IPs only — doh:/tcp:/udp: URLs would crash it). Echoes RESOLVERS_FILE
+# when it contains only plain host[:port] entries; otherwise probes the system
+# resolver and returns a one-entry file (empty string if even that is dead).
+_plain_ip_resolver_file() {
+    local f="${RESOLVERS_FILE:-}"
+    if [[ -z "$f" || ! -s "$f" ]]; then
+        echo ""
+        return
+    fi
+    if ! grep -qE '^[[:space:]]*(doh|dot|tcp|udp):' "$f" 2>/dev/null; then
+        echo "$f"
+        return
+    fi
+    local sys
+    sys=$(_probe_system_resolver)
+    if [[ -n "$sys" ]]; then
+        local out="${OUTPUT_DIR}/.sys_resolvers.txt"
+        echo "$sys" > "$out"
+        echo "$out"
+        log_warn "DoH resolver file is not usable by cloud_enum — falling back to the system resolver ($sys) for its DNS checks"
+    else
+        echo ""
+        log_warn "DoH resolver file is not usable by cloud_enum and no system resolver answered — cloud_enum DNS checks will be skipped"
+    fi
+}
+
 # Find a working system resolver and echo its IP (empty if none answers).
 # Tries Docker's embedded DNS (127.0.0.11) first — inside a container it
+# forwards to the host's resolv.conf — then the host-facing resolv.conf entries.
 # forwards to the host's resolv.conf — then the host-facing resolv.conf entries.
 # Probe domain: whoami.akamai.net (see _health_check_resolvers) — immune to
 # DoH-endpoint sinkholing that would fake-OK a dead path.
@@ -353,6 +418,12 @@ PASSIVE_PROXY="${PASSIVE_PROXY:-}"
 RESOLVERS_SOURCE_BUILTIN="/opt/scripts/wordlists/resolvers.txt"
 RESOLVERS_SOURCE="${RESOLVERS_SOURCE:-${RESOLVERS_SOURCE_BUILTIN}}"
 RESOLVERS_FILE="${RESOLVERS_SOURCE}"
+# DNS transport: udp (default — raw UDP/53 against the 12.7K static pool) or
+# doh (DNS-over-HTTPS to 3 trusted IP-literal endpoints: 1.1.1.1, 8.8.8.8,
+# 9.9.9.9). Use doh on networks that block/tarpit outbound UDP/53 (corporate
+# VPN split-DNS, ISP response-rate-limiting) while TCP/443 stays open. An
+# explicit --resolvers FILE|URL overrides either mode.
+DNS_MODE="udp"
 AUTO=false
 SKIP_PHASES=()
 THREADS=50
@@ -463,6 +534,7 @@ parse_args() {
             --subfaster-config) SUBFASTER_PROVIDER_CONFIG="$2"; shift 2 ;;
             --proxy)          PASSIVE_PROXY="$2"; shift 2 ;;
             --resolvers)      RESOLVERS_SOURCE="$2"; RESOLVERS_FILE="$2"; shift 2 ;;
+            --dns-mode)       DNS_MODE="$2"; shift 2 ;;
             --asn-config)     ASN_CONFIG_FILE="$2"; shift 2 ;;
             --waymore-mode)   WAYMORE_MODE="$2"; shift 2 ;;
             --auto)           AUTO=true; shift ;;
@@ -497,7 +569,12 @@ parse_args() {
                 echo "  --resolvers FILE|URL      DNS resolver list (file path or http(s) URL, default:"
                 echo "                            built-in ~12.7K trickest list, used as-is with no"
                 echo "                            health-check — dnsx retries across the pool). A custom"
-                echo "                            list IS health-checked; survivors only."
+                echo "                            list IS health-checked; survivors only. Overrides"
+                echo "                            --dns-mode."
+                echo "  --dns-mode {udp,doh}      udp (default): raw UDP/53 against the static pool."
+                echo "                            doh: DNS-over-HTTPS to 3 trusted endpoints (1.1.1.1,"
+                echo "                            8.8.8.8, 9.9.9.9) — for networks that block/tarpit"
+                echo "                            outbound UDP/53 (VPN split-DNS, ISP rate-limits)"
                 echo "  --asn-config FILE         Path to ASN provider classification config (default: built-in)"
                 echo "  --waymore-mode MODE       Waymore mode: U (URLs, default) or B (URLs+responses)"
                 echo "  --auto                    Skip all checkpoint prompts"
@@ -558,6 +635,14 @@ validate_args() {
                 log_warn "Proxy host is localhost/127.0.0.1 — inside the container that resolves to the container itself, not the Docker host. If the proxy runs on the host, use host.docker.internal instead (e.g. ${PASSIVE_PROXY%%://*}://host.docker.internal:PORT)." ;;
         esac
         export PASSIVE_PROXY
+    fi
+    # Validate DNS mode
+    case "${DNS_MODE:-udp}" in
+        udp|doh) ;;
+        *) log_error "Invalid --dns-mode: $DNS_MODE (must be 'udp' or 'doh')"; exit 1 ;;
+    esac
+    if [[ "$DNS_MODE" == "doh" && -n "$RESOLVERS_SOURCE" && "$RESOLVERS_SOURCE" != "$RESOLVERS_SOURCE_BUILTIN" ]]; then
+        log_warn "--resolvers is set explicitly — it overrides --dns-mode doh"
     fi
     # Validate waymore mode
     case "$WAYMORE_MODE" in

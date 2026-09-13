@@ -217,7 +217,14 @@ canonical_dns_resolve_pending() {
     fi
 
     # Extract pending hostnames — plus, on final passes, timed-out ones (retry)
-    # but only when DNS has been seen working this run.
+    # but only when DNS has been seen HEALTHY this run (set by the previous
+    # resolve pass: >=2% of its batch actually resolved — see the report block
+    # below). "Any host ever resolved" is NOT healthy: a 0.5% resolve rate on
+    # a 28K corpus re-ground the full timeout pile in TWO later passes for
+    # ~150 recoveries each (3 pointless 10-minute grinds per run).
+    local _resolved_before=0
+    _resolved_before=$(awk -F'\t' '$7 == "resolved" {c++} END {print c+0}' "$tsv")
+
     if [[ "${1:-}" == "include_timeouts" && "${METHO_DNS_WORKING:-0}" == "1" ]]; then
         awk -F'\t' '$7 == "pending" || $7 == "timeout" {print $1}' "$tsv" > "$pending_file"
     else
@@ -418,11 +425,27 @@ canonical_dns_resolve_pending() {
     CANONICAL_LAST_RESOLVED=$resolved
     CANONICAL_LAST_BOGON=$bogon
     CANONICAL_LAST_TIMEOUT=$timeout
-    # Remember across the whole run that DNS has worked at least once. Final
-    # passes use this to decide whether retrying "timeout" hosts is worthwhile
-    # (never true if nothing has EVER resolved — the network is just dead).
-    if [[ "$resolved" -gt 0 ]]; then
+
+    # DNS-health gate for include_timeouts retries: a pass counts as "healthy"
+    # only if it resolved >=2% of the batch it attempted (delta vs the resolved
+    # count captured before the pass). A pass that resolved a handful of a
+    # 28K pile marks DNS UNHEALTHY — later final passes must not re-grind the
+    # full timeout list for marginal gain (observed: 3 pointless 10-minute
+    # grinds per run at a 0.5% resolve rate, ~150 recoveries each).
+    # Hysteresis: small batches that fully NXDOMAIN on an otherwise healthy
+    # network must NOT clear the flag — only unset when a LARGE batch (>=1000)
+    # resolves nothing at all (network died mid-run).
+    local _delta=$(( resolved - _resolved_before ))
+    local _healthy_threshold=$(( pending_count / 50 ))
+    (( _healthy_threshold < 1 )) && _healthy_threshold=1
+    if (( _delta >= _healthy_threshold )); then
         METHO_DNS_WORKING=1
+        log_info "DNS health: $_delta/$pending_count resolved this pass (>=2% — healthy); timeout retries enabled"
+    elif (( _delta == 0 && pending_count >= 1000 )); then
+        METHO_DNS_WORKING=0
+        log_warn "DNS health: 0/$pending_count resolved this pass — DNS UNHEALTHY; timeout retries disabled"
+    else
+        log_info "DNS health: $_delta/$pending_count resolved this pass — no change to health state"
     fi
 
     if [[ "$bogon" -gt 0 ]]; then
@@ -660,9 +683,15 @@ merge_per_domain_dns() {
         log_success "Merged canonical DNS: $entry_count entries from ${#per_domain_tsvs[@]} per-domain TSVs"
         # METHO_DNS_WORKING is set inside the per-domain subshells during Phase 1
         # and does not survive into this (parent) shell — re-derive it from the
-        # merged dataset so Phase 3's final timeout-retry pass knows DNS worked.
-        if awk -F'\t' 'NR>1 && $7 == "resolved" { found=1; exit } END { exit !found }' "$global_tsv"; then
+        # merged dataset so Phase 3's final timeout-retry pass knows DNS was
+        # healthy. Healthy means a meaningful fraction resolved (>=2%), not
+        # merely ">0" — a 0.5% rate means resolvers are effectively dead and
+        # the Phase 3 retry pass would re-grind the whole timeout pile.
+        if awk -F'\t' 'NR>1 { n++; if ($7 == "resolved") r++ } END { exit !(r*50 >= n && n > 0) }' "$global_tsv"; then
             METHO_DNS_WORKING=1
+        else
+            METHO_DNS_WORKING=0
+            log_warn "DNS health after merge: under 2% of hostnames resolved — timeout retries disabled for Phase 3"
         fi
     else
         log_warn "No per-domain canonical_dns.tsv files found to merge"
