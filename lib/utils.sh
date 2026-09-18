@@ -42,35 +42,49 @@ _safe_name() {
 }
 
 # ── Resolver loading ─────────────────────────────────────────────────────────
-# RESOLVERS_FILE is used by every dnsx call. Three paths:
+# RESOLVERS_FILE is what every dnsx call resolves through. Three paths:
 #
-#   * --dns-mode udp (DEFAULT): built-in static list
-#     (wordlists/resolvers.txt, ~12.7K trickest entries) used as-is with NO
-#     health-check. retryabledns (dnsx's engine) round-robins resolvers and
-#     each retry automatically moves to the NEXT resolver in the list
-#     (client.go: Do → index%len(resolvers) → continue on error), so dead
-#     entries in a large mostly-alive list cost nothing: a query only fails
-#     if it lands on ≥ MaxRetries+1 consecutive dead resolvers. Health-checking
-#     12K+ resolvers at startup would burn minutes for zero benefit.
-#   * --dns-mode doh: three trusted IP-literal DoH endpoints (Cloudflare,
-#     Google, Quad9) in dnsx's native doh: URL format — verified in
-#     retryabledns resolver.go parseResolver() and documented at
-#     docs.projectdiscovery.io/tools/dnsx. Use on networks that block or
-#     tarpit raw UDP/53 (corporate VPN split-DNS, ISP response-rate-limiting)
-#     while TCP/443 stays open. IP literals avoid the chicken-and-egg of
-#     resolving the endpoint's hostname first; dnsx's DoH client skips TLS
-#     verification, so cert-name mismatches on bare IPs are not an issue.
+#   * --dns-mode doh (DEFAULT): a local DoH proxy (lib/doh_proxy.py) listens on
+#     127.0.0.1 and forwards every query over DNS-over-HTTPS on TCP/443.
+#     RESOLVERS_FILE becomes a one-line file pointing at it, so dnsx keeps
+#     doing the resolving and only the transport changes.
+#
+#     Why a proxy and not dnsx's own `doh:` resolvers: dnsx v1.3.1 cannot
+#     complete a DoH query at all. `doh:https://…` fails with
+#     `Post "https://…/dns-query": EOF` and `dot:`/`tcp:` return zero results,
+#     on networks where curl and Python POST the identical request to the
+#     identical endpoint and get HTTP 200. The resolver STRING format is right
+#     (retryabledns' parseResolver() documents exactly that form) — the client
+#     is what is broken. Putting the transport in a process we control also
+#     means the endpoint-failover behaviour is ours to get right: on the
+#     network this was developed against, 1.1.1.1 answered promptly while
+#     8.8.8.8/9.9.9.9 accepted TCP then went silent, and naive round-robin
+#     sent a third of all queries into that hole.
+#
+#     This is the default because plain UDP/53 against a large public pool is
+#     what fails in practice: the shipped 12.7K trickest list resolved 74% of
+#     a known-good sample and collapses under a bulk burst.
+#   * --dns-mode udp: built-in static list (wordlists/resolvers.txt, ~12.7K
+#     trickest entries) used as-is with NO health-check. retryabledns (dnsx's
+#     engine) round-robins resolvers and each retry automatically moves to the
+#     NEXT resolver in the list (client.go: Do → index%len(resolvers) →
+#     continue on error), so a few dead entries cost little. Note the flip
+#     side: a MOSTLY dead list is still ruinous, which is why the runtime
+#     quality gate below exists.
 #   * Custom list via --resolvers FILE or URL (takes precedence over
 #     --dns-mode): if the value is an http(s) URL it is downloaded first. A
-#     user-supplied list may be mostly dead (which DOES tank throughput —
-#     success rate ≈ alive_fraction^(retries+1)), so it IS health-checked, at
-#     high parallelism so even 13K entries take ~2 min. If nothing survives,
-#     fall back to the system resolver (which answers where corporate
-#     firewalls block external UDP/53) rather than a dead list.
+#     user-supplied list may be mostly dead, so it IS health-checked, at high
+#     parallelism so even 13K entries take ~2 min. If nothing survives, fall
+#     back to the system resolver (which answers where corporate firewalls
+#     block external UDP/53) rather than a dead list.
 #
-# Also detects total-DNS-failure AT RUNTIME (system-resolver fallback inside
-# canonical_dns_resolve_pending) — a network can break or recover mid-run, so a
-# startup check is the wrong place for that.
+# A failing transport is also detected AT RUNTIME: canonical_dns_resolve_pending
+# measures how many queries were ANSWERED (not how many names resolved), and
+# escalates the batch to the fallback transport when the answer rate collapses.
+# A startup check alone cannot catch a network that breaks mid-run — which is
+# exactly what happened in the run that motivated this: DNS worked for the
+# first domain, collapsed when the 28K-hostname batch hit, and every remaining
+# stage quietly recorded the loss as "timeout".
 load_resolvers() {
     local src="${RESOLVERS_SOURCE:-/opt/scripts/wordlists/resolvers.txt}"
     RESOLVERS_FILE="$src"
@@ -95,11 +109,15 @@ load_resolvers() {
         return
     fi
 
-    # Built-in static list + doh mode → switch to the DoH endpoint file.
+    # Built-in static list + doh mode → bring up the local DoH proxy.
     # (An explicit --resolvers file/URL wins over --dns-mode.)
     if [[ "$src" == "${RESOLVERS_SOURCE_BUILTIN:-/opt/scripts/wordlists/resolvers.txt}" ]]; then
-        if [[ "${DNS_MODE:-udp}" == "doh" ]]; then
-            _load_doh_resolvers
+        if [[ "${DNS_MODE}" == "doh" ]]; then
+            # Never propagate a failure: this function already falls back to
+            # the UDP pool on its own, and load_resolvers is called bare from
+            # recon.sh, so a non-zero return would abort the whole run under
+            # `set -e` — precisely when the fallback has just succeeded.
+            _load_doh_resolvers || true
         else
             log_info "Resolvers: using built-in list ($(grep -cvE '^[[:space:]]*(#|$)' "$src") entries, no health-check — dnsx retries across the pool)"
         fi
@@ -111,26 +129,211 @@ load_resolvers() {
     _health_check_resolvers "$src"
 }
 
-# DoH mode: generate the 3-endpoint resolver file and probe it once so a
-# fully-blocked 443 is surfaced at startup (with a loud warning) instead of as
-# 28K timeouts mid-run. Failures are non-fatal: dnsx stages already degrade
-# gracefully, and 443 may recover mid-run.
+# ── Local DoH proxy lifecycle ────────────────────────────────────────────────
+# The proxy is a child of this shell. It is stopped by the EXIT trap so a
+# failed or interrupted run does not leave it holding a UDP port.
+DOH_PROXY_PID=""
+DOH_PROXY_PORT=""
+
+# Directory holding this script, so the proxy can be found whether the tree is
+# mounted at /opt/scripts or run straight from a checkout.
+_metho_lib_dir() {
+    ( cd "$(dirname "${BASH_SOURCE[0]}")" && pwd )
+}
+
+# Start lib/doh_proxy.py and point RESOLVERS_FILE at it.
+# Returns 0 only when the proxy is listening AND answered a real query.
 _load_doh_resolvers() {
-    local doh_file="${OUTPUT_DIR}/doh_resolvers.txt"
-    printf 'doh:https://1.1.1.1/dns-query:post\ndoh:https://8.8.8.8/dns-query:post\ndoh:https://9.9.9.9/dns-query:post\n' > "$doh_file"
-    RESOLVERS_FILE="$doh_file"
+    local lib_dir proxy
+    lib_dir="$(_metho_lib_dir)"
+    proxy="${lib_dir}/doh_proxy.py"
 
-    log_info "DoH mode: probing 3 endpoints (Cloudflare 1.1.1.1, Google 8.8.8.8, Quad9 9.9.9.9) over TCP/443 ..."
-    local answered
-    answered=$(printf 'whoami.akamai.net\n' \
-        | timeout 20 dnsx -silent -a -r "$doh_file" -timeout 5 -retry 1 2>/dev/null | grep -c . || true)
-
-    if [[ "${answered:-0}" -gt 0 ]]; then
-        log_success "DoH mode: ${answered}/3 endpoint(s) answered the probe — using $doh_file"
-    else
-        log_warn "DoH mode: none of the 3 DoH endpoints answered the probe — TCP/443 may be filtered on this network."
-        log_warn "  Continuing with the DoH file anyway; if 443 is truly dead every dnsx call will time out."
+    if [[ ! -f "$proxy" ]]; then
+        log_warn "DoH mode requested but ${proxy} is missing — falling back to the UDP pool"
+        _fallback_to_udp_pool
+        return 1
     fi
+    if ! command -v python3 &>/dev/null; then
+        log_warn "DoH mode requested but python3 is not available — falling back to the UDP pool"
+        _fallback_to_udp_pool
+        return 1
+    fi
+
+    local port_file="${OUTPUT_DIR}/.doh_proxy.port"
+    local proxy_log="${OUTPUT_DIR}/doh_proxy.log"
+    local endpoints="${DOH_ENDPOINTS:-https://1.1.1.1/dns-query,https://8.8.8.8/dns-query,https://9.9.9.9/dns-query}"
+
+    rm -f "$port_file"
+    log_info "DoH mode: starting local DNS-over-HTTPS proxy (endpoints: ${endpoints//,/, }) ..."
+
+    python3 "$proxy" \
+        --host 127.0.0.1 \
+        --port 0 \
+        --port-file "$port_file" \
+        --endpoints "$endpoints" \
+        --threads "${DOH_PROXY_THREADS:-128}" \
+        --timeout "${DOH_PROXY_TIMEOUT:-4}" \
+        >>"$proxy_log" 2>&1 &
+    DOH_PROXY_PID=$!
+
+    # Detach from the shell's job table. This process deliberately never
+    # exits, and any `wait` with no arguments would block on it forever —
+    # which is exactly how a run hung between Phase 1 and the canonical-DNS
+    # merge. bounded_parallel now waits only on PIDs it started, and disowning
+    # keeps the proxy out of the way of any other whole-shell wait.
+    disown "$DOH_PROXY_PID" 2>/dev/null || true
+
+    # The proxy probes its endpoints BEFORE publishing the port, so this wait
+    # also covers endpoint discovery.
+    local _i _waited=0 _deadline="${DOH_PROXY_READY_SECS:-30}"
+    for ((_i = 0; _i < _deadline * 5; _i++)); do
+        if [[ -s "$port_file" ]]; then
+            break
+        fi
+        if ! kill -0 "$DOH_PROXY_PID" 2>/dev/null; then
+            log_warn "DoH proxy exited before it started listening — see ${proxy_log}"
+            tail -5 "$proxy_log" 2>/dev/null | sed 's/^/    /'
+            DOH_PROXY_PID=""
+            _fallback_to_udp_pool
+            return 1
+        fi
+        sleep 0.2
+        _waited=$((_waited + 1))
+    done
+
+    if [[ ! -s "$port_file" ]]; then
+        log_warn "DoH proxy did not report a port within ${_deadline}s — see ${proxy_log}"
+        _doh_proxy_stop
+        _fallback_to_udp_pool
+        return 1
+    fi
+
+    DOH_PROXY_PORT=$(tr -d '[:space:]' < "$port_file")
+    if [[ -z "$DOH_PROXY_PORT" ]]; then
+        log_warn "DoH proxy reported an empty port — see ${proxy_log}"
+        _doh_proxy_stop
+        _fallback_to_udp_pool
+        return 1
+    fi
+
+    printf '127.0.0.1:%s\n' "$DOH_PROXY_PORT" > "${OUTPUT_DIR}/doh_resolvers.txt"
+    RESOLVERS_FILE="${OUTPUT_DIR}/doh_resolvers.txt"
+
+    # Functional check: a live socket is not the same as a working transport.
+    if _doh_proxy_answers; then
+        log_success "DoH mode: proxy listening on 127.0.0.1:${DOH_PROXY_PORT} and answering — resolvers → ${RESOLVERS_FILE}"
+        # Report which endpoints the proxy found usable; on a filtered network
+        # this is the first place the problem becomes visible.
+        grep -o 'endpoint probe:.*' "$proxy_log" 2>/dev/null | tail -1 | sed 's/^/    /' || true
+    else
+        log_warn "DoH mode: proxy started but could not answer a probe query through any endpoint."
+        log_warn "  TCP/443 to a DoH endpoint may be filtered here. Falling back to the UDP pool."
+        _doh_proxy_stop
+        RESOLVERS_FILE="${RESOLVERS_SOURCE_BUILTIN:-/opt/scripts/wordlists/resolvers.txt}"
+        _fallback_to_udp_pool
+        return 1
+    fi
+
+    # Stop the proxy when this shell exits, whatever the reason.
+    trap '_doh_proxy_stop' EXIT
+    return 0
+}
+
+# Fall back to the shipped UDP pool, logging why. Used when the DoH transport
+# cannot be brought up at all.
+_fallback_to_udp_pool() {
+    local builtin="${RESOLVERS_SOURCE_BUILTIN:-/opt/scripts/wordlists/resolvers.txt}"
+    if [[ -s "$builtin" ]]; then
+        RESOLVERS_FILE="$builtin"
+        log_warn "DNS transport: falling back to the built-in UDP pool ($(grep -cvE '^[[:space:]]*(#|$)' "$builtin" 2>/dev/null || echo 0) entries)"
+    else
+        log_warn "DNS transport: no usable resolver list — DNS will fail"
+    fi
+}
+
+_doh_proxy_stop() {
+    [[ -n "${DOH_PROXY_PID:-}" ]] || return 0
+    kill -TERM "$DOH_PROXY_PID" 2>/dev/null || true
+    wait "$DOH_PROXY_PID" 2>/dev/null || true
+    DOH_PROXY_PID=""
+    DOH_PROXY_PORT=""
+}
+
+# Check the active transport is still usable before a batch depends on it.
+#
+# Only the DoH proxy can die mid-run — a resolver list cannot. Across a
+# 70-domain sweep the proxy lives for hours, so a worker-thread crash or an
+# OOM kill would otherwise leave every remaining batch resolving against a
+# closed port and recording the loss as "timeout" for the rest of the run.
+# Restart it once; if that fails, fall back to the UDP pool rather than
+# discovering the problem tens of thousands of hostnames later.
+_ensure_dns_transport() {
+    [[ "${DNS_MODE}" == "doh" ]] || return 0
+    [[ -n "${DOH_PROXY_PID:-}" ]] || return 0     # already fell back to UDP
+    kill -0 "$DOH_PROXY_PID" 2>/dev/null && return 0
+
+    log_warn "DoH proxy is no longer running — restarting it before the next resolution batch"
+    DOH_PROXY_PID=""
+    DOH_PROXY_PORT=""
+    _load_doh_resolvers || return 1
+    return 0
+}
+
+# Does the proxy actually resolve? A listening socket is not enough — the
+# proxy can be up while every endpoint is blocked.
+_doh_proxy_answers() {
+    [[ -n "${DOH_PROXY_PORT:-}" ]] || return 1
+    command -v dnsx &>/dev/null || return 1
+
+    # Retried: this is a live round trip to a third-party endpoint through a
+    # socket that was bound microseconds ago, and a single miss is not proof
+    # that the transport is dead. Concluding "unusable" on one miss threw away
+    # a perfectly good DoH path and silently moved the whole run to the pool.
+    local attempt
+    for attempt in 1 2 3; do
+        if printf 'whoami.akamai.net\n' \
+            | timeout 30 dnsx -silent -a -r "127.0.0.1:${DOH_PROXY_PORT}" \
+                -timeout "$(_dnsx_query_timeout)" -retry 2 2>/dev/null | grep -q .; then
+            return 0
+        fi
+        (( attempt < 3 )) && sleep 1
+    done
+    return 1
+}
+
+# A resolver file usable as a FALLBACK when the primary transport is failing.
+# Prefers the network's own resolver (fast, permitted where external UDP/53 is
+# firewalled), then the shipped pool. Echoes an empty string if neither exists
+# or both are the primary.
+_fallback_resolver_file() {
+    local primary="${1:-}"
+    local sys
+    sys=$(_probe_system_resolver)
+    if [[ -n "$sys" && "$sys" != "$primary" ]]; then
+        echo "$sys"
+        return 0
+    fi
+    local builtin="${RESOLVERS_SOURCE_BUILTIN:-/opt/scripts/wordlists/resolvers.txt}"
+    if [[ -s "$builtin" && "$builtin" != "$primary" ]]; then
+        echo "$builtin"
+        return 0
+    fi
+    echo ""
+}
+
+# A resolver file holding real resolver ADDRESSES — never the local DoH proxy.
+# Needed by dnsx features that open their own conversation with a server: AXFR
+# is a TCP/53 exchange with the zone's authoritative nameserver, and pointing
+# it at a UDP-only proxy on 127.0.0.1 silently reduces it to a no-op. Prefers
+# the network's own resolver, then the shipped pool.
+_direct_resolver_file() {
+    local sys
+    sys=$(_probe_system_resolver)
+    if [[ -n "$sys" ]]; then
+        echo "$sys"
+        return 0
+    fi
+    echo "${RESOLVERS_SOURCE_BUILTIN:-/opt/scripts/wordlists/resolvers.txt}"
 }
 
 # Probe every resolver in $1 and keep only those that answer from THIS network,
@@ -189,35 +392,76 @@ _health_check_resolvers() {
 }
 
 # Return a resolver file usable by NON-dnsx consumers (cloud_enum's dnspython
-# parses IPs only — doh:/tcp:/udp: URLs would crash it). Echoes RESOLVERS_FILE
-# when it contains only plain host[:port] entries; otherwise probes the system
-# resolver and returns a one-entry file (empty string if even that is dead).
+# accepts only BARE IP ADDRESSES — it rejects both the `doh:`-style prefixes
+# and the `host:port` form the local DoH proxy uses, with
+# "nameserver 127.0.0.1:5353 is not a ... IP address, nor a valid https URL").
+# Echoes RESOLVERS_FILE when every entry is a plain address; otherwise probes
+# the system resolver and returns a one-entry file (empty string if that is
+# dead too, in which case the caller skips its DNS checks).
+# True when every entry in the file is a bare IP address — no protocol prefix,
+# no port. Split out from _plain_ip_resolver_file so it can be tested without
+# touching the network.
+_resolver_file_is_plain_ips() {
+    local f="$1" line
+    [[ -s "$f" ]] || return 1
+    while IFS= read -r line; do
+        line="${line//[[:space:]]/}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        # No colon at all → a bare IPv4 address.
+        [[ "$line" != *:* ]] && continue
+        # Colons but only hex digits → a bare IPv6 address.
+        [[ "$line" =~ ^[0-9a-fA-F:]+$ ]] && continue
+        return 1
+    done < "$f"
+    return 0
+}
+
 _plain_ip_resolver_file() {
     local f="${RESOLVERS_FILE:-}"
     if [[ -z "$f" || ! -s "$f" ]]; then
         echo ""
         return
     fi
-    if ! grep -qE '^[[:space:]]*(doh|dot|tcp|udp):' "$f" 2>/dev/null; then
+
+    if _resolver_file_is_plain_ips "$f"; then
         echo "$f"
         return
     fi
+
+    # NOTE: this function logs NOTHING. Its stdout is captured by the caller
+    # (`nsf_file=$(...)`), so a log line written here is captured too — which
+    # is how cloud_enum ended up being handed a two-line "-nsf" value
+    # containing the warning text, and failed with
+    #     Error: File '/output/.sys_resolvers.txt\n[!] ...' not found.
+    # The caller does the reporting, from the return value.
+    # Build a plain-IP list rather than handing over the raw active file.
+    #
+    # The network's own resolver goes first (always reachable, and the only
+    # option where external UDP/53 is firewalled), then the well-known public
+    # resolvers as backups. dnspython tries nameservers in order, so extras
+    # cost nothing when the first answers — but a single resolver is fragile
+    # for cloud_enum specifically: it does not catch dns.resolver.NoAnswer, so
+    # one NOERROR-with-no-A response aborts the whole run and the assets it had
+    # not logged yet are lost.
+    local out="${OUTPUT_DIR}/.sys_resolvers.txt"
+    : > "$out"
     local sys
     sys=$(_probe_system_resolver)
-    if [[ -n "$sys" ]]; then
-        local out="${OUTPUT_DIR}/.sys_resolvers.txt"
-        echo "$sys" > "$out"
+    [[ -n "$sys" ]] && printf '%s\n' "$sys" >> "$out"
+    local pub
+    for pub in ${CLOUD_ENUM_FALLBACK_RESOLVERS:-1.1.1.1 8.8.8.8 9.9.9.9}; do
+        printf '%s\n' "$pub" >> "$out"
+    done
+
+    if [[ -s "$out" ]]; then
         echo "$out"
-        log_warn "DoH resolver file is not usable by cloud_enum — falling back to the system resolver ($sys) for its DNS checks"
     else
         echo ""
-        log_warn "DoH resolver file is not usable by cloud_enum and no system resolver answered — cloud_enum DNS checks will be skipped"
     fi
 }
 
 # Find a working system resolver and echo its IP (empty if none answers).
 # Tries Docker's embedded DNS (127.0.0.11) first — inside a container it
-# forwards to the host's resolv.conf — then the host-facing resolv.conf entries.
 # forwards to the host's resolv.conf — then the host-facing resolv.conf entries.
 # Probe domain: whoami.akamai.net (see _health_check_resolvers) — immune to
 # DoH-endpoint sinkholing that would fake-OK a dead path.
@@ -242,6 +486,39 @@ normalize_hostname() {
     echo "$1" | sed 's/^\*\.//; s/\.$//' | tr '[:upper:]' '[:lower:]'
 }
 
+# ── Keep only hostnames that belong to a user-supplied root domain ───────────
+# filter_in_scope_hostnames <input_file> <output_file>
+#
+# EVERY path that feeds hostnames into the canonical DNS dataset must go
+# through this. Certificate Transparency logs, cloud_enum bucket names and DNS
+# record chains (MX/NS/TXT, CNAME targets) all surface third-party hostnames —
+# `_spf.google.com`, `d3vfd.s3.amazonaws.com`, `…elb.amazonaws.com`. Those are
+# cloud SIGNALS, not attack surface. Once ingested they are resolved,
+# classified, and — because classification can fail — handed to naabu and nmap
+# as targets, which means port-scanning infrastructure the program does not
+# cover. That happened: 10 out-of-scope bucket/ELB hostnames became 70 scanned
+# AWS-owned IPs.
+#
+# Matching mirrors match_root_domain: exact root, or a ".root" suffix. A file
+# that is empty, or a run with no root domains, yields an empty output rather
+# than an unfiltered one.
+filter_in_scope_hostnames() {
+    local input="$1" output="$2"
+    : > "$output"
+    [[ -s "$input" ]] || return 0
+    [[ -s "${ROOT_DOMAINS_FILE:-/nonexistent}" ]] || return 0
+
+    local rd escaped
+    while IFS= read -r rd; do
+        [[ -z "$rd" ]] && continue
+        rd=$(normalize_hostname "$rd")
+        [[ -z "$rd" ]] && continue
+        escaped="${rd//./\\.}"
+        grep -E "(^|\.)${escaped}$" "$input" >> "$output" || true
+    done < "$ROOT_DOMAINS_FILE"
+    sort -u "$output" -o "$output" 2>/dev/null || true
+}
+
 # ── crt.name Certificate Transparency query ──────────────────────────────────
 # Queries the crt.name API for a root domain and extracts in-scope hostnames.
 # Usage: crtname_query <domain> <output_hostnames_file> <raw_json_file>
@@ -251,7 +528,7 @@ normalize_hostname() {
 # deduplicate, and preserve the raw API response.
 # Registrable apex for a hostname. crt.name's ?apex= param expects a
 # REGISTRABLE domain and returns HTTP 400 for a deep subdomain
-# (automotive.vodafone.co.uk -> 400, abcom.al -> 200). A full Public Suffix
+# (a deeply nested subdomain -> 400, a registrable apex -> 200). A full Public Suffix
 # List is unnecessary here — this covers the multi-label ccTLD suffixes the
 # target scope actually contains (co.uk, com.tr, co.za, co.tz, co.ke, co.mz,
 # co.ls, com.eg, ...) plus common extras. Single-label TLDs fall through to
@@ -305,7 +582,7 @@ crtname_query() {
     # Extract "sub" fields from JSON, normalize, filter to in-scope, deduplicate.
     # Normalization is a SINGLE streamed pass (strip *. and trailing dot, then
     # lowercase) — the previous per-line shell loop forked sed+tr per hostname
-    # and cost minutes on large-CT apexes (~28k names for vodafone.com, far
+    # and cost minutes on large-CT apexes (~28k names for a single apex, far
     # worse under amd64 emulation). Mirrors canonical_dns_add_sources' batch idiom.
     local escaped_domain="${domain//./\\.}"
     jq -r '.[].sub // empty' "$raw_file" 2>/dev/null \
@@ -343,6 +620,14 @@ bounded_parallel() {
             _METHO_HAS_WAIT_N=0
         fi
     fi
+    # Track the workers THIS function started, and wait only on those.
+    #
+    # A bare `wait` waits on every child of the shell, and the pipeline owns
+    # at least one process that deliberately never exits — the DoH proxy. With
+    # a bare `wait`, the first call to bounded_parallel that finished while the
+    # proxy was alive blocked forever, hanging the run between Phase 1 and the
+    # canonical-DNS merge with no error and no log line.
+    local -a _pids=()
     # Temporarily disable errexit AND save/restore it. A worker that returns
     # non-zero must NOT abort the pool (its exit surfaces through `wait`), and
     # we must not leak `set +e` back to the caller.
@@ -353,6 +638,7 @@ bounded_parallel() {
         # stdin redirections (katana historically did) must not swallow the
         # remaining input lines this loop is still reading.
         ( "$func" "$line" "$@" || true ) < /dev/null &
+        _pids+=("$!")
         running=$((running + 1))
         if (( running >= concurrency )); then
             if [[ "$_METHO_HAS_WAIT_N" == 1 ]]; then
@@ -360,13 +646,22 @@ bounded_parallel() {
                 running=$((running - 1))
             else
                 # Older bash: wait for the whole batch, then start the next.
-                wait || true
+                _metho_wait_pids "${_pids[@]}"
+                _pids=()
                 running=0
             fi
         fi
     done < "$input"
-    wait || true
+    _metho_wait_pids "${_pids[@]}"
     [[ "$_prev_errexit" == 1 ]] && set -e
+}
+
+# Wait for specific PIDs only, never for "all children".
+_metho_wait_pids() {
+    local _p
+    for _p in "$@"; do
+        wait "$_p" 2>/dev/null || true
+    done
 }
 
 # NOTE: each logger must return 0 unconditionally. Before init_log runs,
@@ -418,12 +713,33 @@ PASSIVE_PROXY="${PASSIVE_PROXY:-}"
 RESOLVERS_SOURCE_BUILTIN="/opt/scripts/wordlists/resolvers.txt"
 RESOLVERS_SOURCE="${RESOLVERS_SOURCE:-${RESOLVERS_SOURCE_BUILTIN}}"
 RESOLVERS_FILE="${RESOLVERS_SOURCE}"
-# DNS transport: udp (default — raw UDP/53 against the 12.7K static pool) or
-# doh (DNS-over-HTTPS to 3 trusted IP-literal endpoints: 1.1.1.1, 8.8.8.8,
-# 9.9.9.9). Use doh on networks that block/tarpit outbound UDP/53 (corporate
-# VPN split-DNS, ISP response-rate-limiting) while TCP/443 stays open. An
-# explicit --resolvers FILE|URL overrides either mode.
-DNS_MODE="udp"
+# DNS transport: doh (DEFAULT — every query goes over DNS-over-HTTPS on
+# TCP/443 through a local proxy, immune to UDP/53 filtering and to the
+# rate-limiting that a bulk UDP burst provokes) or udp (raw UDP/53 against the
+# 12.7K static pool).
+#
+# The default flipped from udp to doh because udp is what fails in the field:
+# on a real 29K-hostname run the pool answered ~1% of the corpus, silently
+# labelling ~12,000 existing hostnames as "timeout", while the same hostnames
+# resolved fine over DoH. UDP remains available (and is still the automatic
+# fallback when TCP/443 is filtered). An explicit --resolvers FILE|URL
+# overrides either mode.
+# Env-overridable like the other transport settings (-e DNS_MODE=udp), and
+# validated once in validate_args — which is what makes that check the
+# single validation point for both the flag and an inherited value.
+DNS_MODE="${DNS_MODE:-doh}"
+
+# dnsx concurrency is transport-aware — see _dnsx_threads() in
+# lib/canonical_dns.sh. Setting DNSX_THREADS here pins it for both transports.
+DNSX_THREADS="${DNSX_THREADS:-}"
+
+# dnsx retry count and wall-clock cap, defined ONCE. Both used to be
+# re-defaulted at every call site, and had already drifted apart — the
+# canonical passes used -retry 2 while the Phase 2 record query used -retry 3,
+# so "DNSX_RETRY" meant two different things depending on which file you read.
+DNSX_RETRY="${DNSX_RETRY:-2}"
+DNSX_TIMEOUT="${DNSX_TIMEOUT:-600}"
+
 AUTO=false
 SKIP_PHASES=()
 THREADS=50
@@ -506,6 +822,16 @@ NAABU_RATE=1000
 # without multiplying noise on filtered ports.
 NAABU_RETRIES=2
 
+# Naabu wall-clock cap. 0 (default) = derive it from the target count as
+# NAABU_TIMEOUT_BASE + hosts × NAABU_SECONDS_PER_HOST, capped at 1h. A fixed
+# cap silently truncates large sweeps: 423 hosts × 1000 ports at 1000 pps
+# needs ~423s of pure sending before any retransmit, which the old 600s
+# default did not leave room for. Set NAABU_TIMEOUT to a positive value to
+# pin it explicitly.
+NAABU_TIMEOUT=0
+NAABU_TIMEOUT_BASE="${NAABU_TIMEOUT_BASE:-300}"
+NAABU_SECONDS_PER_HOST="${NAABU_SECONDS_PER_HOST:-2}"
+
 # Cap on how many ports nmap -sV service-detects in Stage 4b. naabu already
 # records EVERY open port (they are merged into the final ip_port_pairs), so
 # this only bounds which ports get version detection. Without a cap, the union
@@ -548,6 +874,7 @@ parse_args() {
             --threads)        _require_int "$1" "$2"; THREADS="$2"; shift 2 ;;
             --parallel-hosts) _require_int "$1" "$2"; PARALLEL_HOSTS="$2"; shift 2 ;;
             --parallel-domains) _require_int "$1" "$2"; PARALLEL_DOMAINS="$2"; shift 2 ;;
+            --doh-proxy-threads) _require_int "$1" "$2"; DOH_PROXY_THREADS="$2"; shift 2 ;;
             --domain-timeout) _require_int "$1" "$2"; DOMAIN_TIMEOUT="$2"; shift 2 ;;
             --rate-limit)     _require_int "$1" "$2"; RATE_LIMIT="$2"; shift 2 ;;
             --nmap-top-ports) _require_int "$1" "$2"; NMAP_TOP_PORTS="$2"; shift 2 ;;
@@ -571,10 +898,12 @@ parse_args() {
                 echo "                            health-check — dnsx retries across the pool). A custom"
                 echo "                            list IS health-checked; survivors only. Overrides"
                 echo "                            --dns-mode."
-                echo "  --dns-mode {udp,doh}      udp (default): raw UDP/53 against the static pool."
-                echo "                            doh: DNS-over-HTTPS to 3 trusted endpoints (1.1.1.1,"
-                echo "                            8.8.8.8, 9.9.9.9) — for networks that block/tarpit"
-                echo "                            outbound UDP/53 (VPN split-DNS, ISP rate-limits)"
+                echo "  --dns-mode {udp,doh}      doh (default): DNS-over-HTTPS on TCP/443 through a"
+                echo "                            local proxy that tries 1.1.1.1, 8.8.8.8 and 9.9.9.9"
+                echo "                            and drops the ones this network cannot reach."
+                echo "                            udp: raw UDP/53 against the built-in 12.7K pool."
+                echo "                            A failing transport is retried through the other one"
+                echo "                            automatically before results are recorded."
                 echo "  --asn-config FILE         Path to ASN provider classification config (default: built-in)"
                 echo "  --waymore-mode MODE       Waymore mode: U (URLs, default) or B (URLs+responses)"
                 echo "  --auto                    Skip all checkpoint prompts"
@@ -582,9 +911,14 @@ parse_args() {
                 echo "  --skip-cloud              Shorthand for --skip-phase 2"
                 echo "  --no-port-scan            Skip port scanning phase"
                 echo "  --skip-permutation        Disable dnsgen permutation brute force (Stage 4b) for all domains"
-                echo "  --threads N               Thread count (default: 50)"
+                echo "  --threads N               Cloud_Enum thread count (default: 50). dnsx concurrency is"
+                echo "                            transport-aware — see DNSX_THREADS_DOH/_UDP"
                 echo "  --parallel-hosts N         Hosts crawled in parallel per tool (default: 5)"
                 echo "  --parallel-domains N       Root domains processed in parallel in Phase 1 (default: 3)"
+                echo "  --doh-proxy-threads N      Concurrent DoH requests the local proxy may have in"
+                echo "                            flight (default: 128). Size it to at least"
+                echo "                            parallel-domains × DNSX_THREADS_DOH, or queries queue past"
+                echo "                            dnsx's own timeout and are recorded as 'timeout'"
                 echo "  --domain-timeout N        Per-domain wall-clock cap in seconds (default: 5400; 0=off)"
                 echo "  --rate-limit N            Requests/second (default: 100)"
                 echo "  --nmap-top-ports N        Cap nmap -sV to the N most-common open ports (default: 100; 0=no cap)"
@@ -637,7 +971,7 @@ validate_args() {
         export PASSIVE_PROXY
     fi
     # Validate DNS mode
-    case "${DNS_MODE:-udp}" in
+    case "${DNS_MODE}" in
         udp|doh) ;;
         *) log_error "Invalid --dns-mode: $DNS_MODE (must be 'udp' or 'doh')"; exit 1 ;;
     esac
@@ -749,6 +1083,12 @@ checkpoint() {
 # host user read, modify, and delete results without "permission denied".
 setup_dirs() {
     mkdir -p "${OUTPUT_DIR}"/{phase1,phase2,phase3,final,config}
+    # A port file left by a previous run would let the readiness wait below
+    # succeed instantly against a proxy that is not running, which is how you
+    # get a whole run resolving against a dead port.
+    rm -f "${OUTPUT_DIR}/.doh_proxy.port" \
+          "${OUTPUT_DIR}/doh_resolvers.txt" \
+          "${OUTPUT_DIR}/.sys_resolvers.txt"
     chmod -R 777 "$OUTPUT_DIR" 2>/dev/null || true
 }
 
@@ -804,6 +1144,13 @@ httpx_probe() {
     # -web-server: detect web server (alias for -server in some versions)
     # -content-length: include content_length field
     # -status-code, -title: include status code and page title
+    # Per-process request rate. --rate-limit is documented as the rate against
+    # the TARGETS, but in Phase 1 every parallel domain worker runs its own
+    # httpx, so N workers offer N× the configured rate. run_phase1 divides the
+    # budget by the number of workers it actually starts and passes it down
+    # here; a single-domain run (or any Phase 3 probe) uses RATE_LIMIT as-is.
+    local _rl="${METHO_HTTPX_RATE:-$RATE_LIMIT}"
+
     cat "$input_file" | httpx \
         -silent \
         -json \
@@ -815,7 +1162,7 @@ httpx_probe() {
         -content-length \
         -timeout 10 \
         -retries 2 \
-        -rate-limit "$RATE_LIMIT" \
+        -rate-limit "$_rl" \
         -o "$output_json" > /dev/null 2>"$httpx_log" || true
 
     local count=0

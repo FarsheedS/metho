@@ -26,9 +26,15 @@ run_phase3() {
 
     # Final resolution pass — resolve any hostnames still pending, and retry
     # ones lost to transient timeouts earlier in the run (the include_timeouts
-    # mode only fires if DNS has actually worked at some point, so a dead
+    # mode only fires if the transport has actually been answering, so a dead
     # network never triggers a pointless re-grind).
     canonical_dns_resolve_pending include_timeouts
+
+    # Settle the remaining "timeout" rows into "does not exist" vs "we could
+    # not ask". Without this the dataset cannot say whether a 90%-unresolved
+    # corpus is a dead corpus or a dead transport, which is the first question
+    # anyone asks after a run like that.
+    canonical_dns_label_nxdomain
 
     # Extract the domain→IP mapping from the canonical DNS dataset
     local dns_tsv="${CANONICAL_DNS_TSV:-${OUTPUT_DIR}/canonical_dns.tsv}"
@@ -40,7 +46,10 @@ run_phase3() {
     # Build domain_ip_map.txt from canonical DNS (hostname A_record)
     # The A column (field 4) contains semicolon-separated IPs.
     : > "${pdir}/domain_ip_map.txt"
-    tail -n +2 "$dns_tsv" | awk -F'\t' '{
+    # The input file MUST be passed explicitly: an awk with no file argument
+    # reads stdin, so dropping it here silently produced an empty map, zero
+    # IPs, and a run that skipped classification and port scanning entirely.
+    awk -F'\t' '$1 == "hostname" && $2 == "root_domain" { next } {
         if ($4 != "" && $7 == "resolved") {
             n = split($4, ips, ";")
             for (i = 1; i <= n; i++) {
@@ -48,7 +57,7 @@ run_phase3() {
                 if (ips[i] != "") printf "%s %s\n", $1, ips[i]
             }
         }
-    }' > "${pdir}/domain_ip_map.txt"
+    }' "$dns_tsv" > "${pdir}/domain_ip_map.txt"
 
     # Build all_ips.txt from the domain_ip_map (unique IPs)
     cut -d' ' -f2 "${pdir}/domain_ip_map.txt" | sort -u -V > "${pdir}/all_ips.txt"
@@ -57,7 +66,25 @@ run_phase3() {
     [[ -s "${pdir}/all_ips.txt" ]] && ip_count=$(wc -l < "${pdir}/all_ips.txt")
     log_success "Unique IP addresses from canonical DNS: $ip_count"
 
+    # Consistency check. "Zero IPs" out of a dataset that clearly holds
+    # resolved hosts means the extraction is broken, not that the corpus is
+    # empty — and the failure is otherwise silent, because the phase simply
+    # reports success and skips classification and scanning. (It happened: an
+    # awk lost its input-file argument and read stdin instead.)
     if [[ "$ip_count" -eq 0 ]]; then
+        local _resolved_with_a
+        _resolved_with_a=$(awk -F'\t' \
+            '$1 == "hostname" && $2 == "root_domain" { next }
+             $7 == "resolved" && $4 != "" { c++ } END { print c+0 }' "$dns_tsv")
+        if [[ "${_resolved_with_a:-0}" -gt 0 ]]; then
+            log_error "Canonical DNS holds ${_resolved_with_a} resolved host(s) with A records, but the IP extraction produced none."
+            log_error "  This is an extraction bug, not an empty corpus. Skipping classification and port scanning."
+            # Deliberately NOT a non-zero return: recon.sh runs this phase
+            # directly, so under `set -e` that would abort the run and the user
+            # would lose final consolidation too — including the DNS and live
+            # host results that are perfectly good.
+            return 0
+        fi
         log_warn "No IPs resolved, skipping classification and port scanning"
         return 0
     fi
@@ -69,10 +96,11 @@ run_phase3() {
     if command -v dnsx &>/dev/null; then
         log_info "Stage 1b: Reverse DNS (PTR) lookups on ${ip_count} IPs"
 
-        cat "${pdir}/all_ips.txt" | timeout "${DNSX_TIMEOUT:-600}" dnsx \
+        cat "${pdir}/all_ips.txt" | timeout "${DNSX_TIMEOUT}" dnsx \
             -silent -ptr -resp-only \
             -r "${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt}" \
-            -timeout 5 \
+            -timeout "$(_dnsx_query_timeout)" \
+            -t "$(_dnsx_threads)" \
             2>/dev/null | sort -u > "${pdir}/ptr_hostnames.txt" || true
 
         if [[ -s "${pdir}/ptr_hostnames.txt" ]]; then
@@ -84,15 +112,7 @@ run_phase3() {
             # but we pre-filter to avoid adding thousands of unrelated PTR
             # names (e.g. google.com, cloudflare.com) to the dataset.
             local ptr_in_scope="${pdir}/ptr_in_scope.txt"
-            : > "$ptr_in_scope"
-            while IFS= read -r rd; do
-                [[ -z "$rd" ]] && continue
-                rd=$(normalize_hostname "$rd")
-                [[ -z "$rd" ]] && continue
-                local escaped_rd="${rd//./\\.}"
-                grep -E "(^|\.)${escaped_rd}$" "${pdir}/ptr_hostnames.txt" 2>/dev/null >> "$ptr_in_scope" || true
-            done < "$ROOT_DOMAINS_FILE"
-            sort -u "$ptr_in_scope" -o "$ptr_in_scope" 2>/dev/null || true
+            filter_in_scope_hostnames "${pdir}/ptr_hostnames.txt" "$ptr_in_scope"
 
             [[ -s "$ptr_in_scope" ]] && ptr_in_scope_count=$(wc -l < "$ptr_in_scope")
             log_success "PTR: $ptr_total hostnames from reverse DNS, $ptr_in_scope_count in-scope"
@@ -113,7 +133,7 @@ run_phase3() {
     # lookup, classification, and port scanning. Rebuild both files from the
     # now-updated TSV so no resolved host is lost.
     if [[ -s "${pdir}/ptr_in_scope.txt" ]]; then
-        tail -n +2 "$dns_tsv" | awk -F'\t' '{
+        awk -F'\t' '$1 == "hostname" && $2 == "root_domain" { next } {
             if ($4 != "" && $7 == "resolved") {
                 n = split($4, ips, ";")
                 for (i = 1; i <= n; i++) {
@@ -121,7 +141,7 @@ run_phase3() {
                     if (ips[i] != "") printf "%s %s\n", $1, ips[i]
                 }
             }
-        }' > "${pdir}/domain_ip_map.txt"
+        }' "$dns_tsv" > "${pdir}/domain_ip_map.txt"
         cut -d' ' -f2 "${pdir}/domain_ip_map.txt" | sort -u -V > "${pdir}/all_ips.txt"
         local _ip_count_before_ptr="$ip_count"
         ip_count=$(wc -l < "${pdir}/all_ips.txt")
@@ -132,24 +152,37 @@ run_phase3() {
         fi
     fi
 
-    # ── Stage 2: IP → ASN Lookup via whois.cymru.com ───────────────────────
-    log_info "Stage 2: Looking up ASNs via whois.cymru.com"
+    # ── Stage 2: IP → ASN Lookup ───────────────────────────────────────────
+    # Two independent transports, because this lookup decides which IPs are
+    # safe to port-scan. When it fails, every IP classifies as "unknown" and
+    # the CDN/cloud exclusion stops working — in the observed run that put
+    # Akamai, Imperva and Amazon S3 addresses in front of naabu and nmap.
+    log_info "Stage 2: Looking up ASNs (whois.cymru.com:43, DNS fallback)"
 
-    # Query whois.cymru.com ONCE and cache the raw response.
     local _cymru_cache="${pdir}/.cymru_raw.txt"
-    {
-        echo "begin"
-        echo "verbose"
-        cat "${pdir}/all_ips.txt"
-        echo "end"
-    } | nc whois.cymru.com 43 2>/dev/null > "$_cymru_cache" || true
+    local _cymru_ok=0
+    if _cymru_whois_lookup "${pdir}/all_ips.txt" "$_cymru_cache"; then
+        _cymru_ok=1
+    else
+        log_warn "whois.cymru.com:43 did not answer — falling back to Team Cymru's DNS service"
+        if _cymru_dns_lookup "${pdir}/all_ips.txt" "$_cymru_cache"; then
+            _cymru_ok=1
+            log_success "ASN data recovered over DNS ($(wc -l < "$_cymru_cache") rows)"
+        fi
+    fi
 
-    # Validate the response: cymru bulk mode answers with a "Bulk mode;"
-    # banner line before the data rows. Without this check, a failed nc
-    # (firewall, DNS hiccup, transient outage) leaves an empty cache that
-    # silently degrades EVERY IP to classification "unknown".
-    if ! grep -q "^Bulk mode" "$_cymru_cache" 2>/dev/null; then
-        log_warn "ASN lookup via whois.cymru.com failed or returned no data — all IPs will classify as 'unknown'. Check network egress to whois.cymru.com:43."
+    # Neither transport worked. Do NOT let the pipeline walk into a port scan
+    # it cannot scope: with no ASN data there is no way to tell a target's own
+    # server from a shared CDN edge, so the scan is skipped instead of being
+    # aimed at third-party infrastructure.
+    ASN_LOOKUP_FAILED=0
+    if (( _cymru_ok == 0 )); then
+        ASN_LOOKUP_FAILED=1
+        log_error "ASN lookup failed on BOTH transports (whois.cymru.com:43 and origin.asn.cymru.com)."
+        log_error "  Every IP would classify as 'unknown', which disables the CDN/cloud exclusion."
+        log_error "  Port scanning will be SKIPPED for this run rather than aimed at unscoped infrastructure."
+        log_error "  All DNS, HTTP and cloud results are unaffected. Re-run Phase 3 once egress to"
+        log_error "  whois.cymru.com:43 or UDP/53 resolution is available."
     fi
 
     # Cymru "verbose" output format (pipe-separated, with leading/trailing spaces):
@@ -235,7 +268,14 @@ run_phase3() {
     # open ports quickly, then nmap -sV does service/version detection on
     # just those ports. This is wider than the old fixed 37-port nmap list
     # and faster than nmap scanning 1000 ports directly.
-    if [[ "$PORT_SCAN" == true && -s "${pdir}/nmap_candidates.txt" ]]; then
+    if [[ "$PORT_SCAN" != true ]]; then
+        log_skip "Port scanning disabled (--no-port-scan)"
+    elif [[ "${ASN_LOOKUP_FAILED:-0}" == "1" ]]; then
+        log_skip "Port scanning SKIPPED: ASN classification unavailable (see Stage 2) — refusing to scan IPs that may be shared CDN/cloud infrastructure"
+        log_skip "  Everything else (DNS records, live hosts, cloud assets, IP inventory) is complete."
+    elif [[ ! -s "${pdir}/nmap_candidates.txt" ]]; then
+        log_warn "No nmap candidates to port scan"
+    else
         local nmap_count=0
         nmap_count=$(wc -l < "${pdir}/nmap_candidates.txt")
         log_info "Stage 4: Port scanning ${nmap_count} nmap candidates (non-CDN IPs)"
@@ -248,8 +288,26 @@ run_phase3() {
         # IPS/IDS and saturating the uplink on large candidate lists.
         local naabu_found=0
         if command -v naabu &>/dev/null; then
-            log_info "  Stage 4a: Naabu fast scan (top ${NAABU_TOP_PORTS:-1000} ports, rate ${NAABU_RATE:-1000} pps)"
-            timeout "${NAABU_TIMEOUT:-600}" naabu \
+            # Scale the wall-clock cap with the target count instead of using a
+            # fixed one. A 600s cap over 423 hosts × 1000 ports at 1000 pps
+            # needs ~423s of pure sending with zero retransmits, so the sweep in
+            # the observed run was killed mid-scan and its coverage silently
+            # became "whatever fitted in ten minutes".
+            local naabu_timeout="${NAABU_TIMEOUT:-0}"
+            if [[ "$naabu_timeout" -le 0 ]]; then
+                local _naabu_ideal=$(( NAABU_TIMEOUT_BASE + nmap_count * NAABU_SECONDS_PER_HOST ))
+                local _naabu_cap="${NAABU_TIMEOUT_MAX:-3600}"
+                naabu_timeout="$_naabu_ideal"
+                if (( naabu_timeout > _naabu_cap )); then
+                    naabu_timeout="$_naabu_cap"
+                    # Silently truncating a sweep is how coverage quietly
+                    # becomes "whatever fitted": say so, and say what to raise.
+                    log_warn "  Naabu cap reached: ${nmap_count} hosts need ~${_naabu_ideal}s at ${NAABU_RATE:-1000} pps but NAABU_TIMEOUT_MAX=${_naabu_cap}s."
+                    log_warn "  The scan WILL be truncated. Raise NAABU_TIMEOUT_MAX, raise NAABU_RATE, or lower NAABU_TOP_PORTS to cover everything."
+                fi
+            fi
+            log_info "  Stage 4a: Naabu fast scan (top ${NAABU_TOP_PORTS:-1000} ports, rate ${NAABU_RATE:-1000} pps, cap ${naabu_timeout}s)"
+            timeout "$naabu_timeout" naabu \
                 -list "${pdir}/nmap_candidates.txt" \
                 -top-ports "${NAABU_TOP_PORTS:-1000}" \
                 -rate "${NAABU_RATE:-1000}" \
@@ -345,11 +403,59 @@ run_phase3() {
         else
             log_warn "No open ports found"
         fi
-    elif [[ "$PORT_SCAN" != true ]]; then
-        log_skip "Port scanning disabled (--no-port-scan)"
-    else
-        log_warn "No nmap candidates to port scan"
     fi
 
+    # Late-window hostnames: anything that resolved AFTER Phase 1's HTTPX
+    # rounds never got probed. Phase 1 is the only stage that runs httpx, so a
+    # host resolved in Phase 2 or in this phase's final resolution pass stayed
+    # invisible — 172 real hosts on one target were port-scanned here without
+    # anyone ever checking whether they serve HTTP.
+    _probe_late_resolved_hosts
+
     log_success "Phase 3 complete"
+}
+
+# ── Probe hostnames that resolved after Phase 1 stopped looking ────────────────
+# Phase 1 runs httpx three times, all before Phase 2 and Phase 3 do their own
+# resolution passes. Everything those later passes recovered was left with DNS
+# records and no HTTP metadata, so it never reached final_live_web_servers.txt.
+# This closes that gap without re-probing anything already known.
+_probe_late_resolved_hosts() {
+    local pdir="${OUTPUT_DIR}/phase3"
+    local dns_tsv="${CANONICAL_DNS_TSV:-${OUTPUT_DIR}/canonical_dns.tsv}"
+    local meta_tsv="${HTTPX_META_TSV:-${OUTPUT_DIR}/httpx_metadata.tsv}"
+    local pending="${pdir}/.late_probe.txt"
+
+    [[ -s "$dns_tsv" ]] || return 0
+    command -v httpx &>/dev/null || return 0
+
+    # Resolved hosts with no HTTPX metadata row yet.
+    if [[ -s "$meta_tsv" ]]; then
+        cut -f1 "$meta_tsv" | sort -u > "${pending}.probed"
+    else
+        : > "${pending}.probed"
+    fi
+    awk -F'\t' '$1 == "hostname" && $2 == "root_domain" { next } $7 == "resolved" { print $1 }' \
+        "$dns_tsv" | sort -u > "${pending}.resolved"
+    comm -23 "${pending}.resolved" "${pending}.probed" > "$pending" || true
+
+    local n=0
+    [[ -s "$pending" ]] && n=$(wc -l < "$pending")
+    rm -f "${pending}.resolved" "${pending}.probed"
+    if (( n == 0 )); then
+        rm -f "$pending"
+        return 0
+    fi
+
+    log_info "Stage 5: Probing ${n} hostname(s) that resolved after Phase 1's HTTPX rounds"
+    httpx_probe "$pending" "${pdir}/httpx_results_late.json"
+    if [[ -s "${pdir}/httpx_results_late.json" ]]; then
+        jq -r '.url' "${pdir}/httpx_results_late.json" 2>/dev/null | sort -u \
+            > "${pdir}/live_hosts_late.txt" || : > "${pdir}/live_hosts_late.txt"
+        log_success "Late-window live hosts: $(wc -l < "${pdir}/live_hosts_late.txt") of ${n}"
+    else
+        : > "${pdir}/live_hosts_late.txt"
+        log_info "Late-window probe: none of the ${n} newly resolved hostname(s) answered HTTP"
+    fi
+    rm -f "$pending"
 }

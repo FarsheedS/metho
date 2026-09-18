@@ -14,7 +14,12 @@ run_consolidation() {
     [[ -s "${fdir}/final_all_domains.txt" ]] && domain_total=$(wc -l < "${fdir}/final_all_domains.txt")
 
     # ── Live Web Servers ────────────────────────────────────────────────────
-    cat "${OUTPUT_DIR}"/phase1/*/live_subdomains_final.txt 2>/dev/null | sort -u > "${fdir}/final_live_web_servers.txt" || true
+    # Phase 1's per-domain results plus Phase 3's late-window probe — hosts
+    # that only resolved after Phase 1 finished looking, and which would
+    # otherwise carry DNS records but never appear as live servers.
+    cat "${OUTPUT_DIR}"/phase1/*/live_subdomains_final.txt \
+        "${OUTPUT_DIR}/phase3/live_hosts_late.txt" \
+        2>/dev/null | sort -u > "${fdir}/final_live_web_servers.txt" || true
     local live_total=0
     [[ -s "${fdir}/final_live_web_servers.txt" ]] && live_total=$(wc -l < "${fdir}/final_live_web_servers.txt")
 
@@ -40,7 +45,7 @@ run_consolidation() {
     # ── Canonical DNS Dataset ───────────────────────────────────────────────
     if [[ -s "${OUTPUT_DIR}/canonical_dns.tsv" ]]; then
         cp "${OUTPUT_DIR}/canonical_dns.tsv" "${fdir}/canonical_dns.tsv"
-        log_info "Canonical DNS dataset: $(tail -n +2 "${fdir}/canonical_dns.tsv" | wc -l) entries"
+        log_info "Canonical DNS dataset: $(awk -F'\t' '$1 != "hostname"' "${fdir}/canonical_dns.tsv" | wc -l) entries"
     fi
 
     # ── HTTPX Metadata TSV (per-host CDN/tech/webserver companion) ──────────

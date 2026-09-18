@@ -45,8 +45,29 @@ run_phase1() {
         return 0
     }
 
-    log_info "Processing ${domain_count} domains with ${PARALLEL_DOMAINS:-3} parallel workers..."
-    bounded_parallel "${PARALLEL_DOMAINS:-3}" "$root_domains_file" _process_domain_wrapper
+    # --rate-limit is an aggregate budget against the targets, but each
+    # parallel domain worker runs its own httpx/katana/cewl. Divide it by the
+    # number of workers actually started so a 70-domain sweep does not offer
+    # PARALLEL_DOMAINS× the configured request rate to every target at once.
+    local _workers="${PARALLEL_DOMAINS:-3}"
+    (( _workers > domain_count )) && _workers=$domain_count
+    (( _workers < 1 )) && _workers=1
+    if [[ "$_workers" -gt 1 ]]; then
+        METHO_HTTPX_RATE=$(( ${RATE_LIMIT:-100} / _workers ))
+        (( METHO_HTTPX_RATE < 5 )) && METHO_HTTPX_RATE=5
+    else
+        METHO_HTTPX_RATE="${RATE_LIMIT:-100}"
+    fi
+    export METHO_HTTPX_RATE
+
+    log_info "Processing ${domain_count} domains with ${_workers} parallel workers (per-worker httpx rate: ${METHO_HTTPX_RATE}/s, aggregate ${RATE_LIMIT:-100}/s)..."
+    bounded_parallel "$_workers" "$root_domains_file" _process_domain_wrapper
+
+    # The per-worker rate only applies while several Phase 1 domains run at
+    # once. Clearing it restores the full --rate-limit for the single-threaded
+    # probes later (Phase 3's late-window httpx pass), which share no budget
+    # with anything else.
+    unset METHO_HTTPX_RATE
 
     # Merge all per-domain canonical DNS TSVs into the global dataset
     merge_per_domain_dns
@@ -207,9 +228,15 @@ process_domain() {
     log_info "Attempting DNS zone transfer (AXFR)..."
     : > axfr_results.txt
     printf '%s\n' "$domain" > axfr_input.txt
+    # AXFR is a TCP/53 conversation with the zone's authoritative server, so it
+    # cannot ride the UDP DoH proxy: dnsx uses -r only to locate the NS, then
+    # connects to it directly. Hand it a real address, not the local proxy.
+    local _axfr_resolver
+    _axfr_resolver=$(_direct_resolver_file)
     timeout 30 dnsx -silent -axfr -resp-only \
         -l axfr_input.txt \
-        -r ${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt} \
+        -r "${_axfr_resolver}" \
+        -timeout "$(_dnsx_query_timeout)" \
         < /dev/null > axfr_results.txt 2>/dev/null || true
     if [[ -s axfr_results.txt ]]; then
         extract_domains axfr_results.txt axfr_all_domains.txt || true
@@ -482,10 +509,11 @@ WORDBASE
         timeout "${BRUTEFORCE_TIMEOUT:-900}" dnsx \
             -d "$domain" \
             -w wordlists/custom_wordlist.txt \
-            -r ${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt} \
+            -r "${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt}" \
+            -timeout "$(_dnsx_query_timeout)" \
             -auto-wildcard \
             -duc -silent \
-            -t 500 \
+            -t "$(_dnsx_threads)" \
             -o shuffledns_results.txt \
             >> "$bruteforce_log" 2>&1 || bruteforce_exit=$?
 
@@ -631,8 +659,8 @@ WORDBASE
                 timeout "$_resolve_timeout" dnsx \
                     -l dnsgen_permutations.txt \
                     -silent -wd "$domain" -wt 1 \
-                    -r ${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt} \
-                    -t 500 -timeout 5 -json \
+                    -r "${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt}" \
+                    -t "$(_dnsx_threads)" -timeout "$(_dnsx_query_timeout)" -json \
                     < /dev/null 2>/dev/null > dnsgen_results.json || true
 
                 if [[ -s dnsgen_results.json ]]; then
@@ -764,16 +792,21 @@ WORDBASE
         _katana_one_host() {
             local url="$1" tag
             tag="$(_safe_name "$url")"
+            # Two caps, and the ORDER matters. Katana's own -ct makes it stop
+            # and flush what it found; the external `timeout` is the backstop
+            # for a process that hangs and ignores -ct. When -ct was 15m under
+            # a 10m `timeout`, katana was SIGTERM'd mid-crawl every time and
+            # -ct was dead config.
             timeout "${KATANA_TIMEOUT:-600}" katana -u "$url" -d 3 -jc -j \
                 -ob -or \
                 -timeout 30 -c 20 -p 1 \
                 -retry 2 -rd 1 -rl 10 \
-                -ct "${KATANA_CRAWL_DURATION:-15m}" \
+                -ct "${KATANA_CRAWL_DURATION:-9m}" \
                 -silent \
                 < /dev/null > "${ka_tmp}/${tag}.jsonl" 2>/dev/null || true
         }
 
-        log_info "Katana: crawling $(wc -l < live_subdomains_round2.txt) hosts (per-host cap ${KATANA_CRAWL_DURATION:-15m}, ${PARALLEL_HOSTS:-5} in parallel)..."
+        log_info "Katana: crawling $(wc -l < live_subdomains_round2.txt) hosts (katana cap ${KATANA_CRAWL_DURATION:-9m}, hard timeout ${KATANA_TIMEOUT:-600}s, ${PARALLEL_HOSTS:-5} in parallel)..."
         bounded_parallel "${PARALLEL_HOSTS:-5}" live_subdomains_round2.txt _katana_one_host
 
         cat "$ka_tmp"/*.jsonl 2>/dev/null > katana/raw_output.jsonl || : > katana/raw_output.jsonl

@@ -15,7 +15,7 @@
 #   A                   semicolon-separated IPv4 addresses
 #   AAAA                semicolon-separated IPv6 addresses
 #   CNAME               semicolon-separated CNAME targets
-#   resolution_status   resolved | nxdomain | timeout | pending
+#   resolution_status   resolved | nxdomain | timeout | bogon | pending
 #
 # The file lives at ${OUTPUT_DIR}/canonical_dns.tsv
 # and is initialized once at pipeline start, then updated incrementally.
@@ -144,11 +144,13 @@ canonical_dns_add_sources() {
                 if (!($0 in new_root) || (new_root[$0] == "" && rd != "")) new_root[$0] = rd
                 next
             }
-            # The TSV header (line 1 of file 2) must be preserved in the
-            # output — dropping it here turned every later call into seeing
-            # the first data row as the "header" (silently skipped),
-            # corrupting the dataset. Print it, then process data rows.
-            FNR == 1 { print; next }
+            # The TSV header must be preserved in the output — dropping it
+            # turned every later call into seeing the first data row as the
+            # "header" (silently skipped), corrupting the dataset. Identify it
+            # by its first field, never by line number: the file is rewritten
+            # by several passes, and a positional FNR==1 test silently eats a
+            # real hostname the moment the header is missing.
+            $1 == "hostname" { print; next }
             {
                 if ($1 in new_root) {
                     consumed[$1] = 1
@@ -182,6 +184,65 @@ canonical_dns_add_sources() {
     log_info "Canonical DNS: added $added new hostnames from $source, updated $skipped existing"
 }
 
+# ── Run one dnsx resolution pass ───────────────────────────────────────────────
+# _dnsx_resolve_to <input_file> <output_json> <resolver_spec> <wall_clock_cap>
+#
+# Appends JSONL to <output_json> and diagnostics to <output_json>.stderr. The
+# caller is responsible for truncating both before the first pass of a batch.
+# Shared by the primary pass and every fallback so the flags can never drift
+# apart between them.
+_dnsx_resolve_to() {
+    local input="$1" out="$2" resolver="$3" cap="$4"
+    cat "$input" | timeout "$cap" dnsx \
+        -silent -a -aaaa -cname -json \
+        -retry "${DNSX_RETRY}" \
+        -r "$resolver" \
+        -timeout "$(_dnsx_query_timeout)" \
+        -t "$(_dnsx_threads)" \
+        2>>"${out}.stderr" >> "$out" || true
+}
+
+# Per-query timeout handed to dnsx. A DoH answer travels as an HTTPS POST
+# through the local proxy, so it is inherently slower than a UDP reply from a
+# resolver on the same continent; a UDP-tuned value makes dnsx abandon queries
+# the proxy is still working on, which reads downstream as "timeout".
+# The DoH budget must exceed the proxy's worst case: it may try every
+# configured endpoint once, each with its own request timeout. At the defaults
+# (3 endpoints × 4s) that is 12s, so dnsx's window is 15s — otherwise dnsx
+# abandons the query while the proxy is still working on it and records a
+# "timeout" for a host that was about to be answered.
+_dnsx_query_timeout() {
+    if [[ "${DNS_MODE}" == "doh" ]]; then
+        echo "${DNSX_QUERY_TIMEOUT_DOH:-15}"
+    else
+        echo "${DNSX_QUERY_TIMEOUT:-5}"
+    fi
+}
+
+# Concurrency handed to each dnsx invocation, per transport.
+#
+# Every Phase 1 worker runs its own dnsx batch concurrently with the others,
+# and in DoH mode all of those batches share ONE local proxy with a fixed
+# worker pool. PARALLEL_DOMAINS × DNSX_THREADS is therefore the real in-flight
+# count against that pool: at 3 domains × 100 threads it is 300 requests
+# against 48 workers, and the queueing that follows pushes queries past dnsx's
+# own per-query timeout — which the pipeline then records as "timeout" on
+# hosts that were about to be answered.
+#
+# UDP has no shared bottleneck (12.7K independent resolvers), so it keeps the
+# higher default.
+_dnsx_threads() {
+    if [[ -n "${DNSX_THREADS:-}" ]]; then
+        echo "$DNSX_THREADS"
+        return
+    fi
+    if [[ "${DNS_MODE}" == "doh" ]]; then
+        echo "${DNSX_THREADS_DOH:-64}"
+    else
+        echo "${DNSX_THREADS_UDP:-100}"
+    fi
+}
+
 # ── Resolve pending hostnames via DNSx ─────────────────────────────────────────
 # canonical_dns_resolve_pending [include_timeouts]
 #
@@ -189,23 +250,23 @@ canonical_dns_add_sources() {
 # dnsx for A/AAAA/CNAME resolution, and updates the TSV in-place.
 # Any extra flags (e.g., -r resolvers.txt) are passed through to dnsx.
 #
-# With the argument "include_timeouts" (and only if DNS has been seen working
-# in this run — METHO_DNS_WORKING=1), previously-timed-out hosts are retried
-# once more. Used by the FINAL passes (Phase 1 Stage 7, Phase 3 Stage 1) so
-# hosts lost to a transient resolver slowdown get a second chance without
-# re-grinding the whole corpus on every delta round.
+# With the argument "include_timeouts" (and only while METHO_DNS_WORKING=1 —
+# i.e. the transport has been answering), previously-timed-out hosts are
+# retried once more. Used by the FINAL passes (Phase 1 Stage 7, Phase 3
+# Stage 1) so hosts lost to a transient resolver slowdown get a second chance
+# without re-grinding the whole corpus on every delta round.
 #
 # Robustness:
 #   * Effective dnsx wall-clock cap scales with the batch size
 #     (max(DNSX_TIMEOUT, pending/50), capped at 3600s) — a fixed 600s cap on a
 #     300K-host batch killed dnsx mid-run and permanently mislabeled every
 #     unprocessed host as "timeout" (never retried: only "pending" re-resolves).
-#   * Total-failure fallback: if dnsx returns NOTHING for the batch, the
-#     system resolver (Docker's 127.0.0.11 / resolv.conf) is probed and, if it
-#     answers, the whole batch is retried through it. Covers networks that
-#     block direct UDP/53 to external resolvers (corporate VPN etc.) while
-#     their own resolver keeps working — no startup health-check can catch a
-#     network that breaks (or recovers) mid-run.
+#   * Transport escalation: when a batch's ANSWER rate collapses, the whole
+#     batch is retried through the other transport (system resolver or the
+#     built-in UDP pool) before any result is recorded. The previous
+#     implementation retried only on EXACTLY zero results, which a
+#     partially-degraded path never produces — the run that motivated this
+#     resolved 1% of its corpus and escalated zero times.
 canonical_dns_resolve_pending() {
     local tsv="${CANONICAL_DNS_TSV:-${OUTPUT_DIR}/canonical_dns.tsv}"
     local pending_file="${tsv}.pending_hosts"
@@ -216,15 +277,12 @@ canonical_dns_resolve_pending() {
         return
     fi
 
-    # Extract pending hostnames — plus, on final passes, timed-out ones (retry)
-    # but only when DNS has been seen HEALTHY this run (set by the previous
-    # resolve pass: >=2% of its batch actually resolved — see the report block
-    # below). "Any host ever resolved" is NOT healthy: a 0.5% resolve rate on
-    # a 28K corpus re-ground the full timeout pile in TWO later passes for
-    # ~150 recoveries each (3 pointless 10-minute grinds per run).
-    local _resolved_before=0
-    _resolved_before=$(awk -F'\t' '$7 == "resolved" {c++} END {print c+0}' "$tsv")
-
+    # Extract pending hostnames — plus, on final passes, timed-out ones, but
+    # only when the transport has been HEALTHY this run (see the health block
+    # at the end of this function). Health means "queries are being answered",
+    # not "many names resolved": a corpus harvested from Certificate
+    # Transparency is legitimately about half NXDOMAIN, and treating that as
+    # failure would disable the retry that recovers genuinely lost hosts.
     if [[ "${1:-}" == "include_timeouts" && "${METHO_DNS_WORKING:-0}" == "1" ]]; then
         awk -F'\t' '$7 == "pending" || $7 == "timeout" {print $1}' "$tsv" > "$pending_file"
     else
@@ -259,50 +317,94 @@ canonical_dns_resolve_pending() {
     # Scale the wall-clock cap with batch size: a fixed 600s cap killed dnsx
     # mid-batch on large corpora and permanently mislabeled unprocessed hosts
     # as "timeout". 1s per 50 hosts ≈ 2.5× headroom at ~2000 q/s, capped at 1h.
-    local eff_timeout="${DNSX_TIMEOUT:-600}"
+    local eff_timeout="${DNSX_TIMEOUT}"
     local _scaled=$(( pending_count / 50 ))
     (( _scaled > eff_timeout )) && eff_timeout=$_scaled
     (( eff_timeout > 3600 )) && eff_timeout=3600
 
+    # Make sure the transport is still alive before a batch depends on it: a
+    # long multi-domain run outlives the proxy's process by many hours.
+    _ensure_dns_transport || true
+
+    local _primary="${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt}"
     : > "$dnsx_json"
+    : > "${dnsx_json}.stderr"
+    _dnsx_resolve_to "$pending_file" "$dnsx_json" "$_primary" "$eff_timeout"
 
-    cat "$pending_file" | timeout "$eff_timeout" dnsx \
-        -silent -a -aaaa -cname -json -retry 2 \
-        -r "${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt}" \
-        -timeout 5 \
-        2>"${dnsx_json}.stderr" > "$dnsx_json" || true
-
-    # Resolver-health check: dnsx's [WRN] line is the only signal that the
-    # RESOLVERS (not the domains) are failing — e.g. a network that blocks
-    # outbound UDP/53 to public resolvers makes the entire shipped list dead
-    # while dnsx still exits 0. Surface it loudly instead of letting every
-    # host silently become "timeout".
+    # ── Health signal: answer rate, not resolution rate ─────────────────────
+    # dnsx's "[WRN] N domains failed to resolve" counts QUERY ERRORS — a
+    # resolver that never answered. It is NOT the count of NXDOMAINs: a name
+    # that does not exist is a perfectly successful query that dnsx reports as
+    # a normal negative answer. So
+    #     answered = attempted - errors
+    # and an answered/(attempted) ratio below the floor means the transport is
+    # broken, regardless of how many names actually exist.
+    #
+    # This replaces a resolution-rate heuristic that could not tell the two
+    # apart. On a real 28K-hostname run, ~43% of the "timeout" pile turned out
+    # to exist and resolve fine on an independent resolver — a rate-based gate
+    # called that environment healthy because a handful of hosts resolved.
+    local _failed_n=0
     if grep -q "domains failed to resolve" "${dnsx_json}.stderr" 2>/dev/null; then
-        local _failed_n
-        _failed_n=$(grep -oE "[0-9]+ domains failed" "${dnsx_json}.stderr" | head -1 | grep -oE "^[0-9]+")
-        if [[ -n "$_failed_n" && "$_failed_n" -ge "$pending_count" ]]; then
-            log_warn "dnsx failed to resolve ${_failed_n}/${pending_count} hosts — if this is ALL of them, the resolvers list (wordlists/resolvers.txt) is likely unreachable from this network"
+        _failed_n=$(grep -oE "[0-9]+ domains failed" "${dnsx_json}.stderr" | head -1 | grep -oE "^[0-9]+" || echo 0)
+        _failed_n=${_failed_n:-0}
+    fi
+    local _answered=$(( pending_count - _failed_n ))
+    (( _answered < 0 )) && _answered=0
+
+    local _min_pct="${DNS_MIN_ANSWER_PCT:-50}"
+    local _min_batch="${DNS_MIN_HEALTH_BATCH:-20}"
+    local _transport="${DNS_TRANSPORT_LABEL:-${DNS_MODE}}"
+
+    if [[ "$_failed_n" -ge "$pending_count" && "$pending_count" -gt 0 ]]; then
+        log_warn "dnsx failed to resolve ${_failed_n}/${pending_count} hosts — the resolver list (${_primary}) is unreachable from this network"
+    fi
+
+    # ── Transport escalation ────────────────────────────────────────────────
+    # A broken transport is retried through the other one BEFORE the results
+    # are merged: an answered name always beats a lost one, and waiting for a
+    # later stage only re-grinds the same pile. The old code did this only
+    # when dnsx returned EXACTLY zero results, which a partially-degraded path
+    # never does — during the observed run it silently wrote off 12k hosts.
+    if (( pending_count > 0 )) && (( _answered * 100 < pending_count * _min_pct )); then
+        local _fallback
+        _fallback=$(_fallback_resolver_file "$_primary")
+        if [[ -n "$_fallback" && "$_fallback" != "$_primary" ]]; then
+            log_warn "DNS transport '${_transport}' answered only ${_answered}/${pending_count} queries — retrying the batch via the fallback transport ($_fallback) ..."
+            local _before_fb _err_before
+            _before_fb=$(wc -l < "$dnsx_json" 2>/dev/null || echo 0)
+            _err_before=$(wc -l < "${dnsx_json}.stderr" 2>/dev/null || echo 0)
+            _dnsx_resolve_to "$pending_file" "$dnsx_json" "$_fallback" "$eff_timeout"
+            local _after_fb _fb_ok
+            _after_fb=$(wc -l < "$dnsx_json" 2>/dev/null || echo 0)
+            _fb_ok=$(( _after_fb - _before_fb ))
+            if (( _fb_ok > 0 )); then
+                log_success "Fallback transport recovered ${_fb_ok} additional answer line(s) for this batch"
+                DNS_TRANSPORT_LABEL="${_transport}+fallback"
+            fi
+
+            # The two passes share one stderr file, so the fallback's own error
+            # count only exists in its slice of it. Reading the file from the
+            # top (as an earlier version did) always returned the PRIMARY
+            # pass's number and made the health flag describe the transport
+            # that had just failed.
+            local _fb_failed
+            _fb_failed=$(tail -n "+$(( _err_before + 1 ))" "${dnsx_json}.stderr" 2>/dev/null \
+                | grep -oE "[0-9]+ domains failed" | head -1 | grep -oE "^[0-9]+") || true
+            if [[ -n "${_fb_failed:-}" ]] && (( _fb_failed < _failed_n )); then
+                _failed_n="$_fb_failed"
+            fi
+        else
+            log_warn "DNS transport '${_transport}' answered only ${_answered}/${pending_count} queries and no fallback transport is usable from this network"
         fi
     fi
 
-    # ── Total-failure fallback: retry the batch through the system resolver ──
-    # Zero results for a non-empty batch means the configured resolvers are
-    # unreachable (blocked UDP/53, dead custom list, network flap). If the
-    # network's own resolver answers, redo the batch through it — a working
-    # pipeline beats a dead one. (No-op when RESOLVERS_FILE already IS the
-    # system resolver, e.g. after a custom-list health-check fallback.)
-    if [[ ! -s "$dnsx_json" ]]; then
-        local sys_dns
-        sys_dns=$(_probe_system_resolver)
-        if [[ -n "$sys_dns" && "$sys_dns" != "${RESOLVERS_FILE:-}" ]]; then
-            log_warn "Canonical DNS: dnsx returned 0 results for ${pending_count} hosts — retrying via system resolver (${sys_dns}) ..."
-            cat "$pending_file" | timeout "$eff_timeout" dnsx \
-                -silent -a -aaaa -cname -json -retry 2 \
-                -r "$sys_dns" \
-                -timeout 5 \
-                2>>"${dnsx_json}.stderr" >> "$dnsx_json" || true
-        fi
-    fi
+    # Recompute the answered count from the (possibly improved) error figure so
+    # the health flag below describes the transport that actually served the
+    # batch. Both passes count their own errors against the same batch, so the
+    # signal kept is the BEST pass, never the sum.
+    _answered=$(( pending_count - _failed_n ))
+    (( _answered < 0 )) && _answered=0
 
     rm -f "${dnsx_json}.stderr"
 
@@ -344,7 +446,12 @@ canonical_dns_resolve_pending() {
                 }
                 close(NR_FILE)
             }
-            FNR == 1 { next }
+            # Identify the header by CONTENT and PRESERVE it. This pass is what
+            # used to destroy it: `FNR == 1 { next }` dropped line 1
+            # unconditionally, so the first resolution after init_canonical_dns
+            # silently removed the header row — and every downstream consumer
+            # that then skipped "line 1" ate a real hostname instead.
+            $1 == "hostname" && $2 == "root_domain" { print; next }
             {
                 if ($1 in dst) {
                     if (da[$1]    != "") $4 = da[$1]
@@ -399,7 +506,7 @@ canonical_dns_resolve_pending() {
             }
             return out
         }
-        FNR == 1 { print; next }
+        $1 == "hostname" && $2 == "root_domain" { print; next }
         {
             $4 = filter_reserved($4)
             $5 = filter_reserved($5)
@@ -426,26 +533,27 @@ canonical_dns_resolve_pending() {
     CANONICAL_LAST_BOGON=$bogon
     CANONICAL_LAST_TIMEOUT=$timeout
 
-    # DNS-health gate for include_timeouts retries: a pass counts as "healthy"
-    # only if it resolved >=2% of the batch it attempted (delta vs the resolved
-    # count captured before the pass). A pass that resolved a handful of a
-    # 28K pile marks DNS UNHEALTHY — later final passes must not re-grind the
-    # full timeout list for marginal gain (observed: 3 pointless 10-minute
-    # grinds per run at a 0.5% resolve rate, ~150 recoveries each).
-    # Hysteresis: small batches that fully NXDOMAIN on an otherwise healthy
-    # network must NOT clear the flag — only unset when a LARGE batch (>=1000)
-    # resolves nothing at all (network died mid-run).
-    local _delta=$(( resolved - _resolved_before ))
-    local _healthy_threshold=$(( pending_count / 50 ))
-    (( _healthy_threshold < 1 )) && _healthy_threshold=1
-    if (( _delta >= _healthy_threshold )); then
-        METHO_DNS_WORKING=1
-        log_info "DNS health: $_delta/$pending_count resolved this pass (>=2% — healthy); timeout retries enabled"
-    elif (( _delta == 0 && pending_count >= 1000 )); then
-        METHO_DNS_WORKING=0
-        log_warn "DNS health: 0/$pending_count resolved this pass — DNS UNHEALTHY; timeout retries disabled"
+    # ── DNS-health gate for include_timeouts retries ────────────────────────
+    # "Healthy" means the TRANSPORT answered the queries — not that many names
+    # resolved. A batch of 28K hostnames harvested from Certificate
+    # Transparency is expected to be ~half NXDOMAIN; that is a working
+    # resolver reporting real negatives, and it must NOT disable retries.
+    # What disables them is a transport that could not answer at all.
+    #
+    # Both directions are gated on a minimum batch size. The previous
+    # implementation only guarded the UNSET direction, so a 10-host batch that
+    # happened to resolve 8 flipped the flag to healthy and re-armed a
+    # 28,927-host re-grind that took 10 minutes and recovered 173 names.
+    if (( pending_count >= _min_batch )); then
+        if (( _answered * 100 >= pending_count * _min_pct )); then
+            METHO_DNS_WORKING=1
+            log_info "DNS health: transport '${DNS_TRANSPORT_LABEL:-${DNS_MODE}}' answered $_answered/$pending_count queries (>=${_min_pct}% — healthy); timeout retries enabled"
+        else
+            METHO_DNS_WORKING=0
+            log_warn "DNS health: transport '${DNS_TRANSPORT_LABEL:-${DNS_MODE}}' answered only $_answered/$pending_count queries (<${_min_pct}%) — DNS UNHEALTHY; timeout retries disabled"
+        fi
     else
-        log_info "DNS health: $_delta/$pending_count resolved this pass — no change to health state"
+        log_info "DNS health: batch of $pending_count is below the ${_min_batch}-query floor — health flag unchanged (was ${METHO_DNS_WORKING:-0})"
     fi
 
     if [[ "$bogon" -gt 0 ]]; then
@@ -453,6 +561,90 @@ canonical_dns_resolve_pending() {
     fi
 
     rm -f "$pending_file" "$dnsx_json"
+}
+
+# ── Distinguish "this name does not exist" from "we could not ask" ─────────────
+# canonical_dns_label_nxdomain
+#
+# Every hostname that produced no A/AAAA/CNAME is currently recorded as
+# "timeout", which conflates two very different things:
+#
+#   * the name does not exist (NXDOMAIN) — settled, nothing was lost, and
+#     re-resolving it on a later run is pure waste; and
+#   * the resolver never answered — unresolved, possibly a live host that a
+#     working transport would have found.
+#
+# Without the distinction the dataset cannot answer the only question that
+# matters after a run that resolves 1% of its corpus: "is this a dead corpus
+# or a dead transport?" During the observed run all 28,716 unanswered rows
+# said "timeout", while an independent resolver showed ~43% of them exist.
+#
+# dnsx reports the rcode in JSON, but only for hosts it is asked to emit: with
+# `-a -aaaa -cname` a host with no records of those types produces no line at
+# all, which is why the rcode was never available. `-rcode nxdomain` with no
+# record-type flags emits exactly the hosts that authoritatively do not exist.
+#
+# Runs once, at the end of the pipeline, over whatever is still unresolved —
+# bounded by a wall-clock cap rather than a host cap so a large corpus is
+# labelled as far as it gets instead of being skipped outright.
+canonical_dns_label_nxdomain() {
+    local tsv="${CANONICAL_DNS_TSV:-${OUTPUT_DIR}/canonical_dns.tsv}"
+    [[ -s "$tsv" ]] || return 0
+
+    if [[ "${METHO_NXDOMAIN_LABEL:-1}" == "0" ]]; then
+        log_info "Canonical DNS: NXDOMAIN labelling disabled (METHO_NXDOMAIN_LABEL=0) — unresolved hosts stay 'timeout'"
+        return 0
+    fi
+
+    local pile="${tsv}.nx_pile" map="${tsv}.nx_map" raw="${tsv}.nx_raw"
+    awk -F'\t' '$1 == "hostname" && $2 == "root_domain" { next } $7 == "timeout" { print $1 }' \
+        "$tsv" > "$pile"
+
+    local n=0
+    [[ -s "$pile" ]] && n=$(wc -l < "$pile")
+    if (( n == 0 )); then
+        rm -f "$pile"
+        return 0
+    fi
+    if ! command -v dnsx &>/dev/null; then
+        rm -f "$pile"
+        return 0
+    fi
+
+    local cap="${DNSX_TIMEOUT}"
+    local scaled=$(( n / 50 ))
+    (( scaled > cap )) && cap=$scaled
+    (( cap > 3600 )) && cap=3600
+
+    log_info "Canonical DNS: confirming NXDOMAIN for ${n} unresolved hostname(s) (rcode pass, ${cap}s cap)"
+
+    : > "$raw"
+    cat "$pile" | timeout "$cap" dnsx \
+        -silent -rcode nxdomain -json \
+        -retry "${DNSX_RETRY}" \
+        -r "${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt}" \
+        -timeout "$(_dnsx_query_timeout)" \
+        -t "$(_dnsx_threads)" \
+        2>/dev/null > "$raw" || true
+
+    jq -r '(.host | ascii_downcase | sub("^[*][.]"; "") | sub("[.]$"; ""))' "$raw" 2>/dev/null \
+        | sort -u > "$map" || : > "$map"
+
+    local confirmed=0
+    [[ -s "$map" ]] && confirmed=$(wc -l < "$map")
+
+    if (( confirmed > 0 )); then
+        awk -F'\t' -v OFS='\t' -v NR_FILE="$map" '
+            BEGIN { while ((getline dl < NR_FILE) > 0) if (dl != "") nx[dl] = 1; close(NR_FILE) }
+            $1 == "hostname" && $2 == "root_domain" { print; next }
+            { if ($7 == "timeout" && ($1 in nx)) $7 = "nxdomain"; print }
+        ' "$tsv" > "${tsv}.nx_applied" && mv "${tsv}.nx_applied" "$tsv"
+        log_success "Canonical DNS: ${confirmed} hostname(s) confirmed NXDOMAIN — settled, not lost (the remaining $(awk -F'\t' '$7 == "timeout" {c++} END {print c+0}' "$tsv") 'timeout' rows are genuinely unresolved)"
+    else
+        log_warn "Canonical DNS: NXDOMAIN confirmation returned nothing for ${n} hostname(s) — they stay 'timeout' (unresolved, not proven dead)"
+    fi
+
+    rm -f "$pile" "$map" "$raw"
 }
 
 # ── Merge HTTPX metadata into the canonical dataset ────────────────────────────
@@ -528,34 +720,6 @@ canonical_dns_merge_httpx() {
     log_info "Canonical DNS: merged HTTPX metadata from $httpx_json"
 }
 
-# ── Extract all hostnames from the canonical dataset ──────────────────────────
-canonical_dns_extract_hostnames() {
-    local tsv="${CANONICAL_DNS_TSV:-${OUTPUT_DIR}/canonical_dns.tsv}"
-    if [[ ! -s "$tsv" ]]; then
-        echo ""
-        return
-    fi
-    # Skip header, print column 1
-    tail -n +2 "$tsv" | awk -F'\t' '{print $1}'
-}
-
-# ── Extract all unique resolved IPs (A records) ──────────────────────────────
-canonical_dns_extract_ips() {
-    local tsv="${CANONICAL_DNS_TSV:-${OUTPUT_DIR}/canonical_dns.tsv}"
-    if [[ ! -s "$tsv" ]]; then
-        echo ""
-        return
-    fi
-    # Skip header, extract A column, split on semicolons, dedup
-    tail -n +2 "$tsv" | awk -F'\t' '{
-        n = split($4, ips, ";")
-        for (i = 1; i <= n; i++) {
-            gsub(/^[ \t]+|[ \t]+$/, "", ips[i])
-            if (ips[i] != "") print ips[i]
-        }
-    }' | sort -u
-}
-
 # ── Extract hostnames with a specific resolution status ───────────────────────
 canonical_dns_extract_by_status() {
     local status="$1"
@@ -572,23 +736,7 @@ canonical_dns_extract_resolved() {
     canonical_dns_extract_by_status "resolved"
 }
 
-# ── Look up HTTPX CDN flag for a hostname ─────────────────────────────────────
-# Returns "true" or "false" based on httpx_metadata.tsv
-get_httpx_cdn_for_host() {
-    local host="$1"
-    local meta_tsv="${HTTPX_META_TSV:-${OUTPUT_DIR}/httpx_metadata.tsv}"
-    if [[ ! -s "$meta_tsv" ]]; then
-        echo "false"
-        return
-    fi
-    local cdn
-    cdn=$(awk -F'\t' -v h="$host" '$1 == h {print $2; exit}' "$meta_tsv" 2>/dev/null)
-    if [[ "$cdn" == "true" ]]; then
-        echo "true"
-    else
-        echo "false"
-    fi
-}
+
 
 # ── Merge per-domain canonical DNS TSVs into the global TSV ───────────────────
 # After parallel Phase 1 processing, each domain has its own canonical_dns.tsv
@@ -653,7 +801,10 @@ merge_per_domain_dns() {
                 }
                 return out
             }
-            FNR == 1 { next }  # skip headers
+            # Skip headers by content. A positional FNR==1 skip drops the first
+            # real hostname of every per-domain TSV, which is exactly how
+            # hosts discovered early were lost from the merged dataset.
+            $1 == "hostname" && $2 == "root_domain" { next }
             {
                 h = $1
                 if (h == "") next
@@ -679,7 +830,7 @@ merge_per_domain_dns() {
         ' "${per_domain_tsvs[@]}" >> "$global_tsv"
 
         local entry_count=0
-        [[ -s "$global_tsv" ]] && entry_count=$(tail -n +2 "$global_tsv" | wc -l)
+        [[ -s "$global_tsv" ]] && entry_count=$(awk -F'\t' '$1 != "hostname"' "$global_tsv" | wc -l)
         log_success "Merged canonical DNS: $entry_count entries from ${#per_domain_tsvs[@]} per-domain TSVs"
         # METHO_DNS_WORKING is set inside the per-domain subshells during Phase 1
         # and does not survive into this (parent) shell — re-derive it from the
@@ -711,7 +862,7 @@ merge_per_domain_dns() {
 
         # Last record per host wins (same semantics as canonical_dns_merge_httpx).
         awk -F'\t' -v OFS='\t' '
-            FNR == 1 { next }  # skip headers
+            $1 == "hostname" { next }  # skip the metadata header
             {
                 if ($1 == "") next
                 if (!($1 in seen)) order[++n] = $1
@@ -724,7 +875,7 @@ merge_per_domain_dns() {
         ' "${per_domain_metas[@]}" >> "$global_meta"
 
         local meta_count=0
-        [[ -s "$global_meta" ]] && meta_count=$(tail -n +2 "$global_meta" | wc -l)
+        [[ -s "$global_meta" ]] && meta_count=$(awk -F'\t' '$1 != "hostname"' "$global_meta" | wc -l)
         log_info "Merged HTTPx metadata: $meta_count entries from ${#per_domain_metas[@]} per-domain files"
     fi
 }

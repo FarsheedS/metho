@@ -48,10 +48,11 @@ run_phase2() {
             log_info "  Querying $(wc -l < "$canonical_hosts") resolved hosts for cloud record types (CNAME/MX/NS/TXT)"
 
             cat "$canonical_hosts" \
-                | timeout "${DNSX_TIMEOUT:-600}" dnsx -cname -mx -ns -txt \
-                    -json -retry 3 \
-                    -r ${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt} \
-                    -timeout 5 \
+                | timeout "${DNSX_TIMEOUT}" dnsx -cname -mx -ns -txt \
+                    -json -retry "${DNSX_RETRY}" \
+                    -r "${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt}" \
+                    -timeout "$(_dnsx_query_timeout)" \
+                    -t "$(_dnsx_threads)" \
                     2>>"$dnsx_log" \
                 | tee "${pdir}/dnsx_output.json" >/dev/null || \
                     log_warn "DNSx exited non-zero (or was killed by DNSX_TIMEOUT) — see ${dnsx_log}"
@@ -78,18 +79,7 @@ run_phase2() {
                 # are resolved/tracked below.
                 extract_domains "${pdir}/dnsx_all_records.txt" "${pdir}/dnsx_all_domains.txt" || true
                 local in_scope_file="${pdir}/dnsx_in_scope_domains.txt"
-                : > "$in_scope_file"
-                if [[ -s "${pdir}/dnsx_all_domains.txt" && -s "${ROOT_DOMAINS_FILE:-/nonexistent}" ]]; then
-                    local rd
-                    while IFS= read -r rd; do
-                        [[ -z "$rd" ]] && continue
-                        rd=$(normalize_hostname "$rd")
-                        [[ -z "$rd" ]] && continue
-                        local escaped_rd="${rd//./\\.}"
-                        grep -E "(^|\.)${escaped_rd}$" "${pdir}/dnsx_all_domains.txt" >> "$in_scope_file" || true
-                    done < "$ROOT_DOMAINS_FILE"
-                    sort -u "$in_scope_file" -o "$in_scope_file"
-                fi
+                filter_in_scope_hostnames "${pdir}/dnsx_all_domains.txt" "$in_scope_file"
                 [[ -s "$in_scope_file" ]] && canonical_dns_add_sources "dnsx-cloud" "$in_scope_file"
 
                 # Resolve any newly discovered hostnames incrementally
@@ -153,13 +143,20 @@ run_phase2() {
             done
             log_info "  Cloud_Enum keywords: $_kw_list (wall-clock cap ${CLOUD_ENUM_TIMEOUT:-1800}s)"
 
-            # Emit one -k per keyword. cloud_enum parses resolver files with
-            # dnspython (plain IPs only) — in DoH mode RESOLVERS_FILE contains
-            # doh: URLs it cannot read, so swap in a plain-IP file (system
-            # resolver) or drop the flag entirely (cloud_enum then uses its
-            # own default resolver).
+            # Emit one -k per keyword. cloud_enum parses its resolver file
+            # with dnspython, which accepts BARE IP ADDRESSES ONLY — the DoH
+            # proxy's "127.0.0.1:PORT" form is rejected outright. Swap in a
+            # plain-IP list, or drop the flag entirely (cloud_enum then falls
+            # back to its own default resolver).
             local nsf_file
             nsf_file=$(_plain_ip_resolver_file)
+            # The getter stays silent so its stdout is only ever the path;
+            # reporting happens here, from what it returned.
+            if [[ -z "$nsf_file" ]]; then
+                log_warn "cloud_enum needs a resolver file of bare IPs and neither the active one nor the system resolver qualifies — its DNS checks will be skipped"
+            elif [[ "$nsf_file" != "${RESOLVERS_FILE:-}" ]]; then
+                log_warn "cloud_enum cannot read the active resolver file (it accepts bare IPs only) — falling back to the system resolver ($(head -1 "$nsf_file")) for its DNS checks"
+            fi
             local -a ce_args=()
             [[ -n "$nsf_file" ]] && ce_args+=(-nsf "$nsf_file")
             for kw in "${ce_kw[@]}"; do
@@ -170,6 +167,11 @@ run_phase2() {
             timeout "${CLOUD_ENUM_TIMEOUT:-1800}" python3 \
                 /opt/tools/cloud_enum/cloud_enum.py "${ce_args[@]}" 2>>"$ce_log" || \
                     log_warn "Cloud_Enum exited non-zero or was killed by CLOUD_ENUM_TIMEOUT -- see ${ce_log}"
+            # A non-zero exit does not necessarily mean the results are gone:
+            # cloud_enum appends to its JSON log as it goes, so whatever it
+            # logged before stopping is still parsed below. The usual trigger
+            # is an unhandled dns.resolver.NoAnswer inside cloud_enum itself
+            # (it does not catch it), which aborts the run mid-way.
 
             if [[ -s "${pdir}/cloud_enum_results.json" ]]; then
                 # cloud_enum interleaves banner/status lines with JSON objects
@@ -182,10 +184,23 @@ run_phase2() {
                     "${pdir}/cloud_enum_results.json" 2>/dev/null | \
                     sort -u > "${pdir}/cloud_enum_assets.txt" || true
 
-                # Extract any newly discovered hostnames from cloud_enum and add to canonical dataset
+                # Extract any newly discovered hostnames from cloud_enum and add
+                # to the canonical dataset — but only in-scope ones. cloud_enum
+                # reports the buckets it finds by NAME (some-bucket.s3.amazonaws.com,
+                # …elb.amazonaws.com), which are AWS-owned endpoints, not hosts of
+                # the target. Ingesting them unfiltered sent their IPs straight
+                # into nmap_candidates and got Amazon's S3 frontends port-scanned.
                 extract_domains "${pdir}/cloud_enum_assets.txt" "${pdir}/cloud_enum_all_domains.txt" || true
-                [[ -s "${pdir}/cloud_enum_all_domains.txt" ]] && canonical_dns_add_sources "cloud_enum" "${pdir}/cloud_enum_all_domains.txt"
-                canonical_dns_resolve_pending
+                local ce_in_scope="${pdir}/cloud_enum_in_scope_domains.txt"
+                filter_in_scope_hostnames "${pdir}/cloud_enum_all_domains.txt" "$ce_in_scope"
+                if [[ -s "$ce_in_scope" ]]; then
+                    canonical_dns_add_sources "cloud_enum" "$ce_in_scope"
+                    canonical_dns_resolve_pending
+                else
+                    local _ce_dropped=0
+                    [[ -s "${pdir}/cloud_enum_all_domains.txt" ]] && _ce_dropped=$(wc -l < "${pdir}/cloud_enum_all_domains.txt")
+                    (( _ce_dropped > 0 )) && log_info "  Cloud_Enum: ${_ce_dropped} discovered hostname(s) are out of scope (third-party cloud endpoints) — recorded as cloud assets, not resolved or scanned"
+                fi
 
                 local ce_count=0
                 [[ -s "${pdir}/cloud_enum_assets.txt" ]] && ce_count=$(wc -l < "${pdir}/cloud_enum_assets.txt")

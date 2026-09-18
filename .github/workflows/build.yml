@@ -25,17 +25,28 @@ jobs:
 
       - name: Verify runtime binaries
         run: |
+          # naabu + github-subdomains replaced shuffledns + massdns in the
+          # Dockerfile; verifying the old pair failed every build.
           docker run --rm --entrypoint sh ghcr.io/${{ github.repository_owner }}/metho:latest -c 'subfaster -h 2>&1 | grep -q . && \
                    httpx -h 2>&1 | grep -q . && \
                    katana -h 2>&1 | grep -q . && \
                    dnsx -h 2>&1 | grep -q . && \
-                   shuffledns -h 2>&1 | grep -q . && \
-                   massdns 2>&1 | grep -q . && \
+                   naabu -h 2>&1 | grep -q . && \
+                   github-subdomains -h 2>&1 | grep -q . && \
                    waymore --help 2>&1 | grep -q . && \
                    test -f /opt/tools/SubDomainizer/SubDomainizer.py && \
                    test -f /opt/tools/cloud_enum/cloud_enum.py && \
                    python3 -c "import bs4, requests, termcolor, colorama, tldextract, cffi, dns.resolver, requests_futures" && \
                    echo "All runtime tools OK"'
+
+      - name: Verify DoH proxy
+        run: |
+          # The DoH proxy carries every DNS query in the default dns-mode.
+          # Compile it and exercise argument parsing so a broken proxy fails
+          # the build rather than the first run.
+          docker run --rm --entrypoint sh ghcr.io/${{ github.repository_owner }}/metho:latest -c 'python3 -m py_compile /opt/scripts/lib/doh_proxy.py && \
+                   python3 /opt/scripts/lib/doh_proxy.py --help > /dev/null && \
+                   echo "DoH proxy OK"'
 
       - name: Verify pipeline scripts
         run: |
@@ -47,6 +58,8 @@ jobs:
                    bash -n /opt/scripts/lib/consolidate.sh && \
                    bash -n /opt/scripts/lib/canonical_dns.sh && \
                    bash -n /opt/scripts/lib/classify.sh && \
+                   bash -n /opt/scripts/lib/results.sh && \
+                   bash -n /opt/scripts/entrypoint.sh && \
                    bash -n /opt/scripts/config/asn_providers.sh && \
                    echo "All scripts OK"'
 
