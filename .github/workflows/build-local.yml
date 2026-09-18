@@ -38,8 +38,18 @@ jobs:
                    bash -n /opt/scripts/lib/canonical_dns.sh && \
                    bash -n /opt/scripts/lib/classify.sh && \
                    bash -n /opt/scripts/lib/results.sh && \
+                   bash -n /opt/scripts/entrypoint.sh && \
                    bash -n /opt/scripts/config/asn_providers.sh && \
                    echo "All scripts OK"'
+
+      - name: Verify DoH proxy
+        run: |
+          # The DoH proxy carries every DNS query in the default dns-mode.
+          # Compile it and exercise argument parsing so a broken proxy fails
+          # the build rather than the first run.
+          docker run --rm --entrypoint sh metho -c 'python3 -m py_compile /opt/scripts/lib/doh_proxy.py && \
+                   python3 /opt/scripts/lib/doh_proxy.py --help > /dev/null && \
+                   echo "DoH proxy OK"'
 
       - name: Run unit tests
         run: |

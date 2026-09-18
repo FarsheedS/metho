@@ -16,6 +16,161 @@
 # An IP receives exactly ONE primary classification.
 # CDN IPs are retained in results but excluded from nmap scanning.
 
+# ── ASN data acquisition ──────────────────────────────────────────────────────
+# Both helpers write rows in `whois.cymru.com` bulk "verbose" format so the
+# parsers downstream do not care which transport produced them:
+#   AS | IP | BGP-Prefix | CC | Registry | Allocated | AS Name ...
+
+# Transport 1: the whois service on TCP/43, one round trip for every IP.
+# Retried: this used to be a single unguarded `nc`, and when it failed the run
+# carried on with every IP classified "unknown", which silently disabled the
+# CDN exclusion and pointed naabu/nmap at Akamai, Imperva and Amazon S3.
+_cymru_whois_lookup() {
+    local ips_file="$1" out_file="$2"
+    local attempts="${CYMRU_WHOIS_ATTEMPTS:-3}" attempt
+
+    for (( attempt = 1; attempt <= attempts; attempt++ )); do
+        { echo begin; echo verbose; cat "$ips_file"; echo end; } \
+            | timeout "${CYMRU_WHOIS_TIMEOUT:-60}" nc -w 20 whois.cymru.com 43 \
+                2>/dev/null > "$out_file" || true
+        # A successful bulk query is prefixed by a "Bulk mode;" banner. Without
+        # it this is a failed connection, not an empty result.
+        if grep -q "^Bulk mode" "$out_file" 2>/dev/null \
+           && awk -F'|' 'NF > 6' "$out_file" | grep -q .; then
+            return 0
+        fi
+        if (( attempt < attempts )); then
+            log_warn "ASN lookup via whois.cymru.com:43 returned no usable data (attempt ${attempt}/${attempts}) — retrying"
+            sleep 2
+        fi
+    done
+    return 1
+}
+
+# Transport 2: Team Cymru's DNS service (origin.asn.cymru.com / asn.cymru.com).
+# This rides the pipeline's normal resolver path, so it still works on networks
+# that block outbound TCP/43 — which is precisely the failure that broke
+# classification in the observed run.
+_cymru_dns_lookup() {
+    local ips_file="$1" out_file="$2"
+    local work="${out_file}.dns"
+    : > "$out_file"
+
+    command -v dnsx &>/dev/null || return 1
+    command -v jq &>/dev/null || return 1
+
+    local rfile="${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt}"
+    local cap="${DNSX_TIMEOUT}"
+    local qtimeout
+    qtimeout=$(_dnsx_query_timeout)
+
+    # Reverse each address into the Cymru origin zone, keeping the mapping so
+    # answers can be joined back to the IPs that produced them.
+    awk -F'.' 'NF == 4 { printf "%s.%s.%s.%s.origin.asn.cymru.com\t%s\n", $4, $3, $2, $1, $0 }' \
+        "$ips_file" | sort -u > "${work}.map"
+    cut -f1 "${work}.map" > "${work}.names"
+
+    cat "${work}.names" | timeout "$cap" dnsx \
+        -silent -txt -json -retry "${DNSX_RETRY}" \
+        -r "$rfile" -timeout "$qtimeout" -t "$(_dnsx_threads)" \
+        2>/dev/null > "${work}.json" || true
+
+    jq -r '(.host | sub("[.]$"; "")) as $h | (.txt // [])[] | [$h, .] | @tsv' \
+        "${work}.json" 2>/dev/null > "${work}.answers" || : > "${work}.answers"
+
+    # origin answer -> "IP | AS | prefix | CC | registry | allocated"
+    #
+    # Team Cymru's DNS service answers with EVERY BGP prefix that covers the
+    # address (both 192.0.2.0/21 and the more-specific 192.0.2.0/24, for
+    # instance), where the whois service returns exactly one. Downstream
+    # aggregates count IPs per prefix, so a naive pass-through double-counts
+    # every such address in asn_raw.txt / asn_summary.txt. Keep one row per IP
+    # — the most specific prefix, which is what whois reports.
+    awk -F'\t' -v OFS='\t' '
+        NR == FNR { ip[$1] = $2; next }
+        {
+            name = $1; txt = $2
+            if (!(name in ip)) next
+            n = split(txt, f, "|")
+            if (n < 5) next
+            for (i = 1; i <= n; i++) { gsub(/^[ \t]+|[ \t]+$/, "", f[i]) }
+            asn = f[1]; gsub(/[^0-9]/, "", asn)
+            if (asn == "") next
+            addr = ip[name]
+            # Compare the CIDR LENGTH numerically. Comparing the prefix string
+            # by length ties on /21 vs /24, and silently keeps whichever came
+            # first out of the resolver.
+            spl = split(f[2], pf, "/")
+            bits = (spl > 1) ? pf[2] + 0 : 0
+            if (!(addr in best) || bits > best_bits[addr]) {
+                best_bits[addr] = bits
+                best[addr] = asn
+                best_prefix[addr] = f[2]
+                best_cc[addr] = f[3]
+                best_reg[addr] = f[4]
+                best_alloc[addr] = f[5]
+            }
+            if (!(addr in emitted)) { emitted[addr] = 1; order[++k] = addr }
+        }
+        END {
+            for (i = 1; i <= k; i++) {
+                a = order[i]
+                if (a in best)
+                    print a, best[a], best_prefix[a], best_cc[a], best_reg[a], best_alloc[a]
+            }
+        }
+    ' "${work}.map" "${work}.answers" > "${work}.origin"
+
+    if [[ ! -s "${work}.origin" ]]; then
+        rm -f "${work}".*
+        return 1
+    fi
+
+    # The classifier matches on the AS *name* as well as its number, so each
+    # distinct ASN needs a second lookup to resolve its registered name.
+    cut -f2 "${work}.origin" | sort -u > "${work}.asns"
+    awk '{ print "AS" $1 ".asn.cymru.com\t" $1 }' "${work}.asns" > "${work}.asn_map"
+    cut -f1 "${work}.asn_map" > "${work}.asn_names"
+
+    cat "${work}.asn_names" | timeout "$cap" dnsx \
+        -silent -txt -json -retry "${DNSX_RETRY}" \
+        -r "$rfile" -timeout "$qtimeout" -t "$(_dnsx_threads)" \
+        2>/dev/null > "${work}.asn_json" || true
+
+    jq -r '(.host | sub("[.]$"; "")) as $h | (.txt // [])[] | [$h, .] | @tsv' \
+        "${work}.asn_json" 2>/dev/null > "${work}.asn_answers" || : > "${work}.asn_answers"
+
+    # asn answer -> "AS### | name"; the registered name is the last field.
+    awk -F'\t' -v OFS='\t' '
+        NR == FNR { asn[$1] = $2; next }
+        {
+            if (!($1 in asn)) next
+            n = split($2, f, "|")
+            if (n < 1) next
+            nm = f[n]
+            gsub(/^[ \t]+|[ \t]+$/, "", nm)
+            print asn[$1] "\t" nm
+        }
+    ' "${work}.asn_map" "${work}.asn_answers" > "${work}.asn_names_map"
+
+    # Emit whois-shaped rows.
+    awk -F'\t' -v OFS='' '
+        NR == FNR { nm[$1] = $2; next }
+        {
+            asn = $2; name = (asn in nm) ? nm[asn] : ""
+            # No trailing "\n" here: print already terminates the line, so an
+            # explicit one emitted a blank line after every row and doubled
+            # the apparent record count.
+            print " " $2 " | " $1 " | " $3 " | " $4 " | " $5 " | " $6 " | " name
+        }
+    ' "${work}.asn_names_map" "${work}.origin" > "$out_file"
+
+    local produced=0
+    [[ -s "$out_file" ]] && produced=$(wc -l < "$out_file")
+    rm -f "${work}".*
+    (( produced > 0 ))
+}
+
 # ── Load ASN configuration ────────────────────────────────────────────────────
 # Sources config/asn_providers.sh (or override via --asn-config).
 # Populates: CDN_ASNS, CDN_PROVIDER_NAMES, CLOUD_ASNS, CLOUD_PROVIDER_NAMES,
@@ -202,7 +357,9 @@ write_ip_datasets() {
                 }
                 close(META)
             }
-            FNR == 1 { next }
+            # No header skip here: $ip_hosts is a generated temp file with no
+            # header row, so `FNR == 1 { next }` silently discarded the FIRST
+            # IP and it could never inherit an HTTPX CDN verdict.
             {
                 n = split($2, hh, ";")
                 found = "false"

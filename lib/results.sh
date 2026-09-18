@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ── Per-Root-Domain Final Results ──────────────────────────────────────────────
+# ── Per-Root-Domain Final Results ─────────────────────────────────────────────
 #
 # A presentation layer that carves the GLOBAL canonical datasets into clean,
 # human-consumable per-root-domain result directories:
@@ -15,7 +15,7 @@
 #       waymore_urls.txt       historical URLs for this root
 #       discovery_sources.tsv  hostname → discovery provenance
 #
-# Design rules (see the enhancement spec):
+# Design rules:
 #   * Pure filtering/consolidation of EXISTING global datasets — no tools are
 #     re-run, no raw artifacts are copied/duplicated.
 #   * hostname→root_domain comes ONLY from the canonical DNS dataset's
@@ -25,10 +25,21 @@
 #   * All outputs are deduplicated.
 #   * Existing phase1/phase2/phase3 + canonical files are untouched — this is
 #     an additional, additive layer run after all phases complete.
+#
+# ── Why this is bucketed rather than a per-root loop ──────────────────────────
+# The obvious implementation reads ROOT_DOMAINS_FILE and, for each root, scans
+# the whole canonical TSV once per output file. That is O(roots × datasets)
+# full scans: at 70 roots it is ~350 passes over a multi-million-row TSV plus
+# 70 two-file joins, i.e. ten-plus minutes of pure re-reading, and the cost
+# grows with both the root count and the corpus.
+#
+# Instead every global dataset is read exactly ONCE, and each row is tagged
+# with the root it belongs to. Sorting the tagged stream groups a root's rows
+# together, so the per-root files are then written by a single pass that keeps
+# one file open at a time. Total work is a fixed handful of passes regardless
+# of how many roots the run covers.
 
 # ── Generate per-root-domain result directories ───────────────────────────────
-# Reads ROOT_DOMAINS_FILE and the global datasets, writing one directory per
-# root under ${OUTPUT_DIR}/results/<root>/.
 generate_per_root_results() {
     local results_dir="${OUTPUT_DIR}/results"
     mkdir -p "$results_dir"
@@ -48,198 +59,334 @@ generate_per_root_results() {
 
     log_info "═══ Per-Root-Domain Results ═══"
 
-    local root
+    local root_list="${OUTPUT_DIR}/.results_roots.txt"
+    _scaffold_root_dirs "$root_list" "$results_dir"
+
+    local root_count=0
+    [[ -s "$root_list" ]] && root_count=$(wc -l < "$root_list")
+    if (( root_count == 0 )); then
+        log_warn "generate_per_root_results: no root domains to slice"
+        return 0
+    fi
+
+    local work="${OUTPUT_DIR}/.results_work"
+    rm -rf "$work"
+    mkdir -p "$work"
+
+    _tag_root_slices "$work" "$root_list" "$dns_tsv" "$meta_tsv" "$class_tsv" \
+                     "$ip_port_pairs" "$nmap_grep" "$cloud_global"
+
+    _place_root_slices "$work" "$results_dir"
+
+    _write_waymore_urls_per_root "$results_dir" "$root_list"
+
+    rm -rf "$work"
+    log_success "Per-root results written for ${root_count} root domain(s) under ${results_dir}/"
+}
+
+# ── Build the normalized root list and pre-create every output file ───────────
+# Headers go in first: the placement pass appends, and a slice with no rows
+# must still be a valid, self-describing file.
+_scaffold_root_dirs() {
+    local root_list="$1" results_dir="$2"
+    : > "$root_list"
+
+    # nmap's greppable header comments are identical for every root. Read them
+    # ONCE rather than re-grepping the scan output per root.
+    local nmap_comments=""
+    if [[ -s "${OUTPUT_DIR}/phase3/port_scan_results.txt" ]]; then
+        nmap_comments=$(grep '^#' "${OUTPUT_DIR}/phase3/port_scan_results.txt" 2>/dev/null || true)
+    fi
+
+    local root rdir
     while IFS= read -r root; do
         [[ -z "$root" ]] && continue
         root=$(normalize_hostname "$root")
         [[ -z "$root" ]] && continue
+        printf '%s\n' "$root" >> "$root_list"
 
-        local rdir="${results_dir}/${root}"
+        rdir="${results_dir}/${root}"
         mkdir -p "${rdir}/nmap_results"
 
-        log_info "Slicing results for root domain: $root"
+        : > "${rdir}/subdomains.txt"
+        : > "${rdir}/ips.txt"
+        : > "${rdir}/cloud_assets.txt"
+        : > "${rdir}/nmap_results/ip_port_pairs.txt"
+        printf 'hostname\tA\tAAAA\tCNAME\tresolution_status\n' > "${rdir}/dns_records.tsv"
+        printf 'hostname\tdiscovery_sources\n'              > "${rdir}/discovery_sources.tsv"
+        printf 'url\tstatus_code\ttitle\ttechnologies\twebserver\tcontent_length\tcdn\n' > "${rdir}/live_hosts.tsv"
+        printf 'IP\tASN\tASN_org\tclassification\n'         > "${rdir}/ip_asn.tsv"
 
-        # Resolve the phase1 directory for this root (its name may differ in
-        # case/normalization from ROOT_DOMAINS_FILE). Fall back to a glob match.
-        local p1_dir=""
-        local d
-        for d in "${OUTPUT_DIR}"/phase1/*/; do
-            [[ -d "$d" ]] || continue
-            if [[ "$(normalize_hostname "$(basename "$d")")" == "$root" ]]; then
-                p1_dir="$d"
-                break
-            fi
-        done
-
-        _write_subdomains        "$rdir" "$dns_tsv" "$root"
-        _write_dns_records       "$rdir" "$dns_tsv" "$root"
-        _write_live_hosts        "$rdir" "$dns_tsv" "$meta_tsv" "$root"
-        _write_ips               "$rdir" "$dns_tsv" "$root"
-        _write_ip_asn            "$rdir" "$class_tsv" "$root"
-        _write_nmap_results      "$rdir" "$ip_port_pairs" "$nmap_grep"
-        _write_cloud_assets      "$rdir" "$dns_tsv" "$cloud_global" "$root"
-        _write_waymore_urls      "$rdir" "$p1_dir"
-        _write_discovery_sources "$rdir" "$dns_tsv" "$root"
-
+        if [[ -n "$nmap_comments" ]]; then
+            printf '%s\n' "$nmap_comments" > "${rdir}/nmap_results/port_scan_results.txt"
+        else
+            : > "${rdir}/nmap_results/port_scan_results.txt"
+        fi
     done < "$ROOT_DOMAINS_FILE"
 
-    local root_count
-    root_count=$(grep -c . "$ROOT_DOMAINS_FILE" 2>/dev/null || echo 0)
-    log_success "Per-root results written for $root_count root domain(s) under ${results_dir}/"
+    sort -u "$root_list" -o "$root_list"
 }
 
-# ── subdomains.txt: all in-scope hostnames for this root ──────────────────────
-_write_subdomains() {
-    local rdir="$1" dns_tsv="$2" root="$3"
-    awk -F'\t' -v rd="$root" 'FNR>1 && $2==rd {print $1}' "$dns_tsv" \
-        | sort -u > "${rdir}/subdomains.txt"
-}
+# ── Read every global dataset ONCE, tagging each row with its root ───────────
+_tag_root_slices() {
+    local work="$1" root_list="$2" dns_tsv="$3" meta_tsv="$4" class_tsv="$5" \
+          pairs="$6" nmapg="$7" cloud="$8"
 
-# ── dns_records.tsv: canonical DNS info for those hosts ───────────────────────
-_write_dns_records() {
-    local rdir="$1" dns_tsv="$2" root="$3"
-    printf 'hostname\tA\tAAAA\tCNAME\tresolution_status\n' > "${rdir}/dns_records.tsv"
-    awk -F'\t' -v rd="$root" -v OFS='\t' 'FNR>1 && $2==rd {print $1,$4,$5,$6,$7}' "$dns_tsv" \
-        | sort -u >> "${rdir}/dns_records.tsv"
-}
-
-# ── live_hosts.tsv: HTTPX results joined to this root via canonical DNS ───────
-# httpx_metadata.tsv columns: hostname cdn technologies webserver content_length status_code title url
-# Output columns: url status_code title technologies webserver content_length cdn
-_write_live_hosts() {
-    local rdir="$1" dns_tsv="$2" meta_tsv="$3" root="$4"
-    printf 'url\tstatus_code\ttitle\ttechnologies\twebserver\tcontent_length\tcdn\n' > "${rdir}/live_hosts.tsv"
-    if [[ ! -s "$meta_tsv" ]]; then
-        return
-    fi
-    # Join: build hostname→root map from canonical DNS, then filter httpx rows
-    # whose host belongs to this root. FNR==1 skips both file headers.
-    awk -F'\t' -v rd="$root" -v OFS='\t' '
-        FNR==1 { next }
-        NR==FNR { rd_map[$1]=$2; next }
-        ($1 in rd_map) && rd_map[$1]==rd { print $8,$6,$7,$3,$4,$5,$2 }
-    ' "$dns_tsv" "$meta_tsv" | sort -u >> "${rdir}/live_hosts.tsv"
-}
-
-# ── ips.txt: unique IPs from A records of this root's hosts ───────────────────
-_write_ips() {
-    local rdir="$1" dns_tsv="$2" root="$3"
-    : > "${rdir}/ips.txt"
-    awk -F'\t' -v rd="$root" '
-        FNR>1 && $2==rd && $4!="" {
-            n = split($4, ips, ";")
-            for (i=1; i<=n; i++) {
-                gsub(/^[ \t]+|[ \t]+$/, "", ips[i])
-                if (ips[i] != "") print ips[i]
-            }
+    awk -F'\t' -v OFS='\t' \
+        -v roots_file="$root_list" \
+        -v dns_tsv="$dns_tsv" -v meta_tsv="$meta_tsv" -v class_tsv="$class_tsv" \
+        -v pairs="$pairs" -v nmapg="$nmapg" -v cloud="$cloud" \
+        -v work="$work" '
+        function in_scope_of(host, r,   i, suf) {
+            # Mirrors match_root_domain: exact root or ".root" suffix.
+            if (host == r) return 1
+            suf = "." r
+            return substr(host, length(host) - length(suf) + 1) == suf
         }
-    ' "$dns_tsv" | sort -u -V > "${rdir}/ips.txt"
-}
+        BEGIN {
+            while ((getline r < roots_file) > 0) if (r != "") want[r] = 1
+            close(roots_file)
 
-# ── ip_asn.tsv: IP/ASN/org/classification for IPs of this root ────────────────
-# ip_classification.tsv columns: IP classification associated_hostnames root_domains ASN ASN_org
-# An IP belongs to this root if root (column 4) contains <root> as an element.
-_write_ip_asn() {
-    local rdir="$1" class_tsv="$2" root="$3"
-    printf 'IP\tASN\tASN_org\tclassification\n' > "${rdir}/ip_asn.tsv"
-    if [[ ! -s "$class_tsv" ]]; then
-        return
-    fi
-    awk -F'\t' -v rd="$root" -v OFS='\t' '
-        FNR>1 && index(";"$4";", ";"rd";")>0 { print $1,$5,$6,$2 }
-    ' "$class_tsv" | sort -u >> "${rdir}/ip_asn.tsv"
-}
-
-# ── nmap_results/: nmap output for this root's IPs ────────────────────────────
-# Filters ip_port_pairs.txt (IP:port) and the greppable port_scan_results.txt
-# to only IPs present in this root's ips.txt (many-to-many preserved).
-_write_nmap_results() {
-    local rdir="$1" ip_port_pairs="$2" nmap_grep="$3"
-    local ips_file="${rdir}/ips.txt"
-
-    # ip_port_pairs.txt: "IP:port" — keep pairs whose IP is in ips.txt.
-    if [[ -s "$ip_port_pairs" && -s "$ips_file" ]]; then
-        awk -F':' '
-            NR==FNR { ips[$1]=1; next }
-            ($1 in ips) { print }
-        ' "$ips_file" "$ip_port_pairs" | sort -u > "${rdir}/nmap_results/ip_port_pairs.txt"
-    else
-        : > "${rdir}/nmap_results/ip_port_pairs.txt"
-    fi
-
-    # port_scan_results.txt: nmap -oG greppable. Keep Host: lines whose IP
-    # (field 2) is in ips.txt; preserve nmap comment/metadata lines.
-    if [[ -s "$nmap_grep" && -s "$ips_file" ]]; then
-        awk -v ips_file="$ips_file" '
-            BEGIN {
-                while ((getline line < ips_file) > 0) ips[line]=1
-                close(ips_file)
-            }
-            /^#/ { print; next }
-            /^Host:/ {
-                ip = $2
-                if (ip in ips) print
-            }
-        ' "$nmap_grep" > "${rdir}/nmap_results/port_scan_results.txt"
-    else
-        : > "${rdir}/nmap_results/port_scan_results.txt"
-    fi
-}
-
-# ── cloud_assets.txt: cloud assets attributed to this root ────────────────────
-# Two attribution signals, both from existing data (no tools re-run):
-#   1. CNAME targets of this root's hosts that point at cloud infra
-#      (extracted from canonical_dns.tsv, filtered via filter_cloud_domains).
-#   2. Global cloud assets (phase2/final_cloud_assets.txt) that are themselves
-#      subdomains of this root.
-_write_cloud_assets() {
-    local rdir="$1" dns_tsv="$2" cloud_global="$3" root="$4"
-    : > "${rdir}/cloud_assets.txt"
-
-    # Source 1: CNAME targets for this root's hosts, filtered to cloud patterns.
-    local cname_tmp="${rdir}/.cnames.tmp"
-    if [[ -s "$dns_tsv" ]]; then
-        awk -F'\t' -v rd="$root" '
-            FNR>1 && $2==rd && $6!="" {
-                n = split($6, cnames, ";")
-                for (i=1; i<=n; i++) {
-                    gsub(/^[ \t]+|[ \t]+$/, "", cnames[i])
-                    if (cnames[i] != "") print cnames[i]
+            # ── canonical dataset: subdomains, records, sources, IPs, CNAMEs ──
+            while ((getline line < dns_tsv) > 0) {
+                n = split(line, f, "\t")
+                if (n < 7) continue
+                h = f[1]; r = f[2]
+                # Header skipped by content, never by line number.
+                if (h == "hostname" && r == "root_domain") continue
+                if (r == "" || !(r in want)) continue
+                # hostname -> root, reused by the metadata join below so the
+                # canonical file is read exactly once.
+                h2r[h] = r
+                print r, h > (work "/subs.tsv")
+                print r, h, f[4], f[5], f[6], f[7] > (work "/dns.tsv")
+                print r, h, f[3] > (work "/src.tsv")
+                if (f[4] != "") {
+                    m = split(f[4], ips, ";")
+                    for (i = 1; i <= m; i++) {
+                        ip = ips[i]; gsub(/^[ \t]+|[ \t]+$/, "", ip)
+                        if (ip == "") continue
+                        print r, ip > (work "/ips.tsv")
+                        # ip -> roots, for the port-scan attribution below.
+                        if (index(";" ipr[ip] ";", ";" r ";") == 0)
+                            ipr[ip] = (ipr[ip] == "" ? r : ipr[ip] ";" r)
+                    }
+                }
+                if (f[6] != "") {
+                    m = split(f[6], cns, ";")
+                    for (i = 1; i <= m; i++) {
+                        c = cns[i]; gsub(/^[ \t]+|[ \t]+$/, "", c)
+                        if (c != "") print r, c > (work "/cname.tsv")
+                    }
                 }
             }
-        ' "$dns_tsv" > "$cname_tmp"
-        if [[ -s "$cname_tmp" ]]; then
-            filter_cloud_domains "$cname_tmp" "${cname_tmp}.cloud" || true
-            [[ -s "${cname_tmp}.cloud" ]] && cat "${cname_tmp}.cloud" >> "${rdir}/cloud_assets.txt"
+            close(dns_tsv)
+
+            # ── httpx metadata -> live_hosts (join on hostname) ──
+            if (meta_tsv != "") {
+                while ((getline line < meta_tsv) > 0) {
+                    n = split(line, f, "\t")
+                    if (n < 2) continue
+                    h = f[1]
+                    if (h == "hostname") continue
+                    r = h2r[h]
+                    if (r == "" || !(r in want)) continue
+                    print r, f[8], f[6], f[7], f[3], f[4], f[5], f[2] > (work "/live.tsv")
+                }
+                close(meta_tsv)
+            }
+
+            # ── IP classification -> ip_asn (root_domains may list several) ──
+            if (class_tsv != "") {
+                while ((getline line < class_tsv) > 0) {
+                    n = split(line, f, "\t")
+                    if (n < 6) continue
+                    if (f[1] == "IP") continue
+                    m = split(f[4], rds, ";")
+                    for (i = 1; i <= m; i++) {
+                        r = rds[i]
+                        if (r != "" && (r in want)) print r, f[1], f[5], f[6], f[2] > (work "/asn.tsv")
+                    }
+                }
+                close(class_tsv)
+            }
+
+            # ── port scan results -> per-root nmap (many-to-many via ipr) ──
+            if (pairs != "") {
+                while ((getline line < pairs) > 0) {
+                    if (line == "") continue
+                    ip = line; sub(/:.*/, "", ip)
+                    if (!(ip in ipr)) continue
+                    m = split(ipr[ip], rds, ";")
+                    for (i = 1; i <= m; i++) if (rds[i] != "") print rds[i], line > (work "/ports.tsv")
+                }
+                close(pairs)
+            }
+            if (nmapg != "") {
+                while ((getline line < nmapg) > 0) {
+                    if (substr(line, 1, 1) == "#") continue   # written per root by the scaffold
+                    if (substr(line, 1, 5) != "Host:") continue
+                    split(line, g, " ")
+                    ip = g[2]
+                    if (!(ip in ipr)) continue
+                    m = split(ipr[ip], rds, ";")
+                    for (i = 1; i <= m; i++) if (rds[i] != "") print rds[i], line > (work "/nmapg.tsv")
+                }
+                close(nmapg)
+            }
+
+            # ── global cloud assets that ARE in scope for a root ──
+            if (cloud != "") {
+                while ((getline line < cloud) > 0) {
+                    if (line == "") continue
+                    v = line
+                    sub(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "", v)   # strip scheme
+                    sub(/[/:?].*$/, "", v)                        # strip port/path
+                    for (r in want) if (in_scope_of(v, r)) print r, line > (work "/cloud.tsv")
+                }
+                close(cloud)
+            }
+        }
+    ' /dev/null
+}
+# ── Place the tagged streams into per-root files ─────────────────────────────
+_place_root_slices() {
+    local work="$1" results_dir="$2"
+
+    # CNAME targets that point at cloud infrastructure are cloud assets too.
+    # Filter them once, globally, then tag — the provider regex is the same for
+    # every root, so there is no reason to run it per root.
+    if [[ -s "${work}/cname.tsv" ]]; then
+        cut -f2 "${work}/cname.tsv" | sort -u > "${work}/.cname_uniq"
+        filter_cloud_domains "${work}/.cname_uniq" "${work}/.cname_cloud" || true
+        if [[ -s "${work}/.cname_cloud" ]]; then
+            awk -F'\t' -v OFS='\t' '
+                NR == FNR { keep[$1] = 1; next }
+                ($2 in keep) { print $1, $2 }
+            ' "${work}/.cname_cloud" "${work}/cname.tsv" | sort -t$'\t' -k1,1 > "${work}/cnamecloud.tsv"
         fi
-    fi
-    rm -f "$cname_tmp" "${cname_tmp}.cloud"
-
-    # Source 2: global cloud assets that are subdomains of this root.
-    if [[ -s "$cloud_global" ]]; then
-        local escaped_root="${root//./\\.}"
-        grep -E "(^|\.)(${escaped_root})$" "$cloud_global" >> "${rdir}/cloud_assets.txt" 2>/dev/null || true
+        rm -f "${work}/.cname_uniq" "${work}/.cname_cloud"
     fi
 
-    sort -u "${rdir}/cloud_assets.txt" -o "${rdir}/cloud_assets.txt" 2>/dev/null || : > "${rdir}/cloud_assets.txt"
+    _split_tagged "$work" "$results_dir" subs.tsv   subdomains.txt
+    _split_tagged "$work" "$results_dir" dns.tsv    dns_records.tsv
+    _split_tagged "$work" "$results_dir" src.tsv    discovery_sources.tsv
+    _split_tagged "$work" "$results_dir" ips.tsv    ips.txt
+    _split_tagged "$work" "$results_dir" live.tsv   live_hosts.tsv
+    _split_tagged "$work" "$results_dir" asn.tsv    ip_asn.tsv
+    _split_tagged "$work" "$results_dir" ports.tsv  nmap_results/ip_port_pairs.txt
+    _split_tagged "$work" "$results_dir" nmapg.tsv  nmap_results/port_scan_results.txt
+    _split_tagged "$work" "$results_dir" cloud.tsv  cloud_assets.txt
+    _split_tagged "$work" "$results_dir" cnamecloud.tsv cloud_assets.txt
+
+    # Restore the sort -u / dedup guarantees the slice files are documented to
+    # have. The bucketing pass writes rows in canonical-TSV order, so each
+    # output is sorted and de-duplicated here — on the small per-root files,
+    # never on a global dataset.
+    local root
+    while IFS= read -r root; do
+        [[ -z "$root" ]] && continue
+        _normalize_root_slice "$results_dir" "$root"
+    done < "$root_list"
 }
 
-# ── waymore_urls.txt: historical URLs for this root ───────────────────────────
+# Write one tagged stream out as per-root files. The stream is sorted by its
+# root column first, so all rows for a root are contiguous and only one output
+# file is ever open — an early version of this opened one handle per root per
+# output kind, which hits the process fd limit on a large target list.
+_split_tagged() {
+    local work="$1" results_dir="$2" tag="$3" dest="$4"
+    local src="${work}/${tag}"
+    [[ -s "$src" ]] || return 0
+
+    sort -t$'\t' -k1,1 "$src" > "${src}.sorted"
+    awk -F'\t' -v OFS='\t' -v base="$results_dir" -v dest="$dest" '
+        {
+            if ($1 != cur) {
+                if (cur != "") close(curpath)
+                cur = $1
+                curpath = base "/" cur "/" dest
+            }
+            sub(/^[^\t]*\t/, "")
+            print >> curpath
+        }
+        END { if (cur != "") close(curpath) }
+    ' "${src}.sorted"
+    rm -f "${src}.sorted"
+}
+
+# Restore the sort -u + dedup guarantees of every slice file. This runs on the
+# small per-root files only, never on a global dataset.
+_normalize_root_slice() {
+    local results_dir="$1" root="$2"
+    local d="${results_dir}/${root}"
+    [[ -d "$d" ]] || return 0
+
+    _sort_unique_in_place "${d}/subdomains.txt"
+    _sort_unique_in_place "${d}/ips.txt" -V
+    _sort_unique_in_place "${d}/cloud_assets.txt"
+    _sort_unique_in_place "${d}/nmap_results/ip_port_pairs.txt"
+    _sort_unique_tsv  "${d}/dns_records.tsv"
+    _sort_unique_tsv  "${d}/discovery_sources.tsv"
+    _sort_unique_tsv  "${d}/live_hosts.tsv"
+    _sort_unique_tsv  "${d}/ip_asn.tsv"
+}
+
+_sort_unique_in_place() {
+    local f="$1"; shift
+    [[ -e "$f" ]] || return 0
+    if [[ ! -s "$f" ]]; then
+        : > "$f"
+        return 0
+    fi
+    # Nothing to order or dedupe in a single line. A large target list has many
+    # roots with a handful of rows (or none), and skipping the fork for those
+    # is the difference between a couple of seconds and twenty.
+    local _n
+    _n=$(wc -l < "$f")
+    (( _n < 2 )) && return 0
+    sort -u "$@" "$f" -o "$f"
+}
+
+# Sort a TSV's data rows, keeping its header on line 1.
+_sort_unique_tsv() {
+    local f="$1"
+    [[ -s "$f" ]] || return 0
+    local _n
+    _n=$(wc -l < "$f")
+    (( _n < 3 )) && return 0     # header only, or header + one row
+    local tmp="${f}.srt"
+    head -1 "$f" > "$tmp"
+    tail -n +2 "$f" | sort -u >> "$tmp"
+    mv "$tmp" "$f"
+}
+
+# ── waymore_urls.txt: historical URLs for this root ──────────────────────────
 # Waymore runs per-root in Phase 1, so phase1/<root>/waymore_urls.txt already
-# holds this root's URLs — dedupe and present, no re-crawl.
-_write_waymore_urls() {
-    local rdir="$1" p1_dir="$2"
-    if [[ -n "$p1_dir" && -s "${p1_dir}waymore_urls.txt" ]]; then
-        sort -u "${p1_dir}waymore_urls.txt" > "${rdir}/waymore_urls.txt"
-    else
-        : > "${rdir}/waymore_urls.txt"
-    fi
-}
+# holds this root's URLs — dedupe and present, no re-crawl and no global scan.
+_write_waymore_urls_per_root() {
+    local results_dir="$1" root_list="$2"
+    local p1_dir="${OUTPUT_DIR}/phase1"
 
-# ── discovery_sources.tsv: hostname → discovery provenance ────────────────────
-_write_discovery_sources() {
-    local rdir="$1" dns_tsv="$2" root="$3"
-    printf 'hostname\tdiscovery_sources\n' > "${rdir}/discovery_sources.tsv"
-    awk -F'\t' -v rd="$root" -v OFS='\t' 'FNR>1 && $2==rd {print $1,$3}' "$dns_tsv" \
-        | sort -u >> "${rdir}/discovery_sources.tsv"
+    local d1 r
+    for d1 in "$p1_dir"/*/; do
+        [[ -d "$d1" ]] || continue
+        r=$(normalize_hostname "$(basename "$d1")")
+        [[ -z "$r" ]] && continue
+        grep -qxF -- "$r" "$root_list" 2>/dev/null || continue
+        if [[ -s "${d1}waymore_urls.txt" ]]; then
+            sort -u "${d1}waymore_urls.txt" > "${results_dir}/${r}/waymore_urls.txt"
+        else
+            : > "${results_dir}/${r}/waymore_urls.txt"
+        fi
+    done
+
+    # A root whose Phase 1 directory is missing still gets an (empty) file, so
+    # the per-root output layout is uniform.
+    local root
+    while IFS= read -r root; do
+        [[ -z "$root" ]] && continue
+        [[ -f "${results_dir}/${root}/waymore_urls.txt" ]] || \
+            : > "${results_dir}/${root}/waymore_urls.txt"
+    done < "$root_list"
 }

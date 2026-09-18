@@ -84,11 +84,12 @@ Resolves any still-pending hostnames from the canonical DNS dataset, performs de
 
 | Stage | What Happens | Tool(s) |
 |-------|-------------|---------|
-| 1 | Extract IPs from canonical DNS dataset (pending hosts resolved first) | dnsx |
+| 1 | Extract IPs from canonical DNS dataset (pending hosts resolved first, then unresolved hosts labelled `nxdomain`) | dnsx |
 | 1b | Reverse DNS (PTR) lookups on resolved IPs → new in-scope hostnames | dnsx |
-| 2 | IP → ASN lookup via whois.cymru.com | nc |
+| 2 | IP → ASN lookup via whois.cymru.com, falling back to Team Cymru's DNS service. Both failing skips Stage 4 rather than scanning unclassified IPs | nc, dnsx |
 | 3 | Deterministic IP classification (CDN/cloud/dedicated/unknown) | Built-in classification engine |
 | 4 | Fast port scan (naabu, top 1000 ports) then service detection (nmap -sV on hosts naabu found open, capped to the top `--nmap-top-ports` most-common ports) — skipped with `--no-port-scan` | naabu, nmap |
+| 5 | HTTP probe of hostnames that resolved after Phase 1 (Phase 2/3 resolution) into `phase3/live_hosts_late.txt` | httpx |
 
 ---
 
@@ -107,6 +108,18 @@ Columns:
 | `AAAA` | Semicolon-separated IPv6 addresses |
 | `CNAME` | Semicolon-separated CNAME targets |
 | `resolution_status` | `resolved`, `nxdomain`, `timeout`, `bogon`, or `pending` |
+
+The status vocabulary distinguishes *"this name does not exist"* from *"we could not ask"*, which matters most exactly when a run goes badly:
+
+| Status | Meaning | Retried? |
+|--------|---------|----------|
+| `resolved` | Answered with A/AAAA/CNAME | — |
+| `nxdomain` | The resolver authoritatively says the name does not exist | No — settled, nothing was lost |
+| `timeout` | No answer of the requested types, and not confirmed NXDOMAIN | Yes, while the transport is healthy |
+| `bogon` | Resolved only to reserved/private addresses (fake-IP VPN, RFC1918) — excluded from probing and scanning | No |
+| `pending` | Not yet queried | Always |
+
+`nxdomain` is confirmed by a final pass in Phase 3 (`dnsx -rcode nxdomain`) that runs only over hosts still marked `timeout`. Without it a corpus that is 90% unresolved cannot be diagnosed: a run that lost 12,000 live hostnames to a broken transport produces exactly the same output as one whose corpus was genuinely 90% dead.
 
 Phases 2 and 3 never re-resolve the entire corpus — only newly discovered hosts are resolved through dnsx, and the results are merged incrementally.
 
@@ -173,16 +186,17 @@ Options:
   --resolvers FILE|URL      DNS resolver list (file path or http(s) URL). The built-in list
                             (~12.7K validated trickest resolvers) is used as-is with no
                             health-check — dnsx retries across the pool, so dead entries in a
-                            large list cost nothing. A custom list IS health-checked at startup;
+                            large list cost little. A custom list IS health-checked at startup;
                             only resolvers answering from this network are kept. Overrides
                             --dns-mode.
-  --dns-mode {udp,doh}      udp (default): raw UDP/53 against the ~12.7K static pool — the
-                            normal behavior on networks that allow outbound UDP/53.
-                            doh: DNS-over-HTTPS to 3 trusted endpoints (Cloudflare 1.1.1.1,
-                            Google 8.8.8.8, Quad9 9.9.9.9) over TCP/443 — for networks that
-                            block or rate-limit outbound UDP/53 (corporate VPN split-DNS,
-                            ISP response-rate-limiting). Slower per-query than UDP+12K pool,
-                            but immune to UDP/53 filtering.
+  --dns-mode {udp,doh}      doh (default): DNS-over-HTTPS on TCP/443 through a local proxy
+                            (lib/doh_proxy.py). The proxy probes Cloudflare 1.1.1.1, Google
+                            8.8.8.8 and Quad9 9.9.9.9 at startup and uses only the ones this
+                            network can actually reach — a filtered endpoint is demoted
+                            instead of swallowing a share of every batch.
+                            udp: raw UDP/53 against the ~12.7K static pool.
+                            Either way, a batch whose queries stop being answered is retried
+                            through the other transport before any result is recorded.
   --asn-config FILE         Path to ASN provider classification config (default: built-in)
   --waymore-mode MODE       Waymore mode: U (URLs, default) or B (URLs+responses). R
                             (responses only) is not supported — the pipeline consumes URL output
@@ -192,9 +206,14 @@ Options:
   --no-port-scan            Skip the port-scan stage inside Phase 3 (classification still runs)
   --skip-permutation        Disable dnsgen permutation brute force (Stage 4b) for all domains
                             (recommended for large multi-domain sweeps)
-  --threads N               Threads for dnsx and Cloud_Enum (default: 50)
+  --threads N               Cloud_Enum thread count (default: 50). dnsx concurrency is
+                            transport-aware — see DNSX_THREADS_DOH / DNSX_THREADS_UDP
   --parallel-hosts N        Hosts crawled in parallel per per-host tool (default: 5)
   --parallel-domains N      Root domains processed in parallel in Phase 1 (default: 3)
+  --doh-proxy-threads N     Concurrent DoH requests the local proxy may have in flight
+                            (default: 128). Size it to at least
+                            parallel-domains × DNSX_THREADS_DOH — see "Scaling to many
+                            root domains"
   --rate-limit N            httpx requests/second (default: 100)
   --nmap-top-ports N        Cap nmap -sV (Phase 3) to the N most-common open ports (default: 100; 0 = no cap)
   --timeout N               Checkpoint auto-continue timeout in seconds; 0 = wait forever (default: 30)
@@ -202,7 +221,7 @@ Options:
   --cloud-enum-keywords KW Keywords for cloud_enum brute force (comma-sep, auto-derived from domains)
 ```
 
-> **Flag scope notes:** `--rate-limit` applies only to httpx (Waymore, Katana, and the DNS tools use their own fixed/internal limits); `--threads` applies only to dnsx and Cloud_Enum.
+> **Flag scope notes:** `--rate-limit` is the aggregate request budget against the targets and applies only to httpx (Waymore, Katana and the DNS tools use their own limits); `--threads` applies only to Cloud_Enum — dnsx concurrency is set by `DNSX_THREADS_DOH` / `DNSX_THREADS_UDP`.
 >
 > **`--proxy` scope:** when set, the proxy is applied **only** to the passive OSINT sources (crt.name, GitHub pre-flight + github-subdomains, subfaster, waymore). Target DNS resolution, HTTPX, and the Nmap/naabu port scan deliberately stay **direct** so scanning sees real IPs. `curl` and `waymore` route cleanly over SOCKS or HTTP; statically-linked Go tools (subfaster, github-subdomains) honor `HTTP(S)_PROXY` only for an `http://` proxy, so prefer an HTTP proxy URL for full coverage. Note `localhost` inside the container is the container itself — use `host.docker.internal` for a proxy running on the Docker host.
 >
@@ -294,6 +313,76 @@ docker run --rm -it \
   metho --domains "example.com" --waymore-mode U --auto
 ```
 
+### DNS transport tuning
+
+| Variable | Default | What it controls |
+|----------|---------|------------------|
+| `DOH_ENDPOINTS` | `https://1.1.1.1/dns-query,https://8.8.8.8/dns-query,https://9.9.9.9/dns-query` | DoH endpoints to try. The proxy probes them at startup and uses only the reachable ones |
+| `DOH_PROXY_THREADS` | `128` | Concurrent DoH requests the proxy may have in flight |
+| `DOH_PROXY_TIMEOUT` | `4` | Per-request HTTPS timeout in the proxy. Keep `DOH_PROXY_TIMEOUT` × number of endpoints **below** `DNSX_QUERY_TIMEOUT_DOH`, or dnsx abandons queries the proxy is still working on (4s × 3 endpoints = 12s < 15s) |
+| `DOH_PROXY_READY_SECS` | `30` | How long to wait for the proxy to bind and probe its endpoints |
+| `DOH_FAIL_THRESHOLD` | `3` | Consecutive failures before an endpoint is demoted |
+| `DOH_COOLDOWN` | `60` | Seconds a demoted endpoint stays out of rotation |
+| `DNSX_RETRY` | `2` | dnsx retry count for every resolution pass |
+| `DNSX_THREADS` | unset | Pins dnsx concurrency for BOTH transports, overriding the per-transport defaults below |
+| `DNSX_THREADS_DOH` | `64` | dnsx concurrency per invocation in `doh` mode |
+| `DNSX_THREADS_UDP` | `100` | dnsx concurrency per invocation in `udp` mode |
+| `DNSX_QUERY_TIMEOUT` | `5` | dnsx per-query timeout in `udp` mode |
+| `DNSX_QUERY_TIMEOUT_DOH` | `15` | dnsx per-query timeout in `doh` mode. Must exceed the proxy's worst case (`DOH_PROXY_TIMEOUT` × number of endpoints), or dnsx abandons queries the proxy is still working on |
+| `METHO_NXDOMAIN_LABEL` | `1` | Set to `0` to skip the Phase 3 NXDOMAIN-confirmation pass (saves one query round over the unresolved pile on very large runs, at the cost of leaving every unresolved host as `timeout`) |
+| `DNS_MIN_ANSWER_PCT` | `50` | Below this share of *queries answered*, a batch is treated as a transport failure and retried through the fallback |
+| `DNS_MIN_HEALTH_BATCH` | `20` | Batches smaller than this never change the DNS-health flag (in either direction) |
+
+### Scaling to many root domains
+
+Phase 1 is the only stage that fans out per root domain; Phases 2 and 3 and the
+`results/` slicing all run once over the merged corpus. That keeps the work
+linear in the number of roots rather than multiplicative, but it also means
+three shared resources need to be sized against each other.
+
+**How the concurrency stacks up**
+
+| Layer | Default | Aggregate effect |
+|-------|---------|------------------|
+| `--parallel-domains` | `3` | Phase 1 workers, each running a whole per-domain pipeline |
+| `--parallel-hosts` | `5` | Hosts crawled in parallel *within* each worker — so up to `3 × 5 = 15` concurrent crawls |
+| `--rate-limit` | `100`/s | **Aggregate** against the targets. Phase 1 divides it by the number of workers actually started, so 3 workers each use 33/s, not 100/s |
+| `DNSX_THREADS_DOH` | `64` | dnsx threads *per worker*. All workers share one DoH proxy, so in-flight = `parallel-domains × 64` |
+| `DOH_PROXY_THREADS` | `128` | Requests the proxy serves at once. Must be ≥ the in-flight figure above, or queries queue past `DNSX_QUERY_TIMEOUT_DOH` and get recorded as `timeout` |
+
+Those four numbers are the ones that interact. If you raise
+`--parallel-domains`, raise `DOH_PROXY_THREADS` to match
+(`parallel-domains × DNSX_THREADS_DOH`, with headroom) or lower
+`DNSX_THREADS_DOH`.
+
+**A 70-domain sweep**
+
+```bash
+docker run --rm -it \
+  -v $(pwd)/results:/output \
+  -v $(pwd)/targets.txt:/input/domains.txt:ro \
+  metho --domains-file /input/domains.txt \
+        --subfaster-config /input/provider-config.yaml \
+        --parallel-domains 6 \
+        --doh-proxy-threads 384 \
+        --auto
+```
+
+- `--parallel-domains 6` with `DNSX_THREADS_DOH=64` means 384 DNS queries in
+  flight, so `--doh-proxy-threads 384` matches the pool to the load.
+- Watch `results/doh_proxy.log`: `dropped=0` and an error count near zero is
+  what a correctly sized pool looks like. A growing `dropped` count means
+  `DOH_PROXY_THREADS` is too low.
+- `--domain-timeout` (default `5400`) caps any single pathological domain so it
+  cannot gate the pool; a 70-domain sweep will hit this on the largest targets
+  and keep going.
+- Port scanning is one global phase, so `NAABU_TIMEOUT_MAX` is the knob to
+  raise if the candidate IP set is large (the log says when the cap is hit).
+- Raise `--parallel-hosts` only with headroom in CPU/RAM: each host slot can be
+  a CeWL, Katana or SubDomainizer process, and CeWL is memory-capped per
+  process by `CEWL_MEM_LIMIT_MB` (default 1024MB) — 15 concurrent CeWL crawls
+  can legitimately want 15GB.
+
 ### Per-tool timeouts
 
 Some tools can stall on misbehaving hosts. Each one has a configurable wall-clock cap:
@@ -301,8 +390,8 @@ Some tools can stall on misbehaving hosts. Each one has a configurable wall-cloc
 | Variable | Default | Tool / What it bounds |
 |----------|---------|----------------------|
 | `BRUTEFORCE_TIMEOUT` | `900` | dnsx brute force (per root domain) |
-| `KATANA_TIMEOUT` | `600` | Katana crawl in Phase 1 (per live host) |
-| `KATANA_CRAWL_DURATION` | `15m` | Katana per-host wall-clock cap (Phase 1) |
+| `KATANA_TIMEOUT` | `600` | Hard per-host kill for a Katana crawl that ignores its own cap |
+| `KATANA_CRAWL_DURATION` | `9m` | Katana's own per-host cap — it stops and flushes at this point. Keep it BELOW `KATANA_TIMEOUT`, or the process is killed mid-crawl and never stops gracefully |
 | `SUBDOMAINIZER_TIMEOUT` | `300` | SubDomainizer JS scan (per live host) |
 | `DNSX_TIMEOUT` | `600` | DNSx bulk resolution — floor value; the effective cap auto-scales with batch size (max of this and pending-hosts/50, capped at 3600s) so large corpora are never cut off mid-batch |
 | `CLOUD_ENUM_TIMEOUT` | `900` | Cloud_Enum keyword mutation (single call per Phase 2 run) |
@@ -315,8 +404,13 @@ Some tools can stall on misbehaving hosts. Each one has a configurable wall-cloc
 | `DNSGEN_MAX_INPUT` | `500` | Max subdomains fed to dnsgen (resolved hosts prioritized; 0 disables) |
 | `DNSGEN_SKIP_THRESHOLD` | `100` | Domains with more discovered subs than this skip dnsgen entirely (large targets: ~0 yield, hours of DNS; 0 disables) |
 | `DNSGEN_MAX_OUTPUT_BYTES` | `26214400` | Hard cap on dnsgen permutation output size (25MB) |
-| `NAABU_TIMEOUT` | `600` | Naabu fast port scan |
+| `NAABU_TIMEOUT` | `0` (derived) | Naabu fast port scan. `0` derives the cap from the target count (`NAABU_TIMEOUT_BASE + hosts × NAABU_SECONDS_PER_HOST`, max `NAABU_TIMEOUT_MAX`) — a fixed cap truncates large sweeps silently |
+| `NAABU_TIMEOUT_BASE` | `300` | Fixed part of the derived naabu cap |
+| `NAABU_SECONDS_PER_HOST` | `2` | Per-host part of the derived naabu cap |
+| `NAABU_TIMEOUT_MAX` | `3600` | Ceiling on the derived naabu cap. Hitting it logs a warning, because the scan WILL be truncated — raise this, raise `NAABU_RATE`, or lower `NAABU_TOP_PORTS` to cover everything |
 | `NAABU_TOP_PORTS` | `1000` | Naabu top-N ports to scan |
+| `CYMRU_WHOIS_ATTEMPTS` | `3` | Retries of the `whois.cymru.com:43` ASN lookup before falling back to the DNS service |
+| `CYMRU_WHOIS_TIMEOUT` | `60` | Wall-clock cap on each `whois.cymru.com:43` bulk attempt |
 | `NAABU_RATE` | `1000` | Naabu packets/sec cap (noise/IPS throttle) |
 | `NAABU_RETRIES` | `2` | Naabu SYN retransmit count |
 
@@ -324,10 +418,16 @@ Some tools can stall on misbehaving hosts. Each one has a configurable wall-cloc
 docker run --rm -it \
   -v $(pwd)/results:/output \
   -e KATANA_TIMEOUT=900 \
+  -e KATANA_CRAWL_DURATION=14m \
   -e WAYMORE_TIMEOUT=2700 \
   -e CEWL_MEM_LIMIT_MB=1536 \
-  metho --domains "example.com" --parallel-hosts 8 --parallel-domains 5 --auto
+  metho --domains "example.com" --parallel-hosts 8 --parallel-domains 5 \
+        --doh-proxy-threads 320 --auto
 ```
+
+`KATANA_CRAWL_DURATION` is raised alongside `KATANA_TIMEOUT` because katana's
+own cap must stay below the hard kill. `--doh-proxy-threads` is sized to
+`parallel-domains × DNSX_THREADS_DOH` (5 × 64).
 
 ---
 
@@ -512,6 +612,39 @@ Proceed to vulnerability scanning / enumeration on live web servers.
 
 ---
 
+## Troubleshooting DNS
+
+**Most of the corpus is `timeout`.** Check `nxdomain` before concluding anything was lost. `nxdomain` means the resolver authoritatively answered that the name does not exist — a Certificate-Transparency corpus is routinely half dead, and that is not a failure. A large `timeout` pile with a *healthy* transport means the same thing, less conclusively. Only a **large `timeout` pile plus a transport that stopped answering** indicates loss, and the run log says which it was:
+
+```
+DNS health: transport 'doh' answered 28900/28901 queries (>=50% — healthy)
+DNS health: transport 'doh' answered only 300/28901 queries (<50%) — DNS UNHEALTHY
+```
+
+To settle a specific pile by hand, count how many of its hostnames actually exist:
+
+```bash
+awk -F'\t' '$7=="timeout"{print $1}' results/canonical_dns.tsv | head -200 > /tmp/sample.txt
+docker run --rm -i -v /tmp:/t metho sh -c \
+  'dnsx -silent -a -rcode noerror -r 1.1.1.1 -l /t/sample.txt | wc -l'
+```
+
+If that returns a large number, the run under-resolved and the data is still recoverable — the hostnames are all in `canonical_dns.tsv`; re-running Phase 3 re-resolves them without repeating discovery.
+
+**Which transport is actually working here?** The DoH proxy prints its endpoint probe at startup, and every proxy query is counted:
+
+```bash
+cat results/doh_proxy.log
+# [doh-proxy] endpoint probe: 1/3 reachable — https://1.1.1.1/dns-query
+# [doh-proxy] queries=12168 answered=12168 dropped=0  errors=ReadTimeout×72
+```
+
+`dropped` or a high error count means endpoints are being filtered or throttled. `answered` well below `queries` is the failure signature; add endpoints via `DOH_ENDPOINTS`, or switch to `--dns-mode udp`.
+
+**Everything resolved to `198.18.x.x` or `10.x.x.x`.** A fake-IP VPN (Clash/mihomo/Surge) or the corporate split-DNS is answering. Those hosts are marked `bogon` and excluded from probing and scanning rather than poisoning the results — but you will be seeing a filtered view of the target. Disable fake-IP mode for the Docker network, or run without the VPN.
+
+**Port scanning was skipped.** The log will say `ASN classification unavailable`. Both ASN transports (`whois.cymru.com:43` and Team Cymru's DNS service) failed, which means every IP would classify as `unknown` and the CDN/cloud exclusion would not work. The pipeline refuses to aim a port scan at IPs it cannot scope — DNS, HTTP and cloud results are unaffected.
+
 ## Building the Image
 
 ```bash
@@ -567,7 +700,11 @@ The build uses a multi-stage Dockerfile:
 
 ## Tips
 
-- **DNS resolvers and transport.** Metho ships a static ~12.7K-resolver list (trickest) and uses it as-is over raw UDP/53 — dnsx round-robins the pool and each retry moves to the next resolver, so dead entries in a large list cost nothing. On networks that **block or tarpit outbound UDP/53** (corporate VPN split-DNS, ISP response-rate-limiting after bulk NXDOMAIN queries — both observed in practice), use `--dns-mode doh`: resolution then rides DNS-over-HTTPS on TCP/443 to three trusted endpoints (1.1.1.1, 8.8.8.8, 9.9.9.9), which no UDP filter can touch. DoH trades raw throughput (~50–300 q/s vs UDP's 1,000+) for reachability — plenty for passive corpora; keep `udp` mode for big brute-force wordlists on open networks. For full control, pass your own list via `--resolvers FILE|URL` (custom lists are health-checked first; an all-dead list falls back to the system resolver). As a last-resort runtime safety net, a resolution batch that returns zero results is retried through the container's system resolver.
+- **DNS resolvers and transport.** Resolution defaults to **DNS-over-HTTPS on TCP/443** (`--dns-mode doh`), which is what works in practice. Raw UDP/53 against a large public resolver pool is the fragile option: the shipped ~12.7K trickest list answered only ~74% of a known-good sample here, and on a real 29K-hostname run the whole transport collapsed after a bulk burst — the run wrote off ~12,000 hostnames that exist and resolve fine, and reported zero live web servers for one target while ~75 of the hosts it *had* resolved were answering HTTP.
+  - **Why a local proxy rather than dnsx's built-in DoH.** dnsx v1.3.1 cannot complete a DoH query at all: `doh:https://…` fails with `Post "https://…/dns-query": EOF`, and `dot:`/`tcp:` return zero results, on networks where `curl` and Python POST the identical request to the identical endpoint and get HTTP 200. The resolver string format is correct (retryabledns' `parseResolver()` documents exactly that form) — the client is broken. `lib/doh_proxy.py` therefore speaks DoH itself and hands dnsx a plain `127.0.0.1:PORT` resolver, so wildcard detection, rcode filtering, record-type queries and PTR all keep working unchanged.
+  - **Endpoint selection.** The proxy probes all three endpoints at startup and uses only those that answer — on a network that permits 1.1.1.1 but black-holes 8.8.8.8 and 9.9.9.9 on TCP/443, blind round-robin sends a third of every batch into the hole. A failing endpoint is demoted automatically and retried after a cooldown.
+  - **Fallback.** If the proxy cannot start, or TCP/443 is filtered so no endpoint answers, the run falls back to the UDP pool automatically. Individual batches are also re-tried through the other transport when their answer rate collapses — the check is on *queries answered*, not *names resolved*, because a Certificate-Transparency corpus is legitimately about half NXDOMAIN and a resolve-rate gate misreads that as failure.
+  - For full control, pass your own list via `--resolvers FILE|URL` (custom lists are health-checked first; an all-dead list falls back to the system resolver). `--dns-mode udp` pins the old behaviour.
 - **Rate limiting matters.** If httpx is getting timeouts or empty results, lower `--rate-limit` (e.g., 50 or 25) — note this flag affects httpx only.
 - **ASN occurrence matters.** In `final_asn_summary.txt`, ASNs with fewer IPs are more interesting — they may represent niche hosting or forgotten infrastructure.
 - **Cloud enum keywords.** By default, the base name of each root domain is used as a keyword. Use `--cloud-enum-keywords` to add extra keywords.

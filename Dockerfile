@@ -205,6 +205,14 @@ RUN subfaster -h 2>&1 | grep -q . && \
     python3 -c "import bs4, requests, termcolor, colorama, tldextract, cffi, dns.resolver, requests_futures" && \
     echo "All runtime tools verified OK"
 
+# DoH proxy import check. The proxy is what every resolution rides in the
+# default dns-mode; a syntax error or a missing `requests` here would only
+# surface at runtime as an unexplained DNS failure, so fail the build instead.
+# --help exercises argument parsing without binding a socket.
+RUN python3 -m py_compile /opt/scripts/lib/doh_proxy.py && \
+    python3 /opt/scripts/lib/doh_proxy.py --help > /dev/null && \
+    echo "DoH proxy verified OK"
+
 # dnsgen functional test: --help output can contain a traceback (click
 # prints rich errors to stdout too), so grep is not enough — generate
 # permutations for a known domain and verify real output comes back.

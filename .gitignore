@@ -2,3 +2,5 @@ results_test/
 targets_test.txt
 metho.tar
 metho.tar.gz
+__pycache__/
+*.pyc
