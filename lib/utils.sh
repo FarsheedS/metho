@@ -85,6 +85,14 @@ _safe_name() {
 # exactly what happened in the run that motivated this: DNS worked for the
 # first domain, collapsed when the 28K-hostname batch hit, and every remaining
 # stage quietly recorded the loss as "timeout".
+
+# Default DoH endpoints. Defined once and shared by the proxy launcher below
+# and the banner in recon.sh, so the two can never drift apart — previously
+# the same three-endpoint literal was duplicated in both files. IP literals
+# only; the verification notes and per-provider probe results live in
+# lib/doh_proxy.py's DEFAULT_ENDPOINTS, which is the same list.
+DOH_ENDPOINTS_DEFAULT="https://8.8.8.8/dns-query,https://8.8.4.4/dns-query,https://94.140.14.14/dns-query,https://94.140.15.15/dns-query,https://208.67.222.222/dns-query,https://208.67.220.220/dns-query,https://1.1.1.1/dns-query,https://9.9.9.9/dns-query"
+
 load_resolvers() {
     local src="${RESOLVERS_SOURCE:-/opt/scripts/wordlists/resolvers.txt}"
     RESOLVERS_FILE="$src"
@@ -161,7 +169,7 @@ _load_doh_resolvers() {
 
     local port_file="${OUTPUT_DIR}/.doh_proxy.port"
     local proxy_log="${OUTPUT_DIR}/doh_proxy.log"
-    local endpoints="${DOH_ENDPOINTS:-https://1.1.1.1/dns-query,https://8.8.8.8/dns-query,https://9.9.9.9/dns-query}"
+    local endpoints="${DOH_ENDPOINTS:-${DOH_ENDPOINTS_DEFAULT}}"
 
     rm -f "$port_file"
     log_info "DoH mode: starting local DNS-over-HTTPS proxy (endpoints: ${endpoints//,/, }) ..."
@@ -276,6 +284,30 @@ _ensure_dns_transport() {
     DOH_PROXY_PID=""
     DOH_PROXY_PORT=""
     _load_doh_resolvers || return 1
+    return 0
+}
+
+# ── Which transport are we ACTUALLY on? ──────────────────────────────────────
+# DNS_MODE is the REQUESTED mode and is never rewritten when the proxy fails:
+# _load_doh_resolvers falls back by pointing RESOLVERS_FILE at the built-in
+# ~12.7K UDP pool while DNS_MODE stays "doh". Anything gating on DNS_MODE alone
+# therefore trusts a transport that is not running.
+#
+# That is not hypothetical — it is how httpx would have been handed the
+# unvetted static pool, the exact thing the DoH-only gate exists to prevent,
+# on precisely the networks where DoH had already failed. Ask this instead of
+# reading DNS_MODE.
+#
+# The PID is cleared on every fallback path (_doh_proxy_stop does it, and the
+# early exits do it directly), and the proxy is a child of this shell — so
+# liveness plus the resolver-file identity is the honest signal. The path
+# check catches the case where a fallback swapped RESOLVERS_FILE while a
+# restarted proxy is still coming up.
+_using_doh_transport() {
+    [[ "${DNS_MODE}" == "doh" ]] || return 1
+    [[ -n "${DOH_PROXY_PID:-}" && -n "${DOH_PROXY_PORT:-}" ]] || return 1
+    kill -0 "$DOH_PROXY_PID" 2>/dev/null || return 1
+    [[ "${RESOLVERS_FILE:-}" == "${OUTPUT_DIR}/doh_resolvers.txt" ]] || return 1
     return 0
 }
 
@@ -1151,7 +1183,38 @@ httpx_probe() {
     # here; a single-domain run (or any Phase 3 probe) uses RATE_LIMIT as-is.
     local _rl="${METHO_HTTPX_RATE:-$RATE_LIMIT}"
 
+    # Resolve through the SAME resolver the canonical dataset was built with.
+    #
+    # Without this, httpx falls back to the container's system resolver
+    # (Docker's 192.168.65.7, which forwards to the host's own DNS), so in DoH
+    # mode the dataset says a host resolves to one address while httpx
+    # connects to whatever the local resolver returns. That is two DNS views
+    # for one target — the split-horizon / fake-IP case DoH mode exists to
+    # avoid — and because dnsx's DoH queries bypass the OS resolver entirely,
+    # httpx's ~12,320 cold lookups were landing right back on the local
+    # network path that DoH mode had just taken all 29,022 names off.
+    #
+    # DoH transport only, and "on DoH" means the proxy is RUNNING — not that
+    # DoH was asked for. _using_doh_transport() answers that, because DNS_MODE
+    # still reads "doh" after a fallback has swapped RESOLVERS_FILE for the
+    # built-in UDP pool; gating on DNS_MODE would have handed httpx the
+    # unvetted ~12.7K-entry static list on exactly the networks where DoH had
+    # already failed, trading a divergence risk for a resolution-failure one.
+    #
+    # On the DoH transport, RESOLVERS_FILE is a single health-checked local
+    # proxy address, so both layers provably agree. Everywhere else httpx keeps
+    # the system resolver it has always used — unchanged behaviour, so UDP mode
+    # cannot regress. The divergence still exists there, so it is reported
+    # rather than left implicit.
+    local -a _httpx_resolver_args=()
+    if _using_doh_transport && [[ -s "${RESOLVERS_FILE:-}" ]]; then
+        _httpx_resolver_args=(-r "$RESOLVERS_FILE")
+    else
+        log_info "httpx: not on the DoH transport (DNS_MODE=${DNS_MODE}) — probing via the system resolver; IPs may differ from the canonical dataset"
+    fi
+
     cat "$input_file" | httpx \
+        ${_httpx_resolver_args[@]+"${_httpx_resolver_args[@]}"} \
         -silent \
         -json \
         -cdn \

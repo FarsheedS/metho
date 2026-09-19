@@ -24,17 +24,25 @@ run_phase3() {
     # ── Stage 1: Extract IPs from Canonical DNS Dataset ─────────────────────
     log_info "Stage 1: Extracting IPs from canonical DNS dataset"
 
+    # Settle the remaining "timeout" rows into "does not exist" vs "we could
+    # not ask" BEFORE the retry pass. Without this the dataset cannot say
+    # whether a 90%-unresolved corpus is a dead corpus or a dead transport,
+    # which is the first question anyone asks after a run like that — and the
+    # retry below would spend itself re-asking names that are already settled.
+    #
+    # Ordering matters and was previously the other way round: retry-then-
+    # settle means every confirmed-dead name is queried twice (once by the
+    # retry, once by the rcode pass) where once would do. Phase 1 now settles
+    # before its retries too, so by this point the pile is normally small.
+    canonical_dns_label_nxdomain
+
     # Final resolution pass — resolve any hostnames still pending, and retry
     # ones lost to transient timeouts earlier in the run (the include_timeouts
     # mode only fires if the transport has actually been answering, so a dead
-    # network never triggers a pointless re-grind).
+    # network never triggers a pointless re-grind). Everything the rcode pass
+    # confirmed is excluded, so this only touches genuinely ambiguous names —
+    # SERVFAIL and the like.
     canonical_dns_resolve_pending include_timeouts
-
-    # Settle the remaining "timeout" rows into "does not exist" vs "we could
-    # not ask". Without this the dataset cannot say whether a 90%-unresolved
-    # corpus is a dead corpus or a dead transport, which is the first question
-    # anyone asks after a run like that.
-    canonical_dns_label_nxdomain
 
     # Extract the domain→IP mapping from the canonical DNS dataset
     local dns_tsv="${CANONICAL_DNS_TSV:-${OUTPUT_DIR}/canonical_dns.tsv}"

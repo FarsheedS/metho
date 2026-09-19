@@ -49,7 +49,7 @@ log_info "Domains:    ${DOMAINS:-<not set>}"
 log_info "Domains file: ${DOMAINS_FILE:-<not set>}"
 log_info "DNS mode:   ${DNS_MODE}"
 if [[ "$DNS_MODE" == "doh" ]]; then
-    log_info "DNS endpoints: ${DOH_ENDPOINTS:-https://1.1.1.1/dns-query,https://8.8.8.8/dns-query,https://9.9.9.9/dns-query}"
+    log_info "DNS endpoints: ${DOH_ENDPOINTS:-${DOH_ENDPOINTS_DEFAULT}}"
 fi
 log_info "Auto mode:  ${AUTO}"
 log_info "Output:     ${OUTPUT_DIR}"

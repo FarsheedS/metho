@@ -114,7 +114,8 @@ canonical_dns_add_sources() {
         # File 1 ($norm): normalized new hostnames, one per line.
         # File 2 ($tsv):  the canonical TSV (header on line 1).
         awk -F'\t' -v OFS='\t' -v src="$source" -v xr="$norm_root" \
-            -v roots_file="${ROOT_DOMAINS_FILE:-}" -v counts_file="$counts" '
+            -v roots_file="${ROOT_DOMAINS_FILE:-}" -v counts_file="$counts" \
+            -v nrecheck="${METHO_NXDOMAIN_RECHECK:-0}" '
             # Load the root-domain list once for suffix matching.
             BEGIN {
                 nroots = 0
@@ -157,6 +158,16 @@ canonical_dns_add_sources() {
                     if (index(";" $3 ";", ";" src ";") == 0)
                         $3 = ($3 == "" ? src : $3 ";" src)
                     if ($2 == "" && new_root[$1] != "") $2 = new_root[$1]
+                    # Re-discovery does NOT normally re-open a settled row.
+                    # CT logs are historical, so the same dead names reappear
+                    # on every run — resetting them each time would re-grind
+                    # the whole NXDOMAIN pile and undo the one-query-per-name
+                    # settling that keeps bulk DNS off a constrained network.
+                    # Set METHO_NXDOMAIN_RECHECK=1 to re-open them anyway,
+                    # for when a name is genuinely expected to have come back
+                    # (a decommissioned hostname reused for a new service) and
+                    # one extra resolution pass is worth paying for.
+                    if (nrecheck == "1" && ($7 == "nxdomain" || $7 == "bogon")) $7 = "pending"
                     updated++
                 }
                 print
@@ -474,42 +485,97 @@ canonical_dns_resolve_pending() {
     # over the finalized TSV. Runs after every resolve round regardless of
     # whether dnsx produced output. A host left with no A/AAAA/CNAME that was
     # "resolved" is reclassified "bogon" so it is excluded from HTTPx/nmap.
-    local _bogon_stripped=0
-    awk -F'\t' -v OFS='\t' '
-        function is_reserved(ip,    a, n, o1, o2, o3) {
-            if (ip == "") return 0
+    #
+    # Every stripped address is recorded in "${tsv}.bogon" with the range that
+    # matched. A bogon count with no evidence behind it cannot be audited: the
+    # previous version erased the address AND left no trace, so working out
+    # whether a "bogon" host was an RFC1918 leak, a CGNAT name or a fake-IP
+    # VPN artefact meant re-resolving the hosts by hand.
+    #
+    # The two families are classified separately. The previous version ran the
+    # IPv4 octet parser over BOTH columns, and `split(ip, a, ".")` on an IPv6
+    # literal returns one field — so `n != 4` was true for every AAAA record
+    # and the entire IPv6 column was destroyed on every run, while an
+    # IPv6-only host was reclassified "bogon" and dropped from every
+    # downstream stage (HTTPx, nmap, IP extraction).
+    local _bogon_log="${tsv}.bogon"
+    rm -f "$_bogon_log"
+    awk -F'\t' -v OFS='\t' -v bogon_log="$_bogon_log" '
+        # ── IPv4 ────────────────────────────────────────────────────────────
+        # Sets `why` on a match so the audit log can name the range.
+        function v4_reserved(ip,    a, n, o1, o2, o3) {
             n = split(ip, a, ".")
-            if (n != 4) return 1
+            if (n != 4) { why = "malformed-v4"; return 1 }
             o1 = a[1]+0; o2 = a[2]+0; o3 = a[3]+0
-            if (o1 == 0) return 1
-            if (o1 == 10) return 1
-            if (o1 == 100 && o2 >= 64 && o2 <= 127) return 1
-            if (o1 == 127) return 1
-            if (o1 == 169 && o2 == 254) return 1
-            if (o1 == 172 && o2 >= 16 && o2 <= 31) return 1
-            if (o1 == 192 && o2 == 0 && (o3 == 0 || o3 == 2)) return 1
-            if (o1 == 192 && o2 == 168) return 1
-            if (o1 == 198 && (o2 == 18 || o2 == 19)) return 1
-            if (o1 == 198 && o2 == 51 && o3 == 100) return 1
-            if (o1 == 203 && o2 == 0 && o3 == 113) return 1
-            if (o1 >= 224) return 1
+            if (o1 == 0)   { why = "0.0.0.0/8";     return 1 }
+            if (o1 == 10)  { why = "10.0.0.0/8";    return 1 }
+            if (o1 == 100 && o2 >= 64 && o2 <= 127) { why = "100.64.0.0/10 CGNAT"; return 1 }
+            if (o1 == 127) { why = "127.0.0.0/8";   return 1 }
+            if (o1 == 169 && o2 == 254) { why = "169.254.0.0/16"; return 1 }
+            if (o1 == 172 && o2 >= 16 && o2 <= 31) { why = "172.16.0.0/12"; return 1 }
+            if (o1 == 192 && o2 == 0 && (o3 == 0 || o3 == 2)) { why = "192.0.0.0/24 / 192.0.2.0/24"; return 1 }
+            if (o1 == 192 && o2 == 168) { why = "192.168.0.0/16"; return 1 }
+            if (o1 == 198 && (o2 == 18 || o2 == 19)) { why = "198.18.0.0/15 RFC2544"; return 1 }
+            if (o1 == 198 && o2 == 51 && o3 == 100) { why = "198.51.100.0/24"; return 1 }
+            if (o1 == 203 && o2 == 0 && o3 == 113) { why = "203.0.113.0/24"; return 1 }
+            if (o1 >= 224) { why = "224.0.0.0/4 multicast+reserved"; return 1 }
             return 0
         }
-        function filter_reserved(ips,    a, i, k, out, t) {
+        # ── IPv6 ────────────────────────────────────────────────────────────
+        # Textual prefix matching: awk has no 128-bit integer, and every range
+        # that matters here is a clean prefix. Anything unmatched is treated
+        # as routable, so the IPv6 side is deliberately the permissive one —
+        # over-stripping is what lost the data in the first place.
+        function v6_reserved(ip,    t, a, n) {
+            t = tolower(ip)
+            if (t == "::" || t == "::1") { why = "v6 unspecified/loopback"; return 1 }
+            # IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible forms: judge the
+            # embedded address by the v4 rules, not by the v6 prefix.
+            if (index(t, "::ffff:") == 1 || index(t, "::ffff:0:") == 1) {
+                n = split(t, a, ":")
+                if (v4_reserved(a[n])) { why = why " (v4-mapped)"; return 1 }
+                return 0
+            }
+            if (substr(t, 1, 2) == "fc" || substr(t, 1, 2) == "fd") {
+                why = "fc00::/7 ULA"; return 1
+            }
+            if (substr(t, 1, 3) == "fe8" || substr(t, 1, 3) == "fe9" \
+             || substr(t, 1, 3) == "fea" || substr(t, 1, 3) == "feb") {
+                why = "fe80::/10 link-local"; return 1
+            }
+            if (substr(t, 1, 3) == "fec" || substr(t, 1, 3) == "fed" \
+             || substr(t, 1, 3) == "fee" || substr(t, 1, 3) == "fef") {
+                why = "fec0::/10 site-local (deprecated)"; return 1
+            }
+            if (substr(t, 1, 2) == "ff") { why = "ff00::/8 multicast"; return 1 }
+            if (index(t, "2001:db8") == 1) { why = "2001:db8::/32 documentation"; return 1 }
+            return 0
+        }
+        function is_reserved(ip,    a, n) {
+            if (ip == "") return 0
+            why = ""
+            if (index(ip, ":") > 0) return v6_reserved(ip)
+            return v4_reserved(ip)
+        }
+        function filter_reserved(ips, host,    a, i, k, out, t) {
             k = split(ips, a, ";")
             out = ""
             for (i = 1; i <= k; i++) {
                 t = a[i]
                 gsub(/^[ \t]+|[ \t]+$/, "", t)
-                if (t == "" || is_reserved(t)) continue
+                if (t == "") continue
+                if (is_reserved(t)) {
+                    print host "\t" t "\t" why > bogon_log
+                    continue
+                }
                 out = (out == "") ? t : out ";" t
             }
             return out
         }
         $1 == "hostname" && $2 == "root_domain" { print; next }
         {
-            $4 = filter_reserved($4)
-            $5 = filter_reserved($5)
+            $4 = filter_reserved($4, $1)
+            $5 = filter_reserved($5, $1)
             if ($4 == "" && $5 == "" && $6 == "" && $7 == "resolved") $7 = "bogon"
             print
         }
@@ -557,7 +623,22 @@ canonical_dns_resolve_pending() {
     fi
 
     if [[ "$bogon" -gt 0 ]]; then
-        log_warn "Canonical DNS: $bogon host(s) resolved to reserved/bogon IPs (e.g. 198.18.x.x fake-IP VPN, RFC1918). Excluded from downstream probing/nmap. Verify Docker DNS bypasses fake-ip mode."
+        log_warn "Canonical DNS: $bogon host(s) resolved only to reserved/private addresses — excluded from downstream probing/nmap."
+        log_warn "  Address and matched range for each: ${_bogon_log}"
+        # 198.18.0.0/15 is RFC 2544 benchmark space, which a fake-IP VPN
+        # (Clash/mihomo/Surge in fake-ip mode) returns for EVERY name. Only
+        # when that range is actually present is a VPN the explanation. The
+        # far more common case is a public DNS record that legitimately points
+        # into RFC1918/CGNAT — internal names leaked into Certificate
+        # Transparency logs — which no resolver or Docker setting will change.
+        # The previous wording asserted the VPN case unconditionally and sent
+        # the operator to check Docker DNS for a problem that was not there.
+        if grep -qE '(^|[[:space:]])198\.1[89]\.' "${_bogon_log}" 2>/dev/null; then
+            log_warn "  198.18.0.0/15 (RFC 2544) IS present — that is the fake-IP signature; check that DNS bypasses the VPN's fake-ip mode."
+        else
+            log_info "  No 198.18.0.0/15 present — these are genuine private-address records, not a fake-IP VPN."
+            log_info "  These hosts are unreachable from outside by design; they are worth keeping as intel, not as scan targets."
+        fi
     fi
 
     rm -f "$pending_file" "$dnsx_json"

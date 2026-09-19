@@ -172,8 +172,12 @@ cat > "${STUB}/dnsx" <<'STUBEOF'
 #!/usr/bin/env bash
 # Minimal dnsx stand-in. Driven by:
 #   FAKE_DNSX_A    hostnames that resolve to a public A record
+#   FAKE_DNSX_ADDR "host=literal" pairs; the family is inferred from the
+#                  literal, so one variable drives both the A and AAAA columns
 #   FAKE_DNSX_NX   hostnames reported NXDOMAIN by the -rcode pass
 #   FAKE_DNSX_FAIL 1 = every query errors (transport unreachable)
+#   FAKE_DNSX_LOG  file to append every queried hostname to, so a test can
+#                  assert what a pass did and did not ask for
 input="$(cat)"
 # dnsx also takes -l FILE; the Cymru ASN fallback uses that form.
 for a in "$@"; do :; done
@@ -184,6 +188,9 @@ if [[ " $* " == *" -l "* ]]; then
         [[ "$a" == "-l" ]] && next=1
     done
 fi
+# Record what was actually asked for, so a test can prove a retry pass skipped
+# names an earlier pass had already settled.
+[[ -n "${FAKE_DNSX_LOG:-}" ]] && printf '%s\n' "$input" >> "$FAKE_DNSX_LOG"
 # Team Cymru's DNS service returns EVERY covering prefix; the real service
 # does this too, and the code must keep only the most specific one.
 if [[ " $* " == *" -txt "* ]]; then
@@ -228,6 +235,19 @@ fi
 for h in ${FAKE_DNSX_A:-} whoami.akamai.net; do
     grep -qx -- "$h" <<<"$input" || continue
     printf '{"host":"%s","a":["93.184.216.34"]}\n' "$h"
+done
+# An explicit address per host, family chosen by the literal. Needed to
+# exercise the reserved-IP filter on BOTH columns: the bug it guards against
+# left AAAA answers looking like a different record type entirely.
+for kv in ${FAKE_DNSX_ADDR:-}; do
+    h="${kv%%=*}"; ip="${kv#*=}"
+    [[ -n "$h" && -n "$ip" ]] || continue
+    grep -qx -- "$h" <<<"$input" || continue
+    if [[ "$ip" == *:* ]]; then
+        printf '{"host":"%s","aaaa":["%s"]}\n' "$h" "$ip"
+    else
+        printf '{"host":"%s","a":["%s"]}\n' "$h" "$ip"
+    fi
 done
 exit 0
 STUBEOF
@@ -275,6 +295,119 @@ t "healthy large batch sets the flag" "1" "$METHO_DNS_WORKING"
 canonical_dns_add_sources "test" "${W2}/in4.txt" "example.com" > /dev/null
 FAKE_DNSX_A="" FAKE_DNSX_NX="" FAKE_DNSX_FAIL=1 canonical_dns_resolve_pending > /dev/null 2>&1
 t "unreachable transport clears the flag" "0" "$METHO_DNS_WORKING"
+
+# ── Reserved-IP filter: address families ──
+# Regression for the filter running the IPv4 octet parser over the AAAA column.
+# `split(ip, a, ".")` returns ONE field for an IPv6 literal, so the `n != 4`
+# guard was true for every IPv6 address: the whole AAAA column was destroyed on
+# every run, and an IPv6-only host was reclassified "bogon" and dropped from
+# HTTPx and nmap even when it was a perfectly public host. Both families must
+# be judged on their own terms, and a stripped address must leave a trace.
+printf 'v6only.example.com\nv6ula.example.com\nv4priv.example.com\nv4pub.example.com\n' > "${W2}/in5.txt"
+canonical_dns_add_sources "test" "${W2}/in5.txt" "example.com" > /dev/null
+FAKE_DNSX_ADDR="v6only.example.com=2a05:d014:9ed:7901:47a4:eb57:d2e6:7320 v6ula.example.com=fd12:3456:789a::1 v4priv.example.com=10.64.32.141 v4pub.example.com=93.184.216.34" \
+    canonical_dns_resolve_pending > /dev/null 2>&1
+
+t "public IPv6 survives the reserved-IP filter" \
+  "2a05:d014:9ed:7901:47a4:eb57:d2e6:7320" \
+  "$(awk -F'\t' '$1=="v6only.example.com"{print $5}' "$CANONICAL_DNS_TSV")"
+t "IPv6-only host stays resolved, never bogon" "resolved" \
+  "$(awk -F'\t' '$1=="v6only.example.com"{print $7}' "$CANONICAL_DNS_TSV")"
+t "public IPv4 is still kept" "93.184.216.34" \
+  "$(awk -F'\t' '$1=="v4pub.example.com"{print $4}' "$CANONICAL_DNS_TSV")"
+t "private IPv4 is stripped" "" \
+  "$(awk -F'\t' '$1=="v4priv.example.com"{print $4}' "$CANONICAL_DNS_TSV")"
+t "private-only host becomes bogon" "bogon" \
+  "$(awk -F'\t' '$1=="v4priv.example.com"{print $7}' "$CANONICAL_DNS_TSV")"
+t "ULA IPv6 is stripped" "" \
+  "$(awk -F'\t' '$1=="v6ula.example.com"{print $5}' "$CANONICAL_DNS_TSV")"
+t "ULA-only host becomes bogon" "bogon" \
+  "$(awk -F'\t' '$1=="v6ula.example.com"{print $7}' "$CANONICAL_DNS_TSV")"
+t "stripped address is recorded for audit" "1" \
+  "$(awk -F'\t' '$1=="v4priv.example.com" && $2=="10.64.32.141"{c++} END{print c+0}' "${CANONICAL_DNS_TSV}.bogon")"
+t "audit names the matched IPv4 range" "1" \
+  "$(awk -F'\t' '$1=="v4priv.example.com" && $3=="10.0.0.0/8"{c++} END{print c+0}' "${CANONICAL_DNS_TSV}.bogon")"
+t "audit names the matched IPv6 range" "1" \
+  "$(awk -F'\t' '$1=="v6ula.example.com" && $3=="fc00::/7 ULA"{c++} END{print c+0}' "${CANONICAL_DNS_TSV}.bogon")"
+
+# ── Re-discovery must not re-open a settled row ──
+# CT logs are historical, so the same dead names come back on every run.
+# Resetting them would re-grind the whole NXDOMAIN pile and undo the
+# one-query-per-name settling — the point of that pass on a network where bulk
+# DNS is the constrained resource. METHO_NXDOMAIN_RECHECK=1 is the opt-out.
+printf 'b.example.com\n' > "${W2}/in6.txt"
+canonical_dns_add_sources "test" "${W2}/in6.txt" "example.com" > /dev/null
+t "re-discovery leaves nxdomain settled" "nxdomain" \
+  "$(awk -F'\t' '$1=="b.example.com"{print $7}' "$CANONICAL_DNS_TSV")"
+
+export METHO_NXDOMAIN_RECHECK=1
+canonical_dns_add_sources "test" "${W2}/in6.txt" "example.com" > /dev/null
+unset METHO_NXDOMAIN_RECHECK
+t "METHO_NXDOMAIN_RECHECK=1 re-opens it" "pending" \
+  "$(awk -F'\t' '$1=="b.example.com"{print $7}' "$CANONICAL_DNS_TSV")"
+
+# ── Settling first is what makes each name cost one query ──
+# The whole point of hoisting canonical_dns_label_nxdomain into Phase 1 is that
+# a name proven dead is never asked again. If the include_timeouts retry still
+# touches settled rows, the pile gets re-ground at Stage 7 and again in Phase 3
+# and the hoist buys nothing. The control below matters just as much: the retry
+# must still fire for genuinely unresolved names, or this would "pass" by
+# disabling retries altogether.
+printf 's1.example.com\ns2.example.com\ns3.example.com\n' > "${W2}/in7.txt"
+canonical_dns_add_sources "test" "${W2}/in7.txt" "example.com" > /dev/null
+FAKE_DNSX_A="" canonical_dns_resolve_pending > /dev/null 2>&1
+FAKE_DNSX_NX="s1.example.com s2.example.com s3.example.com" \
+    canonical_dns_label_nxdomain > /dev/null 2>&1
+t "settling labels all three nxdomain" "3" \
+  "$(awk -F'\t' '$1 ~ /^s[123]\.example\.com$/ && $7=="nxdomain"{c++} END{print c+0}' "$CANONICAL_DNS_TSV")"
+
+: > "${W2}/queried.log"
+export METHO_DNS_WORKING=1
+FAKE_DNSX_LOG="${W2}/queried.log" canonical_dns_resolve_pending include_timeouts > /dev/null 2>&1
+t "retry pass does not re-query settled names" "0" \
+  "$(grep -cE '^s[123]\.example\.com$' "${W2}/queried.log" 2>/dev/null || true)"
+
+printf 't1.example.com\n' > "${W2}/in8.txt"
+canonical_dns_add_sources "test" "${W2}/in8.txt" "example.com" > /dev/null
+FAKE_DNSX_A="" canonical_dns_resolve_pending > /dev/null 2>&1
+: > "${W2}/queried2.log"
+FAKE_DNSX_LOG="${W2}/queried2.log" canonical_dns_resolve_pending include_timeouts > /dev/null 2>&1
+unset METHO_DNS_WORKING
+t "retry pass still reaches genuinely unresolved names" "1" \
+  "$(grep -cE '^t1\.example\.com$' "${W2}/queried2.log" 2>/dev/null || true)"
+
+# ── _using_doh_transport: the RUNNING transport, not the requested one ──
+# The trap this guards: _load_doh_resolvers falls back to the built-in UDP
+# pool by repointing RESOLVERS_FILE while leaving DNS_MODE="doh". A gate that
+# reads DNS_MODE reports "DoH" on a network where DoH has just failed, and
+# httpx gets handed the unvetted ~12.7K static pool — the exact thing the
+# DoH-only gate exists to prevent, on exactly the wrong networks.
+_saved_mode="${DNS_MODE:-}"; _saved_res="${RESOLVERS_FILE:-}"
+_saved_pid="${DOH_PROXY_PID:-}"; _saved_port="${DOH_PROXY_PORT:-}"
+
+DNS_MODE=udp; DOH_PROXY_PID=""; DOH_PROXY_PORT=""
+t "udp mode is not a DoH transport" "1" "$(_using_doh_transport; echo $?)"
+
+DNS_MODE=doh; DOH_PROXY_PID=""; DOH_PROXY_PORT=""
+t "doh requested but no proxy running is not DoH" "1" "$(_using_doh_transport; echo $?)"
+
+sleep 30 & _fake_proxy=$!          # a live child stands in for the proxy
+DOH_PROXY_PID="$_fake_proxy"; DOH_PROXY_PORT=9999
+RESOLVERS_FILE="${OUTPUT_DIR}/doh_resolvers.txt"; : > "$RESOLVERS_FILE"
+t "doh with a live proxy IS DoH" "0" "$(_using_doh_transport; echo $?)"
+
+# The fallback: proxy gone, DNS_MODE still "doh", RESOLVERS_FILE swapped.
+DOH_PROXY_PID=""; DOH_PROXY_PORT=""
+RESOLVERS_FILE="${SCRIPT_DIR}/wordlists/resolvers.txt"
+t "doh-mode fallback to the UDP pool is not DoH" "1" "$(_using_doh_transport; echo $?)"
+
+# Proxy up, but its resolver file swapped out from under it.
+DOH_PROXY_PID="$_fake_proxy"; DOH_PROXY_PORT=9999
+t "a stale resolver file is not DoH" "1" "$(_using_doh_transport; echo $?)"
+kill "$_fake_proxy" 2>/dev/null
+
+DNS_MODE="$_saved_mode"; RESOLVERS_FILE="$_saved_res"
+DOH_PROXY_PID="$_saved_pid"; DOH_PROXY_PORT="$_saved_port"
 
 # ── Cymru ASN DNS fallback ──
 # The fallback exists because the whois transport is a single point of failure
