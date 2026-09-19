@@ -642,13 +642,18 @@ If that returns a large number, the run under-resolved and the data is still rec
 
 ```bash
 cat results/doh_proxy.log
-# [doh-proxy] endpoint probe: 1/3 reachable — https://1.1.1.1/dns-query
+# [doh-proxy] endpoint probe: 6/8 reachable — https://8.8.8.8/dns-query, https://8.8.4.4/dns-query, ...
 # [doh-proxy] queries=12168 answered=12168 dropped=0  errors=ReadTimeout×72
 ```
 
 `dropped` or a high error count means endpoints are being filtered or throttled. `answered` well below `queries` is the failure signature; add endpoints via `DOH_ENDPOINTS`, or switch to `--dns-mode udp`.
 
-**Everything resolved to `198.18.x.x` or `10.x.x.x`.** A fake-IP VPN (Clash/mihomo/Surge) or the corporate split-DNS is answering. Those hosts are marked `bogon` and excluded from probing and scanning rather than poisoning the results — but you will be seeing a filtered view of the target. Disable fake-IP mode for the Docker network, or run without the VPN.
+**Everything resolved to a reserved range.** The hostname, the address and the matched range are written to `canonical_dns.tsv.bogon`, and those hosts are marked `bogon` and excluded from probing and scanning rather than poisoning the results. Two causes, and the file tells them apart:
+
+* **`198.18.0.0/15` (RFC 2544 benchmark space)** is the fake-IP signature — a VPN in fake-ip mode (Clash/mihomo/Surge) or a split-DNS resolver answering every name. You are seeing a filtered view of the target: run without the VPN, or disable fake-IP mode for the Docker network.
+* **`10.x`, `172.16–31.x`, `192.168.x`, `100.64–127.x` (CGNAT)** are almost always genuine records — a public DNS zone that deliberately points at internal addresses, usually because those names leaked into Certificate Transparency logs. No resolver or Docker setting will change that, and the hosts are not reachable from outside. Keep them as intel, not as scan targets.
+
+The warning only names a VPN when `198.18.0.0/15` is actually present. An earlier version asserted it unconditionally, which sent operators to check their Docker DNS for a problem that was not there.
 
 **Port scanning was skipped.** The log will say `ASN classification unavailable`. Both ASN transports (`whois.cymru.com:43` and Team Cymru's DNS service) failed, which means every IP would classify as `unknown` and the CDN/cloud exclusion would not work. The pipeline refuses to aim a port scan at IPs it cannot scope — DNS, HTTP and cloud results are unaffected.
 
