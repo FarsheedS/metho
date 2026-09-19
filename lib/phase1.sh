@@ -334,6 +334,30 @@ process_domain() {
             log_warn "  Skipping brute-force + dnsgen for $domain (cannot resolve). Fix DNS (disconnect VPN / use TCP resolvers) and re-run."
         fi
 
+        # ── Settle confirmed NXDOMAINs NOW, before anything retries them ────
+        # This pass used to run only at the top of Phase 3 — i.e. after Phase 1
+        # Stage 7 AND Phase 3 Stage 1 had each re-ground the entire timeout
+        # pile, spending the retry budget on names that were never going to
+        # exist. Measured against one real 240-host sample of a timeout pile:
+        # 84% NXDOMAIN, 10% SERVFAIL, 5% NODATA (name exists, has no address).
+        #
+        # Settling first turns a 16,178-host retry set into roughly 1,700 and
+        # makes each dead name cost ONE query instead of three or four. That
+        # is the whole point on a network where bulk DNS is the constrained
+        # resource: the retry passes are what flood it.
+        #
+        # The rcode pass only promotes a host to "nxdomain" when the resolver
+        # positively confirms it, so the conservative "timeout" label survives
+        # for SERVFAIL and every other unconfirmed case. Nothing is written off
+        # on a guess — which is why hoisting is safe where a blanket
+        # "timeout means dead" assumption would not be.
+        #
+        # Skipped when the circuit breaker fired: with DNS dead the whole pile
+        # is unaskable, and an rcode pass would confirm nothing.
+        if [[ "${_dns_dead:-0}" != "1" ]]; then
+            canonical_dns_label_nxdomain
+        fi
+
         # Extract resolved hostnames for HTTPx probing. Scope to THIS domain
         # (the canonical dataset holds every domain processed so far) so a host
         # resolved under an earlier domain is not re-probed here — before this
@@ -931,6 +955,24 @@ WORDBASE
 
     # Add any newly discovered subdomains from crawling to the canonical dataset
     [[ -s all_subdomains_final.txt ]] && canonical_dns_add_sources "final" "all_subdomains_final.txt" "$domain"
+
+    # Settle NXDOMAINs found by Stages 4-6 (brute force, permutation, crawler)
+    # BEFORE the timeout retry grinds them, for the same reason as the Stage 3
+    # pass: a name proven dead must cost one query, not a retry. This only
+    # sees rows still marked "timeout" — the Stage 3 pass already settled its
+    # own pile and settled rows are excluded — so it costs one rcode pass over
+    # the names added since, not a re-ask of anything already answered.
+    #
+    # Costs nothing when the pile is empty (the function returns before it
+    # invokes dnsx), so a healthy corpus pays no extra queries. Gated on the
+    # circuit breaker for the same reason as Stage 3: when DNS is dead the
+    # whole pile is unaskable and a second pass would confirm nothing. Stages
+    # 4-6 were skipped in that case too, so there is nothing new to settle —
+    # an ungated call here would just repeat a pass that already came back
+    # empty.
+    if [[ "${_dns_dead:-0}" != "1" ]]; then
+        canonical_dns_label_nxdomain
+    fi
 
     # Resolve any remaining pending hostnames. Final pass: also retry hosts
     # lost to transient timeouts (only if DNS has worked this run — guarded

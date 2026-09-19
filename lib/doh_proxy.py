@@ -63,9 +63,40 @@ PROBE_NAME = "whoami.akamai.net"
 
 # Default endpoints are IP literals on purpose: resolving a DoH hostname such
 # as cloudflare-dns.com would need the very resolver we are trying to replace.
+#
+# Ordered with the providers observed to survive a heavily filtered network
+# first. Probe results from the network this was tuned on — where the original
+# three-endpoint default left exactly ONE usable endpoint, so the run had no
+# failover and every query funnelled through a single provider:
+#
+#     reachable : 8.8.8.8, 8.8.4.4 (Google)
+#                 94.140.14.14, 94.140.15.15 (AdGuard)
+#                 208.67.222.222, 208.67.220.220 (OpenDNS)
+#     filtered  : 1.1.1.1, 1.0.0.1 (Cloudflare), 9.9.9.9, 149.112.112.112
+#                 (Quad9), 76.76.2.0 (ControlD), 194.242.2.2 (Mullvad),
+#                 193.110.81.0 / 185.253.5.254 (dns0.eu), 185.228.168.9
+#                 (CleanBrowsing), 64.6.64.6, 156.154.70.1, 101.101.101.101,
+#                 77.88.8.8, 223.5.5.5, 180.184.1.1
+#
+# All six reachable entries were verified to return real A records AND a
+# genuine NXDOMAIN (rcode 3) for a nonexistent name — the latter matters
+# because the NXDOMAIN-settling pass filters on rcode, so an endpoint that
+# answered only positive queries would silently break it.
+#
+# Cloudflare and Quad9 are kept in the list anyway: two of the three original
+# defaults being filtered here is a property of THIS network, not of the tool.
+# The startup probe demotes anything unreachable, and `EndpointPool` keeps
+# demoted endpoints as a last resort, so they cost one parallel probe attempt
+# and buy coverage on networks where Google/AdGuard/OpenDNS are the blocked
+# ones.
 DEFAULT_ENDPOINTS = (
-    "https://1.1.1.1/dns-query",
     "https://8.8.8.8/dns-query",
+    "https://8.8.4.4/dns-query",
+    "https://94.140.14.14/dns-query",
+    "https://94.140.15.15/dns-query",
+    "https://208.67.222.222/dns-query",
+    "https://208.67.220.220/dns-query",
+    "https://1.1.1.1/dns-query",
     "https://9.9.9.9/dns-query",
 )
 
@@ -223,6 +254,11 @@ class DohProxy:
     def __init__(self, endpoints, threads: int, timeout: float, verbose: bool):
         self.endpoints = endpoints
         self.timeout = timeout
+        # Total wall-clock a single query may spend across ALL endpoints.
+        # Must stay below the caller's per-query timeout (dnsx:
+        # DNSX_QUERY_TIMEOUT_DOH, default 15s) so the proxy always resolves or
+        # drops a query before its client gives up on it.
+        self.query_budget = float(os.environ.get("DOH_QUERY_BUDGET", "12"))
         self.verbose = verbose
         self.threads = threads
         self.stats = Stats()
@@ -250,10 +286,25 @@ class DohProxy:
     def resolve(self, wire: bytes) -> bytes | None:
         """Forward one wire-format query. Returns the wire response or None."""
         last_error = "no-endpoint"
+        # One overall deadline for the whole query, independent of how many
+        # endpoints are configured. Without it the worst case is
+        # len(endpoints) × per-request timeout, so growing the endpoint list
+        # (which the default list does, for failover coverage) would silently
+        # push a failing query past dnsx's own per-query budget
+        # (DNSX_QUERY_TIMEOUT_DOH). dnsx would then abandon a query the proxy
+        # is still working on and record a "timeout" on a host that was about
+        # to be answered — the exact mislabelling the timeout budget exists to
+        # prevent. Bounding the query, not the endpoint count, keeps the
+        # invariant true for any list length.
+        deadline = time.monotonic() + self.query_budget
         # Healthy endpoints first, demoted ones last. Every endpoint gets one
         # attempt: a single blocked endpoint must not fail a query while a
         # working one is available.
         for endpoint in self._pool.candidates():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                last_error = "query budget exhausted"
+                break
             try:
                 response = self._session().post(
                     endpoint,
@@ -262,7 +313,7 @@ class DohProxy:
                         "content-type": "application/dns-message",
                         "accept": "application/dns-message",
                     },
-                    timeout=self.timeout,
+                    timeout=min(self.timeout, remaining),
                 )
                 if response.status_code != 200:
                     last_error = f"HTTP {response.status_code}"

@@ -116,10 +116,16 @@ The status vocabulary distinguishes *"this name does not exist"* from *"we could
 | `resolved` | Answered with A/AAAA/CNAME | — |
 | `nxdomain` | The resolver authoritatively says the name does not exist | No — settled, nothing was lost |
 | `timeout` | No answer of the requested types, and not confirmed NXDOMAIN | Yes, while the transport is healthy |
-| `bogon` | Resolved only to reserved/private addresses (fake-IP VPN, RFC1918) — excluded from probing and scanning | No |
+| `bogon` | Resolved only to reserved/private addresses — excluded from probing and scanning | No |
 | `pending` | Not yet queried | Always |
 
-`nxdomain` is confirmed by a final pass in Phase 3 (`dnsx -rcode nxdomain`) that runs only over hosts still marked `timeout`. Without it a corpus that is 90% unresolved cannot be diagnosed: a run that lost 12,000 live hostnames to a broken transport produces exactly the same output as one whose corpus was genuinely 90% dead.
+`nxdomain` is confirmed by a pass (`dnsx -rcode nxdomain`) over the hosts still marked `timeout`. Without it a corpus that is 90% unresolved cannot be diagnosed: a run that lost 12,000 live hostnames to a broken transport produces exactly the same output as one whose corpus was genuinely 90% dead.
+
+**That pass runs in Phase 1, immediately after the first resolution round** — before any `include_timeouts` retry. It previously ran only at the top of Phase 3, so Phase 1 Stage 7 and Phase 3 Stage 1 each re-ground the whole timeout pile first. On a measured pile (240-host sample of a real run): 84% NXDOMAIN, 10% SERVFAIL, 5% NODATA. Settling first turns a ~16,000-host retry set into ~1,700 and makes each dead name cost **one** query instead of three or four. It stays conservative — only a positively confirmed NXDOMAIN is promoted, SERVFAIL and every other unconfirmed case keep the `timeout` label — so nothing is written off on a guess.
+
+Re-discovery does **not** re-open a settled row. CT logs are historical, so the same dead names reappear on every run and resetting them would re-grind the entire pile, undoing the saving above. Set `METHO_NXDOMAIN_RECHECK=1` to re-open `nxdomain` and `bogon` rows anyway, for when a name is genuinely expected to have come back (a decommissioned hostname reused for a new service).
+
+When addresses are stripped, the hostname, the address and the matched range are written to `canonical_dns.tsv.bogon` next to the dataset. A bogon count with no evidence behind it cannot be audited: the earlier version erased the address *and* left no trace, so determining whether a "bogon" was an RFC1918 leak, a CGNAT name or a fake-IP VPN artefact meant re-resolving the hosts by hand. Note the far more common cause is a public DNS record that legitimately points into RFC1918/CGNAT — internal names leaked into Certificate Transparency logs — which no resolver setting will change. `198.18.0.0/15` (RFC 2544) is the fake-IP VPN signature, and the warning only names a VPN when that range is actually present.
 
 Phases 2 and 3 never re-resolve the entire corpus — only newly discovered hosts are resolved through dnsx, and the results are merged incrementally.
 
@@ -317,9 +323,10 @@ docker run --rm -it \
 
 | Variable | Default | What it controls |
 |----------|---------|------------------|
-| `DOH_ENDPOINTS` | `https://1.1.1.1/dns-query,https://8.8.8.8/dns-query,https://9.9.9.9/dns-query` | DoH endpoints to try. The proxy probes them at startup and uses only the reachable ones |
+| `DOH_ENDPOINTS` | `https://8.8.8.8/dns-query,https://8.8.4.4/dns-query,https://94.140.14.14/dns-query,https://94.140.15.15/dns-query,https://208.67.222.222/dns-query,https://208.67.220.220/dns-query,https://1.1.1.1/dns-query,https://9.9.9.9/dns-query` | DoH endpoints to try, all IP literals — resolving a DoH *hostname* would need the very resolver being replaced. The proxy probes them at startup and uses only the reachable ones. With the previous three-endpoint default, one heavily filtered network left exactly one usable endpoint, so the run had no failover at all; per-provider probe results are recorded in `lib/doh_proxy.py` |
 | `DOH_PROXY_THREADS` | `128` | Concurrent DoH requests the proxy may have in flight |
-| `DOH_PROXY_TIMEOUT` | `4` | Per-request HTTPS timeout in the proxy. Keep `DOH_PROXY_TIMEOUT` × number of endpoints **below** `DNSX_QUERY_TIMEOUT_DOH`, or dnsx abandons queries the proxy is still working on (4s × 3 endpoints = 12s < 15s) |
+| `DOH_PROXY_TIMEOUT` | `4` | Per-request HTTPS timeout in the proxy. This is per **endpoint attempt**, not per query — see `DOH_QUERY_BUDGET` for the bound that actually matters |
+| `DOH_QUERY_BUDGET` | `12` | Total wall-clock one query may spend across **all** endpoints. Keep it below `DNSX_QUERY_TIMEOUT_DOH`, or dnsx abandons queries the proxy is still working on and records a `timeout` for a host that was about to be answered. Bounding the query rather than `DOH_PROXY_TIMEOUT` × endpoint count keeps that true however long `DOH_ENDPOINTS` gets |
 | `DOH_PROXY_READY_SECS` | `30` | How long to wait for the proxy to bind and probe its endpoints |
 | `DOH_FAIL_THRESHOLD` | `3` | Consecutive failures before an endpoint is demoted |
 | `DOH_COOLDOWN` | `60` | Seconds a demoted endpoint stays out of rotation |
@@ -635,13 +642,18 @@ If that returns a large number, the run under-resolved and the data is still rec
 
 ```bash
 cat results/doh_proxy.log
-# [doh-proxy] endpoint probe: 1/3 reachable — https://1.1.1.1/dns-query
+# [doh-proxy] endpoint probe: 6/8 reachable — https://8.8.8.8/dns-query, https://8.8.4.4/dns-query, ...
 # [doh-proxy] queries=12168 answered=12168 dropped=0  errors=ReadTimeout×72
 ```
 
 `dropped` or a high error count means endpoints are being filtered or throttled. `answered` well below `queries` is the failure signature; add endpoints via `DOH_ENDPOINTS`, or switch to `--dns-mode udp`.
 
-**Everything resolved to `198.18.x.x` or `10.x.x.x`.** A fake-IP VPN (Clash/mihomo/Surge) or the corporate split-DNS is answering. Those hosts are marked `bogon` and excluded from probing and scanning rather than poisoning the results — but you will be seeing a filtered view of the target. Disable fake-IP mode for the Docker network, or run without the VPN.
+**Everything resolved to a reserved range.** The hostname, the address and the matched range are written to `canonical_dns.tsv.bogon`, and those hosts are marked `bogon` and excluded from probing and scanning rather than poisoning the results. Two causes, and the file tells them apart:
+
+* **`198.18.0.0/15` (RFC 2544 benchmark space)** is the fake-IP signature — a VPN in fake-ip mode (Clash/mihomo/Surge) or a split-DNS resolver answering every name. You are seeing a filtered view of the target: run without the VPN, or disable fake-IP mode for the Docker network.
+* **`10.x`, `172.16–31.x`, `192.168.x`, `100.64–127.x` (CGNAT)** are almost always genuine records — a public DNS zone that deliberately points at internal addresses, usually because those names leaked into Certificate Transparency logs. No resolver or Docker setting will change that, and the hosts are not reachable from outside. Keep them as intel, not as scan targets.
+
+The warning only names a VPN when `198.18.0.0/15` is actually present. An earlier version asserted it unconditionally, which sent operators to check their Docker DNS for a problem that was not there.
 
 **Port scanning was skipped.** The log will say `ASN classification unavailable`. Both ASN transports (`whois.cymru.com:43` and Team Cymru's DNS service) failed, which means every IP would classify as `unknown` and the CDN/cloud exclusion would not work. The pipeline refuses to aim a port scan at IPs it cannot scope — DNS, HTTP and cloud results are unaffected.
 
