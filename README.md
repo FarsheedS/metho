@@ -80,7 +80,7 @@ Discovers AWS, Azure, and GCP assets associated with the root domains. This phas
 
 ### Phase 3: IP → Classification → Port Scan
 
-Resolves any still-pending hostnames from the canonical DNS dataset, performs deterministic IP classification, and port scans non-CDN IPs.
+Resolves any still-pending hostnames from the canonical DNS dataset, performs deterministic IP classification, and port scans non-CDN, non-cloud IPs (see the port-scan notes for why cloud is excluded by default).
 
 | Stage | What Happens | Tool(s) |
 |-------|-------------|---------|
@@ -88,7 +88,7 @@ Resolves any still-pending hostnames from the canonical DNS dataset, performs de
 | 1b | Reverse DNS (PTR) lookups on resolved IPs → new in-scope hostnames | dnsx |
 | 2 | IP → ASN lookup via whois.cymru.com, falling back to Team Cymru's DNS service. Both failing skips Stage 4 rather than scanning unclassified IPs | nc, dnsx |
 | 3 | Deterministic IP classification (CDN/cloud/dedicated/unknown) | Built-in classification engine |
-| 4 | Fast port scan (naabu, top 1000 ports) then service detection (nmap -sV on hosts naabu found open, capped to the top `--nmap-top-ports` most-common ports) — skipped with `--no-port-scan` | naabu, nmap |
+| 4 | Fast port scan (naabu, top `NAABU_TOP_PORTS` ports) then service detection (nmap -sV on hosts naabu found open, capped to the top `--nmap-top-ports` most-common ports) — skipped with `--no-port-scan` | naabu, nmap |
 | 5 | HTTP probe of hostnames that resolved after Phase 1 (Phase 2/3 resolution) into `phase3/live_hosts_late.txt` | httpx |
 
 ---
@@ -107,25 +107,30 @@ Columns:
 | `A` | Semicolon-separated IPv4 addresses |
 | `AAAA` | Semicolon-separated IPv6 addresses |
 | `CNAME` | Semicolon-separated CNAME targets |
-| `resolution_status` | `resolved`, `nxdomain`, `timeout`, `bogon`, or `pending` |
+| `resolution_status` | `resolved`, `cname_only`, `nxdomain`, `timeout`, `bogon`, or `pending` |
 
 The status vocabulary distinguishes *"this name does not exist"* from *"we could not ask"*, which matters most exactly when a run goes badly:
 
 | Status | Meaning | Retried? |
 |--------|---------|----------|
-| `resolved` | Answered with A/AAAA/CNAME | — |
+| `resolved` | Answered with **at least one A or AAAA address** | — |
+| `cname_only` | Answered with a CNAME but no address | No — settled |
 | `nxdomain` | The resolver authoritatively says the name does not exist | No — settled, nothing was lost |
 | `timeout` | No answer of the requested types, and not confirmed NXDOMAIN | Yes, while the transport is healthy |
-| `bogon` | Resolved only to reserved/private addresses — excluded from probing and scanning | No |
+| `bogon` | Resolved, but every address was reserved/private — excluded from port scanning, and from HTTP probing unless `METHO_PROBE_RESERVED=1` | No |
 | `pending` | Not yet queried | Always |
+
+**`resolved` means there is an address to connect to.** A CNAME with no address used to be recorded as `resolved`, which put 1,678 hostnames — 13.7% of everything handed to httpx — into the probe set carrying an empty address column. An independent 40-name sample of that set found ~80% NXDOMAIN elsewhere and ~18% pointing at a CNAME target that no longer resolves. Those are two different findings and neither is `resolved`: one is probe time burned on a host that cannot answer, the other is a dangling CNAME, i.e. a subdomain-takeover candidate that belongs in a report rather than a probe list. `cname_only` holds them out of the probe set and keeps them visible — see `phase1/<domain>/canonical_dns.tsv` and the per-run count in the log.
 
 `nxdomain` is confirmed by a pass (`dnsx -rcode nxdomain`) over the hosts still marked `timeout`. Without it a corpus that is 90% unresolved cannot be diagnosed: a run that lost 12,000 live hostnames to a broken transport produces exactly the same output as one whose corpus was genuinely 90% dead.
 
 **That pass runs in Phase 1, immediately after the first resolution round** — before any `include_timeouts` retry. It previously ran only at the top of Phase 3, so Phase 1 Stage 7 and Phase 3 Stage 1 each re-ground the whole timeout pile first. On a measured pile (240-host sample of a real run): 84% NXDOMAIN, 10% SERVFAIL, 5% NODATA. Settling first turns a ~16,000-host retry set into ~1,700 and makes each dead name cost **one** query instead of three or four. It stays conservative — only a positively confirmed NXDOMAIN is promoted, SERVFAIL and every other unconfirmed case keep the `timeout` label — so nothing is written off on a guess.
 
-Re-discovery does **not** re-open a settled row. CT logs are historical, so the same dead names reappear on every run and resetting them would re-grind the entire pile, undoing the saving above. Set `METHO_NXDOMAIN_RECHECK=1` to re-open `nxdomain` and `bogon` rows anyway, for when a name is genuinely expected to have come back (a decommissioned hostname reused for a new service).
+Re-discovery does **not** re-open a settled row. CT logs are historical, so the same dead names reappear on every run and resetting them would re-grind the entire pile, undoing the saving above. Set `METHO_NXDOMAIN_RECHECK=1` to re-open `nxdomain`, `bogon` and `cname_only` rows anyway, for when a name is genuinely expected to have come back (a decommissioned hostname reused for a new service, or a dangling CNAME whose target has been re-registered — the settled state most likely to change).
 
-When addresses are stripped, the hostname, the address and the matched range are written to `canonical_dns.tsv.bogon` next to the dataset. A bogon count with no evidence behind it cannot be audited: the earlier version erased the address *and* left no trace, so determining whether a "bogon" was an RFC1918 leak, a CGNAT name or a fake-IP VPN artefact meant re-resolving the hosts by hand. Note the far more common cause is a public DNS record that legitimately points into RFC1918/CGNAT — internal names leaked into Certificate Transparency logs — which no resolver setting will change. `198.18.0.0/15` (RFC 2544) is the fake-IP VPN signature, and the warning only names a VPN when that range is actually present.
+When addresses are stripped, the hostname, the address and the matched range are written to `canonical_dns.tsv.bogon` next to the dataset, **appended across every resolution pass and reset once per dataset**. A bogon count with no evidence behind it cannot be audited: the earlier version erased the address *and* left no trace, so determining whether a "bogon" was an RFC1918 leak, a CGNAT name or a fake-IP VPN artefact meant re-resolving the hosts by hand. The log was then truncated on every pass (both by an `rm -f` and by awk's `>` redirect, which truncates on the first write of each invocation), so it only ever held the last pass's strips — on a real run the global file listed 11 hosts against 514 bogon rows, and the same run contradicted itself, reporting "198.18.0.0/15 IS present — fake-IP VPN" in one pass and "No 198.18.0.0/15 present" in the next, because the evidence had been erased in between.
+
+Note the far more common cause is a public DNS record that legitimately points into RFC1918/CGNAT — internal names leaked into Certificate Transparency logs — which no resolver setting will change. `198.18.0.0/15` (RFC 2544) *can* be a fake-IP VPN signature, but its presence alone proves nothing: a VPN can only substitute an answer it is on the path of, so the warning names a VPN only when the range is present **and** the answers came through the system resolver rather than DoH. Verified on a real run — 56 internal-looking names returned `198.18.x` addresses from a public DoH endpoint, i.e. genuine published records for a carrier-internal range, not injection.
 
 Phases 2 and 3 never re-resolve the entire corpus — only newly discovered hosts are resolved through dnsx, and the results are merged incrementally.
 
@@ -221,6 +226,18 @@ Options:
                             parallel-domains × DNSX_THREADS_DOH — see "Scaling to many
                             root domains"
   --rate-limit N            httpx requests/second (default: 100)
+  --httpx-threads N         httpx threads per process (default: 150, hard maximum 200).
+                            This — not --rate-limit — is what bounds probe throughput.
+                            Values above the maximum are clamped and reported, never
+                            honoured silently.
+  --cewl-max-hosts N        Max live hosts CeWL may crawl for the brute-force wordlist
+                            (default: 150; 0 = unlimited)
+  --crawl-max-hosts N       Max live hosts Katana/SubDomainizer may crawl
+                            (default: 300; 0 = unlimited)
+  --probe-reserved          ALSO HTTP-probe hosts whose only addresses are
+                            reserved/private (status 'bogon'). Unreachable from the
+                            internet, but reachable if your network routes into the
+                            target's private/CGNAT space. Never affects naabu/nmap.
   --nmap-top-ports N        Cap nmap -sV (Phase 3) to the N most-common open ports (default: 100; 0 = no cap)
   --timeout N               Checkpoint auto-continue timeout in seconds; 0 = wait forever (default: 30)
   --output DIR              Output directory (default: /output)
@@ -328,6 +345,7 @@ docker run --rm -it \
 | `DOH_PROXY_TIMEOUT` | `4` | Per-request HTTPS timeout in the proxy. This is per **endpoint attempt**, not per query — see `DOH_QUERY_BUDGET` for the bound that actually matters |
 | `DOH_QUERY_BUDGET` | `12` | Total wall-clock one query may spend across **all** endpoints. Keep it below `DNSX_QUERY_TIMEOUT_DOH`, or dnsx abandons queries the proxy is still working on and records a `timeout` for a host that was about to be answered. Bounding the query rather than `DOH_PROXY_TIMEOUT` × endpoint count keeps that true however long `DOH_ENDPOINTS` gets |
 | `DOH_PROXY_READY_SECS` | `30` | How long to wait for the proxy to bind and probe its endpoints |
+| `DOH_PROXY_EXTRA_PORT` | `53` | A second, bare-IP UDP listener the proxy opens alongside its ephemeral port. cloud_enum's dnspython accepts bare IPs only and always dials UDP/53, so without this it leaves the DoH transport for the system resolver and sees a **different DNS view** from every other tool. Best-effort: 53 needs root (the container has it), and if the bind fails the proxy logs it and continues — consumers fall back to the old behaviour |
 | `DOH_FAIL_THRESHOLD` | `3` | Consecutive failures before an endpoint is demoted |
 | `DOH_COOLDOWN` | `60` | Seconds a demoted endpoint stays out of rotation |
 | `DNSX_RETRY` | `2` | dnsx retry count for every resolution pass |
@@ -353,9 +371,15 @@ three shared resources need to be sized against each other.
 |-------|---------|------------------|
 | `--parallel-domains` | `3` | Phase 1 workers, each running a whole per-domain pipeline |
 | `--parallel-hosts` | `5` | Hosts crawled in parallel *within* each worker — so up to `3 × 5 = 15` concurrent crawls |
-| `--rate-limit` | `100`/s | **Aggregate** against the targets. Phase 1 divides it by the number of workers actually started, so 3 workers each use 33/s, not 100/s |
+| `--httpx-threads` | `150` (max `200`) | httpx threads **per process**. The real throughput bound: throughput ≈ threads ÷ mean latency, so 50 threads against a corpus full of dead hosts measured 4.34 targets/s while the rate limit sat unused |
+| `HTTPX_TIMEOUT_MAX` / `HTTPX_SECONDS_PER_TARGET` | `3600`s / `1` | Wall-clock ceiling for an httpx round, scaled per target. httpx was the last stage with **no cap at all**: Phase 1 bounds it indirectly through the per-domain watchdog, but Phase 3's late probe runs with no watchdog above it, so an unbounded round there could hang the whole run. A killed round keeps what it flushed and is recorded as partial |
+| `--rate-limit` | `100`/s | **Aggregate** against the targets. Phase 1 divides it by the number of workers actually started, so 3 workers each use 33/s, not 100/s. Only binds once `--httpx-threads` is high enough to reach it |
+| `--cewl-max-hosts` / `--crawl-max-hosts` | `150` / `300` | How many live hosts the wordlist and crawl stages may touch per domain. Uncapped they are linear in the live-host count and outlast the domain budget |
+| `CRAWL_STAGE_TIMEOUT` | `1200`s | Wall-clock cap per crawl stage, independent of `--domain-timeout` |
+| `NAABU_TIMEOUT_MAX` / `NAABU_TOTAL_TIMEOUT_MAX` | `3600`s / `4×` that | Per-chunk and whole-sweep ceilings. naabu's cost is linear in the candidate count, so Phase 3 sweeps the candidate list **in chunks** sized to fit the per-run cap rather than truncating one big run: 6,501 candidates need ~13,300s at the defaults, against a 3,600s cap |
+| `NMAP_TIMEOUT_MAX` / `NMAP_SECONDS_PER_HOST` | `3600`s / `30` | Wall-clock ceiling for the `nmap -sV` pass, which had **no timeout at all**. Matters most on the fallback path (naabu found nothing, so every candidate goes to `-sV`). A killed nmap keeps what it wrote and is recorded as partial |
 | `DNSX_THREADS_DOH` | `64` | dnsx threads *per worker*. All workers share one DoH proxy, so in-flight = `parallel-domains × 64` |
-| `DOH_PROXY_THREADS` | `128` | Requests the proxy serves at once. Must be ≥ the in-flight figure above, or queries queue past `DNSX_QUERY_TIMEOUT_DOH` and get recorded as `timeout` |
+| `DOH_PROXY_THREADS` | `128` | Requests the proxy serves at once. Must be ≥ the in-flight figure above, or queries queue past `DNSX_QUERY_TIMEOUT_DOH` and get recorded as `timeout`. Startup now warns when `parallel-domains × DNSX_THREADS_DOH` exceeds it |
 
 Those four numbers are the ones that interact. If you raise
 `--parallel-domains`, raise `DOH_PROXY_THREADS` to match
@@ -383,8 +407,11 @@ docker run --rm -it \
 - `--domain-timeout` (default `5400`) caps any single pathological domain so it
   cannot gate the pool; a 70-domain sweep will hit this on the largest targets
   and keep going.
-- Port scanning is one global phase, so `NAABU_TIMEOUT_MAX` is the knob to
-  raise if the candidate IP set is large (the log says when the cap is hit).
+- Port scanning is one global phase. The candidate list is swept in **chunks**
+  sized to fit `NAABU_TIMEOUT_MAX`, so a large target is covered rather than
+  truncated; the knob that bounds the whole sweep is
+  `NAABU_TOTAL_TIMEOUT_MAX` (default `4 × NAABU_TIMEOUT_MAX`), and the log
+  reports the chunk count, the projection and any shortfall.
 - Raise `--parallel-hosts` only with headroom in CPU/RAM: each host slot can be
   a CeWL, Katana or SubDomainizer process, and CeWL is memory-capped per
   process by `CEWL_MEM_LIMIT_MB` (default 1024MB) — 15 concurrent CeWL crawls
@@ -411,15 +438,20 @@ Some tools can stall on misbehaving hosts. Each one has a configurable wall-cloc
 | `DNSGEN_MAX_INPUT` | `500` | Max subdomains fed to dnsgen (resolved hosts prioritized; 0 disables) |
 | `DNSGEN_SKIP_THRESHOLD` | `100` | Domains with more discovered subs than this skip dnsgen entirely (large targets: ~0 yield, hours of DNS; 0 disables) |
 | `DNSGEN_MAX_OUTPUT_BYTES` | `26214400` | Hard cap on dnsgen permutation output size (25MB) |
-| `NAABU_TIMEOUT` | `0` (derived) | Naabu fast port scan. `0` derives the cap from the target count (`NAABU_TIMEOUT_BASE + hosts × NAABU_SECONDS_PER_HOST`, max `NAABU_TIMEOUT_MAX`) — a fixed cap truncates large sweeps silently |
+| `NAABU_TIMEOUT` | `0` (derived) | Naabu fast port scan, per chunk. `0` derives the cap from the chunk's host count (`NAABU_TIMEOUT_BASE + hosts × NAABU_SECONDS_PER_HOST`, max `NAABU_TIMEOUT_MAX`); any positive value pins it |
 | `NAABU_TIMEOUT_BASE` | `300` | Fixed part of the derived naabu cap |
-| `NAABU_SECONDS_PER_HOST` | `2` | Per-host part of the derived naabu cap |
-| `NAABU_TIMEOUT_MAX` | `3600` | Ceiling on the derived naabu cap. Hitting it logs a warning, because the scan WILL be truncated — raise this, raise `NAABU_RATE`, or lower `NAABU_TOP_PORTS` to cover everything |
-| `NAABU_TOP_PORTS` | `1000` | Naabu top-N ports to scan |
+| `NAABU_SECONDS_PER_HOST` | `1` | Per-host part of the derived naabu cap. Conservative on purpose — it sets the chunk size, where under-estimating is unsafe. Recalibrate if `NAABU_TOP_PORTS`/`NAABU_RATE` change: the realistic cost is `ports ÷ rate × (1 + retries)` |
+| `NAABU_TIMEOUT_MAX` | `1200` | Ceiling on the per-chunk cap, and therefore the chunk size (`(cap − base) ÷ per-host` hosts per chunk). Also the worst case for ONE hung chunk. Being reached is the normal case on a large target, not a truncation — the sweep continues in the next chunk. The knob that bounds the whole sweep is `NAABU_TOTAL_TIMEOUT_MAX` |
+| `NAABU_TOP_PORTS` | `100` | Naabu top-N ports to scan. The dominant term in both the sweep's cost and its exposure: at 1,000 ports a 6,501-host sweep is ~6.5M SYNs (~1.8h of continuous SYN from one IP); at 100 it is ~650k (~11 min). Top-100 covers essentially every service that matters for recon |
 | `CYMRU_WHOIS_ATTEMPTS` | `3` | Retries of the `whois.cymru.com:43` ASN lookup before falling back to the DNS service |
 | `CYMRU_WHOIS_TIMEOUT` | `60` | Wall-clock cap on each `whois.cymru.com:43` bulk attempt |
 | `NAABU_RATE` | `1000` | Naabu packets/sec cap (noise/IPS throttle) |
 | `NAABU_RETRIES` | `2` | Naabu SYN retransmit count |
+| `NMAP_INCLUDE_CLOUD` | `0` | Whether cloud-classified IPs are port-scanned. Off by default: on a real run every host answering on more than 5 ports was a Google Cloud address, and they contributed 226 of the 247 ports found — GCP front-end artefacts that dominated the sweep and filled the `-sV` port union. Dropping cloud halves the candidate list; it does NOT reduce the HTTP surface (httpx results are unchanged). Set to `1` when the target self-hosts on cloud VMs |
+| `NMAP_MIN_PORT_HOSTS` | `2` | How many hosts a port must have been seen open on before `-sV` spends time on it. The `-sV` port list is global, so a port seen on one odd host gets probed across the whole estate. Well-known ports (`<1024`) bypass the floor. `1` disables it |
+| `NMAP_TIMEOUT_MAX` / `NMAP_SECONDS_PER_HOST` | `3600`s / `30` | Wall-clock ceiling for the `nmap -sV` pass, scaled per host |
+| `NMAP_TOP_PORTS` | `100` | Cap on how many ports `-sV` service-detects (see `--nmap-top-ports`) |
+| `METHO_PROBE_RESERVED` | `0` | Whether `bogon` hosts (every address reserved/private) are HTTP-probed. Off by default: on a network that does not route into that space each costs an httpx timeout, and the address may reach something unrelated to the target. On a real run 549 hosts were in this bucket and **2 were live** — internal OpenSearch clusters answering 200 from `100.64.x`. HTTP only: `bogon` hosts are never port-scanned either way |
 
 ```bash
 docker run --rm -it \
@@ -448,6 +480,8 @@ results/
 ├── recon.log                      # Timestamped log of all stages
 ├── canonical_dns.tsv              # Canonical hostname→DNS dataset
 ├── httpx_metadata.tsv             # HTTPX CDN/tech/webserver metadata per host
+├── httpx_probed.txt               # Every hostname ever handed to httpx (responders AND silent hosts)
+├── stage_truncations.txt          # Any stage or domain that did NOT finish — empty means a complete run
 ├── root_domains.txt               # Normalized, deduplicated input root domains
 │
 ├── phase1/
@@ -517,7 +551,8 @@ results/
     ├── final_asn_list.txt                 # All ASNs
     ├── final_asn_summary.txt             # ASNs sorted by occurrence count
     ├── final_network_ranges.txt           # All network ranges
-    ├── final_ip_addresses.txt             # All IPs
+    ├── final_ip_addresses.txt             # All IPv4 addresses
+    ├── final_ip_addresses_v6.txt          # All IPv6 addresses (inventory only — not port-scanned)
     ├── final_ip_classification.tsv       # IP classification (cdn/cloud/dedicated/unknown)
     ├── final_ip_port_pairs.txt            # IP:port from non-CDN scan
     ├── final_cdn_ips.txt                  # CDN IPs
@@ -533,7 +568,7 @@ This is the one you care about. It contains deduplicated, consolidated lists rea
 Key files:
 - **`canonical_dns.tsv`** — The single source of truth for hostname→DNS mappings. Every hostname discovered by any tool is tracked here with its resolution status and discovery sources.
 - **`final_ip_classification.tsv`** — Deterministic IP classification with CDN/cloud/dedicated/unknown labels, associated hostnames, root domains, ASN, and ASN org.
-- **`final_nmap_candidates.txt`** — IPs that were actually port-scanned (excludes CDN IPs).
+- **`final_nmap_candidates.txt`** — IPs that were actually port-scanned (excludes CDN IPs, and cloud IPs by default — see `NMAP_INCLUDE_CLOUD`).
 - **`final_httpx_metadata.json`** — Full HTTPx output with CDN detection, tech fingerprinting, web server, and content length for every live host.
 - **`final_waymore_urls.txt`** — All historical URLs discovered by Waymore across all root domains.
 
@@ -619,14 +654,63 @@ Proceed to vulnerability scanning / enumeration on live web servers.
 
 ---
 
+## Incomplete runs are reported, not hidden
+
+Several things can stop a stage early: the per-domain wall-clock watchdog, a
+crawl stage reaching its host cap or its stage budget, or the naabu sweep
+running out of its total budget. Each of those leaves a domain **partially
+covered**, and every one of them used to be a single `[!]` line lost in the log
+while the pipeline went on to print `Recon pipeline complete!`.
+
+Every such event is now appended to `stage_truncations.txt` in the output root,
+and the run ends with an error block naming each affected domain and stage:
+
+```
+════════════════════════════════════════════════════════════════
+  RUN INCOMPLETE — 1 truncation(s) recorded
+════════════════════════════════════════════════════════════════
+  vodafone.com: domain-watchdog — killed at 5400s
+  Results for those domains are LOWER BOUNDS, not coverage.
+════════════════════════════════════════════════════════════════
+```
+
+`stage_truncations.txt` and `httpx_probed.txt` are cleared at startup, so a
+re-run into the same output directory starts clean. Both are per-run state that
+either accumulates or is merged into: a leftover truncation record would make a
+clean run report itself incomplete, and a leftover probe ledger would make
+Phase 3 skip hosts the new run never probed.
+
+**An absent or empty `stage_truncations.txt` is what "complete" means.** If it
+is non-empty, every count in `RECON_SUMMARY.txt` for the domains it names is a
+floor. The per-host detail is kept next to the stage that stopped: partial
+crawl output stays in `phase1/<domain>/katana/` and `subdomainizer/`, and the
+naabu sweep records which hosts it completed in
+`phase3/naabu_scanned_hosts.txt` — a lower bound, since a chunk killed at its
+cap is deliberately not counted as reached.
+
+To get full coverage instead of a truncation, raise the limit rather than
+re-running blind: `--domain-timeout` for the watchdog, `--cewl-max-hosts` /
+`--crawl-max-hosts` / `CRAWL_STAGE_TIMEOUT` for the crawlers, and
+`NAABU_TOTAL_TIMEOUT_MAX` for the port sweep.
+
 ## Troubleshooting DNS
 
 **Most of the corpus is `timeout`.** Check `nxdomain` before concluding anything was lost. `nxdomain` means the resolver authoritatively answered that the name does not exist — a Certificate-Transparency corpus is routinely half dead, and that is not a failure. A large `timeout` pile with a *healthy* transport means the same thing, less conclusively. Only a **large `timeout` pile plus a transport that stopped answering** indicates loss, and the run log says which it was:
 
 ```
-DNS health: transport 'doh' answered 28900/28901 queries (>=50% — healthy)
-DNS health: transport 'doh' answered only 300/28901 queries (<50%) — DNS UNHEALTHY
+DNS health: transport 'doh' blackholed 1/28901 hosts — below the 50% ceiling, so the transport is answering; timeout retries enabled
+  12450/28901 of this batch returned an address or CNAME; the rest are negatives (NXDOMAIN/SERVFAIL), which the label pass below separates
+DNS health: transport 'doh' blackholed 28601/28901 hosts — above the 50% ceiling; DNS UNHEALTHY, timeout retries disabled
 ```
+
+Note the two numbers answer two different questions. The **blackhole** count is
+`hosts dnsx reported as failing every attempt` — it detects a dead transport. The
+**record** count is how many names actually came back with an address or CNAME.
+A transport that answers everything with SERVFAIL scores 100% healthy on the
+first number and 0% on the second, which is why both are printed: previously
+only the first existed and was labelled "queries answered", so a run whose pile
+was a dead *corpus* read like a run whose *transport* was fine without saying
+so.
 
 To settle a specific pile by hand, count how many of its hostnames actually exist:
 
@@ -717,6 +801,8 @@ The build uses a multi-stage Dockerfile:
   - **Endpoint selection.** The proxy probes all three endpoints at startup and uses only those that answer — on a network that permits 1.1.1.1 but black-holes 8.8.8.8 and 9.9.9.9 on TCP/443, blind round-robin sends a third of every batch into the hole. A failing endpoint is demoted automatically and retried after a cooldown.
   - **Fallback.** If the proxy cannot start, or TCP/443 is filtered so no endpoint answers, the run falls back to the UDP pool automatically. Individual batches are also re-tried through the other transport when their answer rate collapses — the check is on *queries answered*, not *names resolved*, because a Certificate-Transparency corpus is legitimately about half NXDOMAIN and a resolve-rate gate misreads that as failure.
   - For full control, pass your own list via `--resolvers FILE|URL` (custom lists are health-checked first; an all-dead list falls back to the system resolver). `--dns-mode udp` pins the old behaviour.
+- **cloud_enum and DoH.** cloud_enum cannot read a `HOST:PORT` resolver, so in DoH mode it previously fell back to the system resolver and resolved bucket names through a different DNS view than the rest of the run. The proxy now also listens on `127.0.0.1:53` (`DOH_PROXY_EXTRA_PORT`), and cloud_enum is handed that, so its checks use the same transport as everything else. If the extra bind is unavailable the log says so and the old fallback applies.
+
 - **Rate limiting matters.** If httpx is getting timeouts or empty results, lower `--rate-limit` (e.g., 50 or 25) — note this flag affects httpx only.
 - **ASN occurrence matters.** In `final_asn_summary.txt`, ASNs with fewer IPs are more interesting — they may represent niche hosting or forgotten infrastructure.
 - **Cloud enum keywords.** By default, the base name of each root domain is used as a keyword. Use `--cloud-enum-keywords` to add extra keywords.
@@ -726,7 +812,7 @@ The build uses a multi-stage Dockerfile:
 - **GitHub subdomain discovery.** Set the `GITHUB_TOKEN` environment variable (comma-separated for multiple tokens) or include GitHub tokens in the subfaster provider-config. The pipeline searches GitHub code for references to each target domain.
 - **Subdomain permutation.** After brute force, dnsgen generates permutations from discovered subdomain patterns (e.g. `dev` → `dev1`, `dev-internal`, `dev-staging`) and resolves them. This finds subdomains that follow the target's naming conventions but appear in no passive source.
 - **Reverse DNS.** Phase 3 performs PTR lookups on all resolved IPs, which can reveal hostnames not discovered by any subdomain enumeration tool.
-- **Two-phase port scanning.** Naabu fast-scans the top 1000 ports on all non-CDN candidates, then nmap runs service/version detection (`-sV`) on only the hosts naabu found open — the hosts with nothing open skip the expensive -sV pass entirely, and the fallback fixed-port list covers the rare case where naabu is unavailable or finds nothing.
+- **Two-phase port scanning.** Naabu fast-scans the top `NAABU_TOP_PORTS` (100 by default) ports on all non-CDN, non-cloud candidates, then nmap runs service/version detection (`-sV`) on only the hosts naabu found open — the hosts with nothing open skip the expensive -sV pass entirely, and the fallback fixed-port list covers the rare case where naabu is unavailable or finds nothing.
 - **Check recon.log.** The timestamped log file captures everything — useful for debugging or tuning the pipeline.
 - **Do manual recon first.** Google dorking and reverse WHOIS can find additional root domains. Add them to your input file before running the pipeline.
 

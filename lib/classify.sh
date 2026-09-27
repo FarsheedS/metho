@@ -467,10 +467,31 @@ write_ip_datasets() {
         # 167 IPs + "IP"), and nmap treated "IP" as a target name.
         awk -F'\t' 'FNR>1 && $2 != "cdn" {print $1}' "$class_tsv" | sort -u -V > "${pdir}/non_cdn_ips.txt"
 
-        # nmap_candidates.txt (dedicated + cloud + unknown — same as non-CDN)
-        # This is intentionally identical to non_cdn_ips.txt for the default case.
-        # In the future, one could exclude "cloud" IPs from nmap if desired.
-        cp "${pdir}/non_cdn_ips.txt" "${pdir}/nmap_candidates.txt"
+        # nmap_candidates.txt — what the port scan is actually aimed at.
+        #
+        # CDN is excluded for scope (shared edge infrastructure), and so is
+        # CLOUD by default. Cloud IPs are not "shared" the way a CDN edge is, so
+        # the scope argument is weaker — but the measurement is blunt: on a real
+        # run every one of the 21 hosts answering on more than 5 ports was a
+        # Google Cloud address (34.x/35.x), and they contributed 226 of the 247
+        # distinct ports found. Those are GCP front-end artefacts — one host
+        # SYN-ACKing on a random, unrelated set of a dozen ports is not a service
+        # set — and they cost two ways: they dominated the sweep's time, and they
+        # filled the nmap -sV port union with ports that no real service owns.
+        #
+        # Dropping cloud halves the candidate list (3,620 of 6,501 here) and
+        # removes the artefact population with it. It does NOT reduce the HTTP
+        # surface: httpx results, live hosts and every web-derived finding are
+        # unchanged — this only decides what gets port-scanned.
+        #
+        # Set NMAP_INCLUDE_CLOUD=1 to scan cloud addresses anyway (self-hosted
+        # instances on cloud VMs are a legitimate reason to want them).
+        if [[ "${NMAP_INCLUDE_CLOUD:-0}" == "1" ]]; then
+            cp "${pdir}/non_cdn_ips.txt" "${pdir}/nmap_candidates.txt"
+        else
+            awk -F'\t' 'FNR>1 && $2 != "cdn" && $2 != "cloud" {print $1}' "$class_tsv" \
+                | sort -u -V > "${pdir}/nmap_candidates.txt"
+        fi
     else
         : > "${pdir}/all_resolved_ips.txt"
         : > "${pdir}/cdn_ips.txt"

@@ -15,7 +15,10 @@
 #   A                   semicolon-separated IPv4 addresses
 #   AAAA                semicolon-separated IPv6 addresses
 #   CNAME               semicolon-separated CNAME targets
-#   resolution_status   resolved | nxdomain | timeout | bogon | pending
+#   resolution_status   resolved | cname_only | nxdomain | timeout | bogon | pending
+#                       (resolved = has at least one A/AAAA address; cname_only =
+#                        a CNAME answer with no address, i.e. a dangling-CNAME /
+#                        takeover candidate held out of the probe set)
 #
 # The file lives at ${OUTPUT_DIR}/canonical_dns.tsv
 # and is initialized once at pipeline start, then updated incrementally.
@@ -25,6 +28,14 @@
 init_canonical_dns() {
     local tsv="${CANONICAL_DNS_TSV:-${OUTPUT_DIR}/canonical_dns.tsv}"
     printf 'hostname\troot_domain\tdiscovery_sources\tA\tAAAA\tCNAME\tresolution_status\n' > "$tsv"
+    # The reserved-address audit log is reset HERE, once per dataset, and only
+    # appended to thereafter. It used to be truncated at the start of every
+    # resolve pass, so it only ever held the LAST pass's strips while the
+    # reported bogon count was the cumulative TSV state: a real run's global
+    # file held 11 hosts against 514 bogon rows, i.e. the audit trail the
+    # reserved-IP filter was changed to produce did not actually exist for any
+    # host stripped in an earlier pass.
+    rm -f "${tsv}.bogon"
     log_info "Initialized canonical DNS dataset: $tsv"
 }
 
@@ -167,7 +178,7 @@ canonical_dns_add_sources() {
                     # for when a name is genuinely expected to have come back
                     # (a decommissioned hostname reused for a new service) and
                     # one extra resolution pass is worth paying for.
-                    if (nrecheck == "1" && ($7 == "nxdomain" || $7 == "bogon")) $7 = "pending"
+                    if (nrecheck == "1" && ($7 == "nxdomain" || $7 == "bogon" || $7 == "cname_only")) $7 = "pending"
                     updated++
                 }
                 print
@@ -356,6 +367,11 @@ canonical_dns_resolve_pending() {
     # to exist and resolve fine on an independent resolver — a rate-based gate
     # called that environment healthy because a handful of hosts resolved.
     local _failed_n=0
+    # Names in this batch that came back with an address or a CNAME. Filled in
+    # by the dnsx-JSON parse below; stays 0 when dnsx produced no output at all.
+    # Reported alongside the blackhole count so the health line cannot be read
+    # as "we got answers" when it only means "we were not refused".
+    local _with_records=0
     if grep -q "domains failed to resolve" "${dnsx_json}.stderr" 2>/dev/null; then
         _failed_n=$(grep -oE "[0-9]+ domains failed" "${dnsx_json}.stderr" | head -1 | grep -oE "^[0-9]+" || echo 0)
         _failed_n=${_failed_n:-0}
@@ -431,21 +447,46 @@ canonical_dns_resolve_pending() {
 
     if [[ -s "$dnsx_json" ]]; then
         local dnsx_map="${tsv}.dnsx_map"
-        # dnsx JSON fields: .host, .a[], .aaaa[], .cname[]. A record with
-        # empty A/AAAA/CNAME is ambiguous (SERVFAIL/timeout vs no-answer) —
-        # we keep it as "timeout": mislabeling a timeout as "nxdomain" would
-        # permanently write off a host that may actually be live, while
-        # "timeout" honestly signals "unresolved — retry if you care".
+        # dnsx JSON fields: .host, .a[], .aaaa[], .cname[].
+        #
+        # Three outcomes, and the distinction is load-bearing:
+        #   A or AAAA present        -> "resolved"    (has an address; safe to probe)
+        #   only a CNAME, no address -> "cname_only"  (see below)
+        #   nothing at all           -> "timeout"     (SERVFAIL / no answer)
+        #
+        # "timeout" is deliberately NOT "nxdomain": mislabeling an unresolved
+        # host as nonexistent would write it off permanently, while "timeout"
+        # honestly says "unresolved — retry if you care".
+        #
+        # "cname_only" exists because the rule used to be
+        #     (no A and no AAAA and no CNAME) -> timeout, ELSE resolved
+        # so a bare CNAME answer was recorded as "resolved" with an empty
+        # address column. On a real 28,323-hostname run that put 1,678 rows
+        # (13.7% of everything handed to httpx) into the probe set carrying no
+        # address at all; an independent 40-name sample of that set found ~80%
+        # NXDOMAIN elsewhere and ~18% returning a CNAME whose target no longer
+        # resolves. Those are two different findings and neither is "resolved":
+        #   - the NXDOMAIN majority is probe time burned on names that cannot
+        #     answer, and
+        #   - the dangling-CNAME minority is a takeover candidate, which belongs
+        #     in the report rather than in a probe list labelled "live".
         jq -r '
             (.host | ascii_downcase | sub("^[*][.]"; "") | sub("[.]$"; "")) as $h
-            | [$h,
-               (if .a then (.a | join(";")) else "" end),
-               (if .aaaa then (.aaaa | join(";")) else "" end),
-               (if .cname then (.cname | join(";")) else "" end),
-               (if (.a // [] | length) == 0 and (.aaaa // [] | length) == 0 and (.cname // [] | length) == 0
-                then "timeout" else "resolved" end)]
+            | (if .a then (.a | join(";")) else "" end) as $a
+            | (if .aaaa then (.aaaa | join(";")) else "" end) as $aaaa
+            | (if .cname then (.cname | join(";")) else "" end) as $cname
+            | [$h, $a, $aaaa, $cname,
+               (if $a != "" or $aaaa != "" then "resolved"
+                elif $cname != "" then "cname_only"
+                else "timeout" end)]
             | @tsv
         ' "$dnsx_json" > "$dnsx_map" 2>/dev/null || : > "$dnsx_map"
+
+        # Record-bearing count for the health line below. "The transport did
+        # not blackhole these hosts" and "these names have records" are
+        # different questions, and only this number answers the second.
+        _with_records=$(awk -F'\t' '$2 != "" || $3 != "" || $4 != "" {c++} END {print c+0}' "$dnsx_map" 2>/dev/null)
+        _with_records=${_with_records:-0}
 
         awk -F'\t' -v OFS='\t' -v NR_FILE="$dnsx_map" '
             BEGIN {
@@ -498,8 +539,18 @@ canonical_dns_resolve_pending() {
     # and the entire IPv6 column was destroyed on every run, while an
     # IPv6-only host was reclassified "bogon" and dropped from every
     # downstream stage (HTTPx, nmap, IP extraction).
+    # Append, never truncate: each pass can strip addresses the earlier passes
+    # never saw (a host can gain an address later), and the operator reading
+    # this file wants every strip this dataset produced, not the last pass's.
+    # Duplicate lines across passes are possible and harmless; the report counts
+    # bogon hosts from the TSV, not from here.
+    #
+    # The append has to be an awk `>>`, not `>`: awk's `>` truncates the target
+    # on the first write OF EACH awk INVOCATION, so a per-pass `>` re-erased the
+    # log on every pass no matter what the shell did around it. That — plus the
+    # per-pass `rm -f` that used to sit here — is why a real run's global file
+    # held 11 hosts against 514 bogon rows.
     local _bogon_log="${tsv}.bogon"
-    rm -f "$_bogon_log"
     awk -F'\t' -v OFS='\t' -v bogon_log="$_bogon_log" '
         # ── IPv4 ────────────────────────────────────────────────────────────
         # Sets `why` on a match so the audit log can name the range.
@@ -565,7 +616,7 @@ canonical_dns_resolve_pending() {
                 gsub(/^[ \t]+|[ \t]+$/, "", t)
                 if (t == "") continue
                 if (is_reserved(t)) {
-                    print host "\t" t "\t" why > bogon_log
+                    print host "\t" t "\t" why >> bogon_log
                     continue
                 }
                 out = (out == "") ? t : out ";" t
@@ -576,20 +627,27 @@ canonical_dns_resolve_pending() {
         {
             $4 = filter_reserved($4, $1)
             $5 = filter_reserved($5, $1)
-            if ($4 == "" && $5 == "" && $6 == "" && $7 == "resolved") $7 = "bogon"
+            # A row that was "resolved" and lost every address to the filter is
+            # a private-address record, whether or not it also carries a CNAME.
+            # The old guard also required $6 == "", so a host whose only address
+            # was CGNAT but which had a CNAME stayed "resolved" with an empty
+            # address column — the same mislabel cname_only now covers, and the
+            # reason those hosts reached httpx with no address to dial.
+            if ($4 == "" && $5 == "" && $7 == "resolved") $7 = "bogon"
             print
         }
     ' "$tsv" > "${tsv}.bogon_filtered" && mv "${tsv}.bogon_filtered" "$tsv"
 
     # Report
-    local resolved=0 nxdomain=0 timeout=0 bogon=0 still_pending=0
+    local resolved=0 nxdomain=0 timeout=0 bogon=0 still_pending=0 cname_only=0
     resolved=$(awk -F'\t' '$7 == "resolved" {count++} END {print count+0}' "$tsv")
+    cname_only=$(awk -F'\t' '$7 == "cname_only" {count++} END {print count+0}' "$tsv")
     nxdomain=$(awk -F'\t' '$7 == "nxdomain" {count++} END {print count+0}' "$tsv")
     timeout=$(awk -F'\t' '$7 == "timeout" {count++} END {print count+0}' "$tsv")
     bogon=$(awk -F'\t' '$7 == "bogon" {count++} END {print count+0}' "$tsv")
     still_pending=$(awk -F'\t' '$7 == "pending" {count++} END {print count+0}' "$tsv")
 
-    log_success "Canonical DNS: resolved=$resolved, nxdomain=$nxdomain, timeout=$timeout, bogon=$bogon, pending=$still_pending"
+    log_success "Canonical DNS: resolved=$resolved, cname_only=$cname_only, nxdomain=$nxdomain, timeout=$timeout, bogon=$bogon, pending=$still_pending"
 
     # Expose last-pass counts so callers can detect a dead-DNS environment
     # (fake-IP VPN or unreachable resolvers: nothing resolves, everything
@@ -613,32 +671,72 @@ canonical_dns_resolve_pending() {
     if (( pending_count >= _min_batch )); then
         if (( _answered * 100 >= pending_count * _min_pct )); then
             METHO_DNS_WORKING=1
-            log_info "DNS health: transport '${DNS_TRANSPORT_LABEL:-${DNS_MODE}}' answered $_answered/$pending_count queries (>=${_min_pct}% — healthy); timeout retries enabled"
+            log_info "DNS health: transport '${DNS_TRANSPORT_LABEL:-${DNS_MODE}}' blackholed $(( pending_count - _answered ))/$pending_count hosts — below the $(( 100 - _min_pct ))% ceiling, so the transport is answering; timeout retries enabled"
+            log_info "  ${_with_records}/${pending_count} of this batch returned an address or CNAME; the rest are negatives (NXDOMAIN/SERVFAIL), which the label pass below separates"
         else
             METHO_DNS_WORKING=0
-            log_warn "DNS health: transport '${DNS_TRANSPORT_LABEL:-${DNS_MODE}}' answered only $_answered/$pending_count queries (<${_min_pct}%) — DNS UNHEALTHY; timeout retries disabled"
+            log_warn "DNS health: transport '${DNS_TRANSPORT_LABEL:-${DNS_MODE}}' blackholed $(( pending_count - _answered ))/$pending_count hosts — above the $(( 100 - _min_pct ))% ceiling; DNS UNHEALTHY, timeout retries disabled"
         fi
     else
         log_info "DNS health: batch of $pending_count is below the ${_min_batch}-query floor — health flag unchanged (was ${METHO_DNS_WORKING:-0})"
     fi
 
+    # Persist the observation next to the dataset it was made against.
+    #
+    # Both the per-domain workers and the merge need this, and a shell variable
+    # set inside a Phase 1 subshell does not survive it. Without the file the
+    # merge had to GUESS, and it guessed with a resolution-rate heuristic that
+    # answers a different question (see merge_per_domain_dns).
+    printf '%s\n' "${METHO_DNS_WORKING:-0}" > "${tsv}.dns_health" 2>/dev/null || true
+
     if [[ "$bogon" -gt 0 ]]; then
-        log_warn "Canonical DNS: $bogon host(s) resolved only to reserved/private addresses — excluded from downstream probing/nmap."
+        log_warn "Canonical DNS: $bogon host(s) resolved only to reserved/private addresses — excluded from port scanning."
         log_warn "  Address and matched range for each: ${_bogon_log}"
-        # 198.18.0.0/15 is RFC 2544 benchmark space, which a fake-IP VPN
-        # (Clash/mihomo/Surge in fake-ip mode) returns for EVERY name. Only
-        # when that range is actually present is a VPN the explanation. The
-        # far more common case is a public DNS record that legitimately points
-        # into RFC1918/CGNAT — internal names leaked into Certificate
-        # Transparency logs — which no resolver or Docker setting will change.
-        # The previous wording asserted the VPN case unconditionally and sent
-        # the operator to check Docker DNS for a problem that was not there.
+        # 198.18.0.0/15 is RFC 2544 benchmark space that a fake-IP VPN
+        # (Clash/mihomo/Surge in fake-ip mode) substitutes for EVERY name it
+        # resolves — but presence of the range is NOT evidence of injection.
+        # On a real run the range appeared on 56 internal-looking Vodafone
+        # names while the same dataset also carried 10.0.0.0/8 and 172.16.0.0/12
+        # records for the same host population, and an independent query to a
+        # public DoH endpoint returned those 198.18 addresses directly. They
+        # are genuine published records for a carrier-internal range.
+        #
+        # A VPN can only substitute an answer it is on the path of, so the
+        # range is a fake-IP signature only when the answer came through the
+        # system resolver. On the DoH transport the local resolver is bypassed
+        # by construction, which makes presence alone meaningless. The previous
+        # wording asserted the VPN case whenever the range was present and sent
+        # the operator to hunt a VPN problem that was not there — the same
+        # defect as the unconditional text it replaced, just narrower.
         if grep -qE '(^|[[:space:]])198\.1[89]\.' "${_bogon_log}" 2>/dev/null; then
-            log_warn "  198.18.0.0/15 (RFC 2544) IS present — that is the fake-IP signature; check that DNS bypasses the VPN's fake-ip mode."
+            if [[ "${DNS_TRANSPORT_LABEL:-${DNS_MODE}}" == "doh" ]]; then
+                log_info "  198.18.0.0/15 (RFC 2544) is present, but every answer came from DoH — the local resolver is bypassed, so treat these as genuine published records, not a fake-IP VPN."
+            else
+                log_warn "  198.18.0.0/15 (RFC 2544) is present and answers came through the system resolver ('${DNS_TRANSPORT_LABEL:-${DNS_MODE}}') — check whether the VPN's fake-ip mode is substituting answers."
+            fi
         else
             log_info "  No 198.18.0.0/15 present — these are genuine private-address records, not a fake-IP VPN."
-            log_info "  These hosts are unreachable from outside by design; they are worth keeping as intel, not as scan targets."
         fi
+        # "Unreachable from the internet" is not the same as "unreachable from
+        # you". On a network routed into the target's private or CGNAT space
+        # these hosts answer normally — two internal OpenSearch clusters replied
+        # HTTP 200 from 100.64.x on a real run — so the exclusion has to be
+        # visible and reversible rather than silent.
+        if [[ "${METHO_PROBE_RESERVED:-0}" == "1" ]]; then
+            log_info "  These hosts ARE being HTTP-probed (--probe-reserved) and are excluded only from port scanning."
+        else
+            log_info "  They are held out of the HTTP probe set too. If your network routes into that space they are reachable — set --probe-reserved to probe them (they stay out of naabu/nmap either way)."
+        fi
+    fi
+
+    if [[ "$cname_only" -gt 0 ]]; then
+        # Not a warning: a CNAME pointing at a name that no longer resolves is a
+        # subdomain-takeover candidate, which is a finding, not a failure. It is
+        # reported here and kept out of the probe set, because httpx cannot
+        # connect to a name with no address and would only burn its timeout.
+        log_info "Canonical DNS: $cname_only hostname(s) returned a CNAME but no address — held out of the probe set."
+        log_info "  Each is either a dangling CNAME (takeover candidate) or a name that resolves only through another view."
+        log_info "  Reported in: $tsv (resolution_status=cname_only)"
     fi
 
     rm -f "$pending_file" "$dnsx_json"
@@ -817,6 +915,39 @@ canonical_dns_extract_resolved() {
     canonical_dns_extract_by_status "resolved"
 }
 
+# ── Hostnames eligible for HTTP probing ───────────────────────────────────────
+# Always the `resolved` set — hosts with an address. With METHO_PROBE_RESERVED=1
+# it also includes `bogon` hosts, whose every address is reserved/private and was
+# therefore stripped from the dataset.
+#
+# Why that is worth having: a `bogon` host is unreachable *from the internet*,
+# which is not the same as unreachable from the operator. On a network routed
+# into the target's private or CGNAT space those hosts answer normally — on a
+# real run two internal OpenSearch clusters returned HTTP 200 from 100.64.x and
+# were dropped from the probe set with no way to bring them back.
+#
+# HTTP ONLY, and off by default:
+#   * httpx re-resolves every name itself, so it needs no recorded address. A
+#     private space that is reachable is a space httpx can talk to.
+#   * Port scanning is a different action. naabu and nmap need the address, and
+#     aiming them at private space is far less defensible than one HTTP request
+#     to a hostname the target's own DNS published. `bogon` hosts stay out of the
+#     IP dataset, the ASN lookup, the classification, naabu and nmap regardless
+#     of this flag — that split is deliberate, not an oversight.
+#   * Off by default because the cost is real when the space is NOT routed: every
+#     such host then costs an httpx timeout, and the address may route to
+#     something unrelated to the target. 549 hosts sat in this bucket on that run
+#     and 2 were live, so the flag is worth setting when you know, and the bogon
+#     report says how many hosts are being held back when it is not.
+canonical_dns_extract_probeable() {
+    {
+        canonical_dns_extract_resolved
+        if [[ "${METHO_PROBE_RESERVED:-0}" == "1" ]]; then
+            canonical_dns_extract_by_status "bogon"
+        fi
+    } | grep -v '^$' | sort -u
+}
+
 
 
 # ── Merge per-domain canonical DNS TSVs into the global TSV ───────────────────
@@ -830,7 +961,7 @@ canonical_dns_extract_resolved() {
 #   - discovery_sources: union (semicolon-joined, deduped)
 #   - A/AAAA/CNAME: union (semicolon-joined, deduped)
 #   - root_domain: first non-empty wins
-#   - resolution_status: prefer resolved > nxdomain > timeout > pending > bogon
+#   - resolution_status: prefer resolved > cname_only > nxdomain > timeout > pending > bogon
 #
 # Merge rules for httpx_metadata.tsv:
 #   - Group by hostname (column 1)
@@ -846,27 +977,28 @@ merge_per_domain_dns() {
     # Collect all per-domain TSVs (skip the global one if it exists in phase1/)
     local per_domain_tsvs=()
     local d
-    for d in "$p1_dir"/*/; do
-        [[ -d "$d" ]] || continue
-        if [[ -s "${d}canonical_dns.tsv" ]]; then
-            per_domain_tsvs+=("${d}canonical_dns.tsv")
-        fi
-    done
+    while IFS= read -r d; do
+        [[ -n "$d" && -s "${d}canonical_dns.tsv" ]] && per_domain_tsvs+=("${d}canonical_dns.tsv")
+    done < <(_root_domain_dirs)
 
     if [[ ${#per_domain_tsvs[@]} -gt 0 ]]; then
         printf 'hostname\troot_domain\tdiscovery_sources\tA\tAAAA\tCNAME\tresolution_status\n' > "$global_tsv"
 
         # Single awk pass: read all per-domain TSVs (skipping headers), group by
-        # hostname, merge fields. Status priority: resolved=1, nxdomain=2,
-        # timeout=3, pending=4, bogon=5 (lower = higher priority).
+        # hostname, merge fields. Status priority: resolved=1, cname_only=2,
+        # nxdomain=3, timeout=4, pending=5, bogon=6 (lower = higher priority).
+        # cname_only ranks below resolved so that a host with an address in any
+        # per-domain TSV keeps that address, and above nxdomain because a CNAME
+        # answer is strictly more information than a negative.
         awk -F'\t' -v OFS='\t' '
             function status_rank(s) {
                 if (s == "resolved") return 1
-                if (s == "nxdomain") return 2
-                if (s == "timeout") return 3
-                if (s == "pending") return 4
-                if (s == "bogon") return 5
-                return 6
+                if (s == "cname_only") return 2
+                if (s == "nxdomain") return 3
+                if (s == "timeout") return 4
+                if (s == "pending") return 5
+                if (s == "bogon") return 6
+                return 7
             }
             # Merge a semicolon-separated field: add new values not already present
             function merge_field(old, new,    a, b, i, j, seen, out) {
@@ -914,16 +1046,31 @@ merge_per_domain_dns() {
         [[ -s "$global_tsv" ]] && entry_count=$(awk -F'\t' '$1 != "hostname"' "$global_tsv" | wc -l)
         log_success "Merged canonical DNS: $entry_count entries from ${#per_domain_tsvs[@]} per-domain TSVs"
         # METHO_DNS_WORKING is set inside the per-domain subshells during Phase 1
-        # and does not survive into this (parent) shell — re-derive it from the
-        # merged dataset so Phase 3's final timeout-retry pass knows DNS was
-        # healthy. Healthy means a meaningful fraction resolved (>=2%), not
-        # merely ">0" — a 0.5% rate means resolvers are effectively dead and
-        # the Phase 3 retry pass would re-grind the whole timeout pile.
-        if awk -F'\t' 'NR>1 { n++; if ($7 == "resolved") r++ } END { exit !(r*50 >= n && n > 0) }' "$global_tsv"; then
+        # and does not survive into this (parent) shell. Read it back from the
+        # per-dataset health files rather than re-deriving it.
+        #
+        # This used to be re-derived as "at least 2% of hostnames resolved" —
+        # a different question from the one the flag asks, and the resolve path
+        # above says why: the flag is about the TRANSPORT ("did the resolver
+        # answer at all?"), and a resolution rate cannot answer it, because a
+        # healthy transport on a genuinely dead corpus resolves ~0% while a dead
+        # transport on a 3%-resolved corpus passes the test. So the same flag
+        # meant one thing during Phase 1 and another in Phase 3, and the Phase 3
+        # retry was governed by the weaker definition.
+        METHO_DNS_WORKING=0
+        local _health_file _health_any=0 _hd
+        while IFS= read -r _hd; do
+            _health_file="${_hd}canonical_dns.tsv.dns_health"
+            if [[ -s "$_health_file" ]] && \
+               [[ "$(head -1 "$_health_file" 2>/dev/null | tr -d '[:space:]')" == "1" ]]; then
+                _health_any=1
+            fi
+        done < <(_root_domain_dirs)
+        if (( _health_any )); then
             METHO_DNS_WORKING=1
+            log_info "DNS health after merge: at least one domain observed a responsive transport — timeout retries enabled for Phase 3"
         else
-            METHO_DNS_WORKING=0
-            log_warn "DNS health after merge: under 2% of hostnames resolved — timeout retries disabled for Phase 3"
+            log_info "DNS health after merge: no domain recorded a responsive transport — timeout retries disabled for Phase 3"
         fi
     else
         log_warn "No per-domain canonical_dns.tsv files found to merge"
@@ -931,12 +1078,9 @@ merge_per_domain_dns() {
 
     # ── Merge httpx_metadata.tsv ────────────────────────────────────────────
     local per_domain_metas=()
-    for d in "$p1_dir"/*/; do
-        [[ -d "$d" ]] || continue
-        if [[ -s "${d}httpx_metadata.tsv" ]]; then
-            per_domain_metas+=("${d}httpx_metadata.tsv")
-        fi
-    done
+    while IFS= read -r d; do
+        [[ -n "$d" && -s "${d}httpx_metadata.tsv" ]] && per_domain_metas+=("${d}httpx_metadata.tsv")
+    done < <(_root_domain_dirs)
 
     if [[ ${#per_domain_metas[@]} -gt 0 ]]; then
         printf 'hostname\tcdn\ttechnologies\twebserver\tcontent_length\tstatus_code\ttitle\turl\n' > "$global_meta"
@@ -959,4 +1103,73 @@ merge_per_domain_dns() {
         [[ -s "$global_meta" ]] && meta_count=$(awk -F'\t' '$1 != "hostname"' "$global_meta" | wc -l)
         log_info "Merged HTTPx metadata: $meta_count entries from ${#per_domain_metas[@]} per-domain files"
     fi
+
+    # ── Merge per-domain probe ledgers ──────────────────────────────────────
+    merge_probe_ledgers
+}
+
+# ── This run's per-domain artifact directories ────────────────────────────────
+# `phase1/*/` also matches directories left by earlier, unrelated runs in a
+# reused output directory. Merging those imports hostnames nobody asked for this
+# time, and — worse — their httpx_probed.txt entries make Phase 3 skip hosts
+# this run resolved but never probed, because a previous run probed them.
+# Filter to the root set actually being processed this run.
+#
+# Falls back to every directory when no root list is available (a caller that
+# invokes the merge directly, as the test suite does), so behaviour is only
+# narrowed when there is something to narrow by.
+_root_domain_dirs() {
+    local root_file="${OUTPUT_DIR}/root_domains.txt"
+    local this_run=() _rd d base _r _match
+    if [[ -s "$root_file" ]]; then
+        while IFS= read -r _rd; do
+            [[ -n "$_rd" ]] && this_run+=("$_rd")
+        done < "$root_file"
+    fi
+    for d in "${OUTPUT_DIR}/phase1"/*/; do
+        [[ -d "$d" ]] || continue
+        if [[ ${#this_run[@]} -eq 0 ]]; then
+            echo "$d"
+            continue
+        fi
+        base="$(basename "$d")"
+        _match=0
+        for _r in "${this_run[@]}"; do
+            if [[ "$base" == "$_r" ]]; then _match=1; break; fi
+        done
+        (( _match )) && echo "$d"
+    done
+}
+
+# ── Merge per-domain probe ledgers into the global one ────────────────────────
+# Union of every hostname any Phase 1 worker handed to httpx, responders and
+# silent hosts alike. Phase 3's late pass diffs against it so it probes only
+# genuinely-new hosts, instead of re-probing everything that was probed and
+# stayed silent (7,905 targets — ~64% of a 47-minute round — on a real run).
+#
+# Callable on its own, and called that way from recon.sh when Phase 1 is
+# skipped: merge_per_domain_dns only runs inside run_phase1, so `--skip-phase 1`
+# would otherwise leave the global ledger empty (setup_dirs deletes it) and
+# Phase 3 would silently re-probe the whole resolved set — the exact regression
+# the ledger exists to prevent.
+merge_probe_ledgers() {
+    local global_ledger="${OUTPUT_DIR}/httpx_probed.txt"
+    local p1_dir="${OUTPUT_DIR}/phase1"
+    local per_domain_ledgers=() d
+    while IFS= read -r d; do
+        [[ -n "$d" && -s "${d}httpx_probed.txt" ]] && per_domain_ledgers+=("${d}httpx_probed.txt")
+    done < <(_root_domain_dirs)
+
+    if [[ ${#per_domain_ledgers[@]} -eq 0 ]]; then
+        # Say so. An empty ledger is not neutral: it makes Phase 3 treat every
+        # resolved host as never probed. Silence here is how a re-probe storm
+        # becomes invisible.
+        log_info "Probe ledger: no per-domain ledger found — Phase 3 will treat every resolved host as unprobed"
+        return 0
+    fi
+
+    cat "${per_domain_ledgers[@]}" 2>/dev/null | sort -u > "$global_ledger" || true
+    local ledger_count=0
+    [[ -s "$global_ledger" ]] && ledger_count=$(wc -l < "$global_ledger" | tr -d '[:space:]')
+    log_info "Merged probe ledger: ${ledger_count:-0} hostname(s) already probed by Phase 1"
 }

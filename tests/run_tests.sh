@@ -1,15 +1,47 @@
 #!/usr/bin/env bash
 # Unit tests for metho pure functions — run inside the container with lib/ mounted.
-SCRIPT_DIR="/opt/scripts"
+#
+# The tree under test is /opt/scripts inside the image. When run from a checkout
+# (or against any other tree, via METHO_SCRIPTS_DIR) it resolves the repo root
+# instead, so the suite is runnable — and so a modified tree can be compared
+# against a pristine one:
+#     git archive HEAD | tar -x -C /tmp/base
+#     METHO_SCRIPTS_DIR=/tmp/base bash tests/run_tests.sh
+# Without this the suite silently tested whichever tree happened to be at
+# /opt/scripts and failed wholesale anywhere else.
+if [[ -z "${METHO_SCRIPTS_DIR:-}" && ! -f /opt/scripts/lib/utils.sh ]]; then
+    _repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    [[ -f "${_repo_root}/lib/utils.sh" ]] && METHO_SCRIPTS_DIR="$_repo_root"
+fi
+SCRIPT_DIR="${METHO_SCRIPTS_DIR:-/opt/scripts}"
+if [[ ! -f "${SCRIPT_DIR}/lib/utils.sh" ]]; then
+    echo "tests: cannot find lib/utils.sh under SCRIPT_DIR=${SCRIPT_DIR}" >&2
+    echo "       set METHO_SCRIPTS_DIR to the tree you want to test" >&2
+    exit 1
+fi
 source "${SCRIPT_DIR}/lib/utils.sh"
 source "${SCRIPT_DIR}/lib/canonical_dns.sh"
 source "${SCRIPT_DIR}/lib/classify.sh"
+# phase3.sh holds the late-probe candidate selection, whose "already probed"
+# test is exactly what the ledger changed. Without it sourced here, a test that
+# calls into phase3 fails as "command not found" and — because the call is
+# redirected — looks like an assertion failure rather than a missing source.
+source "${SCRIPT_DIR}/lib/phase3.sh"
 
 PASS=0 FAIL=0
 t() { # t <name> <expected> <actual>
     if [[ "$2" == "$3" ]]; then PASS=$((PASS+1)); echo "PASS: $1";
     else FAIL=$((FAIL+1)); echo "FAIL: $1 — expected [$2] got [$3]"; fi
 }
+
+# Count matching lines, always as a single unpadded number.
+# `grep -c ... || echo 0` prints "0" AND then "0" again (grep -c already writes
+# its count before exiting 1 on no match), which turns a passing assertion into
+# a multi-line failure. `wc -l < file` is space-padded on BSD/macOS.
+_count_in() { # _count_in <file> <grep-pattern>
+    if [[ -s "$1" ]]; then grep -c -- "$2" "$1" 2>/dev/null || true; else echo 0; fi
+}
+_lines() { wc -l < "$1" 2>/dev/null | tr -d '[:space:]'; }
 
 # ── normalize_hostname ──
 t "normalize wildcard+case+dot" "foo.com" "$(normalize_hostname '*.Foo.com.')"
@@ -44,7 +76,7 @@ filter_cloud_domains "$IN2" "$OUT2"
 t "filter_cloud_domains picks only cloud" "$(printf 'app.herokuapp.com\nbucket.s3.amazonaws.com\nstorage.blob.core.windows.net')" "$(cat "$OUT2")"
 
 # ── classify_ip (priority order + org-name rules) ──
-source /opt/scripts/config/asn_providers.sh
+source "${SCRIPT_DIR}/config/asn_providers.sh"
 t "classify httpx cdn wins" "cdn" "$(classify_ip 1.1.1.1 AS64496 'Some Hosting' true)"
 t "classify asn cdn number" "cdn" "$(classify_ip 1.1.1.1 AS13335 'Cloudflare, Inc.' false)"
 t "classify asn cloud number" "cloud" "$(classify_ip 1.1.1.1 AS16509 '' false)"
@@ -230,28 +262,73 @@ if [[ "$fail" == "1" ]]; then
     echo "[WRN] $(grep -c . <<<"$input") domains failed to resolve (consider increasing -retry or reducing -threads)" >&2
     exit 0
 fi
-# A real resolver answers the probe name too — _probe_system_resolver uses it
-# to decide whether a fallback transport is usable at all.
-for h in ${FAKE_DNSX_A:-} whoami.akamai.net; do
-    grep -qx -- "$h" <<<"$input" || continue
-    printf '{"host":"%s","a":["93.184.216.34"]}\n' "$h"
-done
-# An explicit address per host, family chosen by the literal. Needed to
-# exercise the reserved-IP filter on BOTH columns: the bug it guards against
-# left AAAA answers looking like a different record type entirely.
-for kv in ${FAKE_DNSX_ADDR:-}; do
-    h="${kv%%=*}"; ip="${kv#*=}"
-    [[ -n "$h" && -n "$ip" ]] || continue
-    grep -qx -- "$h" <<<"$input" || continue
-    if [[ "$ip" == *:* ]]; then
-        printf '{"host":"%s","aaaa":["%s"]}\n' "$h" "$ip"
-    else
-        printf '{"host":"%s","a":["%s"]}\n' "$h" "$ip"
-    fi
-done
+# One JSON record per host, carrying every field found for it. Real dnsx emits
+# a single object per host; emitting one line per FIELD made the cname line
+# (which carries no address) overwrite the address line's status during the
+# parse — an artifact of the stub, not of the code under test, and one that
+# disguised a real assertion failure as a code defect.
+_emit_host() {
+    local h="$1" fields="" a kv ip target
+    grep -qx -- "$h" <<<"$input" || return 0
+    # A real resolver answers the probe name too — _probe_system_resolver uses
+    # it to decide whether a fallback transport is usable at all.
+    for a in ${FAKE_DNSX_A:-} whoami.akamai.net; do
+        if [[ "$a" == "$h" ]]; then fields="${fields}\"a\":[\"93.184.216.34\"],"; fi
+    done
+    # An explicit address per host, family chosen by the literal. Needed to
+    # exercise the reserved-IP filter on BOTH columns: the bug it guards
+    # against left AAAA answers looking like a different record type entirely.
+    for kv in ${FAKE_DNSX_ADDR:-}; do
+        if [[ "${kv%%=*}" == "$h" ]]; then
+            ip="${kv#*=}"
+            if [[ "$ip" == *:* ]]; then fields="${fields}\"aaaa\":[\"$ip\"],"
+            else fields="${fields}\"a\":[\"$ip\"],"; fi
+        fi
+    done
+    # A bare CNAME answer: the host aliases to another name and has no address
+    # of its own. This is the population that used to be recorded as "resolved"
+    # with an empty address column and handed to httpx.
+    for kv in ${FAKE_DNSX_CNAME:-}; do
+        if [[ "${kv%%=*}" == "$h" ]]; then
+            target="${kv#*=}"
+            fields="${fields}\"cname\":[\"$target\"],"
+        fi
+    done
+    [[ -n "$fields" ]] || return 0
+    printf '{"host":"%s",%s}\n' "$h" "${fields%,}"
+}
+
+_ALL_HOSTS="$(
+    for kv in ${FAKE_DNSX_A:-} ${FAKE_DNSX_ADDR:-} ${FAKE_DNSX_CNAME:-} whoami.akamai.net; do
+        echo "${kv%%=*}"
+    done | sort -u
+)"
+for h in $_ALL_HOSTS; do _emit_host "$h"; done
 exit 0
 STUBEOF
 chmod +x "${STUB}/dnsx"
+
+# Minimal httpx stand-in, so httpx_probe's parsing, ledger write and canonical
+# merge all run for real. Without it the host's own `httpx` gets called — which
+# on a developer machine is the Python HTTP client, a different tool that merely
+# shares the name, and would either hit the network or fail in a way that looks
+# like a pipeline defect.
+cat > "${STUB}/httpx" <<'STUBEOF'
+#!/usr/bin/env bash
+# Honour -o (httpx_probe writes results to a file, not stdout).
+out=""; prev=""
+for a in "$@"; do
+    [[ "$prev" == "-o" ]] && out="$a"
+    prev="$a"
+done
+[[ -n "$out" ]] && exec > "$out"
+while IFS= read -r h; do
+    [[ -n "$h" ]] || continue
+    printf '{"url":"https://%s","input":"%s","host":"%s","status_code":200}\n' "$h" "$h" "$h"
+done
+exit 0
+STUBEOF
+chmod +x "${STUB}/httpx"
 export PATH="${STUB}:${PATH}"
 
 W2="$(mktemp -d)"; OUTPUT_DIR="$W2"
@@ -262,18 +339,18 @@ init_canonical_dns > /dev/null
 printf 'a.example.com\nb.example.com\n' > "${W2}/in.txt"
 canonical_dns_add_sources "test" "${W2}/in.txt" "example.com" > /dev/null
 t "new TSV starts with a header" "hostname" "$(head -1 "$CANONICAL_DNS_TSV" | cut -f1)"
-t "new TSV has header + 2 rows" "3" "$(wc -l < "$CANONICAL_DNS_TSV")"
+t "new TSV has header + 2 rows" "3" "$(_lines "$CANONICAL_DNS_TSV")"
 
 FAKE_DNSX_A="a.example.com" FAKE_DNSX_NX="" canonical_dns_resolve_pending > /dev/null 2>&1
 t "header survives a resolve pass" "hostname" "$(head -1 "$CANONICAL_DNS_TSV" | cut -f1)"
-t "resolve pass loses no row" "3" "$(wc -l < "$CANONICAL_DNS_TSV")"
+t "resolve pass loses no row" "3" "$(_lines "$CANONICAL_DNS_TSV")"
 t "resolved host recorded" "resolved" "$(awk -F'\t' '$1=="a.example.com"{print $7}' "$CANONICAL_DNS_TSV")"
 t "unanswered host stays timeout" "timeout" "$(awk -F'\t' '$1=="b.example.com"{print $7}' "$CANONICAL_DNS_TSV")"
 
 FAKE_DNSX_A="" FAKE_DNSX_NX="b.example.com" canonical_dns_label_nxdomain > /dev/null 2>&1
 t "nxdomain pass labels a dead name" "nxdomain" "$(awk -F'\t' '$1=="b.example.com"{print $7}' "$CANONICAL_DNS_TSV")"
 t "header survives the nxdomain pass" "hostname" "$(head -1 "$CANONICAL_DNS_TSV" | cut -f1)"
-t "nxdomain pass loses no row" "3" "$(wc -l < "$CANONICAL_DNS_TSV")"
+t "nxdomain pass loses no row" "3" "$(_lines "$CANONICAL_DNS_TSV")"
 t "resolved row untouched by nxdomain pass" "resolved" "$(awk -F'\t' '$1=="a.example.com"{print $7}' "$CANONICAL_DNS_TSV")"
 
 # Health gate: a small batch must NOT flip the flag in either direction. This
@@ -418,7 +495,7 @@ DOH_PROXY_PID="$_saved_pid"; DOH_PROXY_PORT="$_saved_port"
 printf '192.0.2.54\n' > "$W2/asn_ips.txt"
 if FAKE_DNSX_TXT="54.2.0.192.origin.asn.cymru.com AS16509.asn.cymru.com" \
    _cymru_dns_lookup "$W2/asn_ips.txt" "$W2/asn_out.txt" 2>/dev/null; then
-    t "ASN DNS fallback produces exactly one row per IP" "1" "$(wc -l < "$W2/asn_out.txt")"
+    t "ASN DNS fallback produces exactly one row per IP" "1" "$(_lines "$W2/asn_out.txt")"
     t "ASN DNS fallback keeps the most specific prefix"  "1" "$(grep -c '192.0.2.0/24' "$W2/asn_out.txt")"
     t "ASN DNS fallback resolves the AS name"            "1" "$(grep -c 'AMAZON-02' "$W2/asn_out.txt")"
 else
@@ -450,6 +527,466 @@ FAKE_DNSX_A="f1.example.com f2.example.com f3.example.com" \
 FAKE_DNSX_NX="" canonical_dns_resolve_pending > /dev/null 2>&1
 t "escalation recovers hosts the primary transport lost" "resolved" "$(awk -F'\t' '$1=="f1.example.com"{print $7}' "$CANONICAL_DNS_TSV")"
 t "escalation loses no rows" "1" "$(awk -F'\t' '$1=="f3.example.com"{print $7}' "$CANONICAL_DNS_TSV" | grep -c resolved)"
+
+# ── "resolved" means the host has an ADDRESS ─────────────────────────────────
+# A bare CNAME used to be recorded as "resolved" with an empty address column:
+# 1,678 rows — 13.7% of everything handed to httpx — on a real run, of which a
+# 40-name independent sample found ~80% NXDOMAIN elsewhere and ~18% pointing at
+# a CNAME target that no longer resolves. Neither is "resolved", and neither
+# belongs in the probe set (one cannot answer; the other is a takeover
+# candidate that belongs in a report).
+_cds() { awk -F'\t' -v h="$1" '$1==h{print $7}' "$CANONICAL_DNS_TSV"; }
+printf 'r-addr.example.com\nr-cname.example.com\nr-dead.example.com\n' > "$W2/in-rc.txt"
+canonical_dns_add_sources "test" "$W2/in-rc.txt" "example.com" > /dev/null
+FAKE_DNSX_ADDR="r-addr.example.com=93.184.216.34" \
+FAKE_DNSX_CNAME="r-cname.example.com=gone.eu-central-1.elb.amazonaws.com" \
+FAKE_DNSX_NX="r-dead.example.com" \
+    canonical_dns_resolve_pending > /dev/null 2>&1
+
+t "host with an address is resolved"          "resolved"    "$(_cds r-addr.example.com)"
+t "bare CNAME is cname_only, not resolved"    "cname_only"  "$(_cds r-cname.example.com)"
+t "bare CNAME keeps its target recorded"      "gone.eu-central-1.elb.amazonaws.com" \
+  "$(awk -F'\t' '$1=="r-cname.example.com"{print $6}' "$CANONICAL_DNS_TSV")"
+t "cname_only is excluded from the probe set" "0" \
+  "$(canonical_dns_extract_resolved | awk '$0=="r-cname.example.com"{c++} END{print c+0}')"
+t "no records at all still means timeout"     "timeout"     "$(_cds r-dead.example.com)"
+
+# A row whose only address was stripped as reserved is a private-address record
+# even when it also carries a CNAME. The old guard also required an empty CNAME
+# column, so such a host stayed "resolved" with no address and got probed.
+printf 'r-privcname.example.com\n' > "$W2/in-rp.txt"
+canonical_dns_add_sources "test" "$W2/in-rp.txt" "example.com" > /dev/null
+FAKE_DNSX_ADDR="r-privcname.example.com=10.64.32.141" \
+FAKE_DNSX_CNAME="r-privcname.example.com=internal-lb.eu-central-1.elb.amazonaws.com" \
+    canonical_dns_resolve_pending > /dev/null 2>&1
+t "private address + CNAME becomes bogon" "bogon" "$(_cds r-privcname.example.com)"
+
+# The reserved-address audit log is reset once per DATASET, not once per pass.
+# It used to be truncated at the start of every resolve pass, so it only held
+# the last pass's strips: a real run's global file listed 11 hosts against 514
+# bogon rows, i.e. the audit trail did not exist for anything stripped in an
+# earlier pass. One pass cannot show that — a SECOND pass must not erase the
+# first pass's record.
+t "bogon audit log records the strip" "1" \
+  "$(awk -F'\t' '$1=="r-privcname.example.com" && $2=="10.64.32.141"{c++} END{print c+0}' "${CANONICAL_DNS_TSV}.bogon")"
+printf 'r-priv2.example.com\n' > "$W2/in-rp2.txt"
+canonical_dns_add_sources "test" "$W2/in-rp2.txt" "example.com" > /dev/null
+FAKE_DNSX_ADDR="r-priv2.example.com=10.1.2.3" \
+    canonical_dns_resolve_pending > /dev/null 2>&1
+t "a later pass does not erase earlier strips" "1" \
+  "$(awk -F'\t' '$1=="r-privcname.example.com" && $2=="10.64.32.141"{c++} END{print c+0}' "${CANONICAL_DNS_TSV}.bogon")"
+t "the later pass's own strip is recorded too" "1" \
+  "$(awk -F'\t' '$1=="r-priv2.example.com" && $2=="10.1.2.3"{c++} END{print c+0}' "${CANONICAL_DNS_TSV}.bogon")"
+
+# ── status ranking across per-domain datasets ───────────────────────────────
+# cname_only must rank below resolved: otherwise a dataset that only ever saw a
+# CNAME would overwrite another's real address.
+MW="$(mktemp -d)"; mkdir -p "$MW/phase1/a.test" "$MW/phase1/b.test"
+printf 'hostname\troot_domain\tdiscovery_sources\tA\tAAAA\tCNAME\tresolution_status\n' > "$MW/phase1/a.test/canonical_dns.tsv"
+printf 'm.example.com\ta.test\tsubfaster\t\t\talias.amazonaws.com\tcname_only\n' >> "$MW/phase1/a.test/canonical_dns.tsv"
+printf 'hostname\troot_domain\tdiscovery_sources\tA\tAAAA\tCNAME\tresolution_status\n' > "$MW/phase1/b.test/canonical_dns.tsv"
+printf 'm.example.com\tb.test\tcrt.name\t93.184.216.34\t\t\tresolved\n' >> "$MW/phase1/b.test/canonical_dns.tsv"
+_od_save="$OUTPUT_DIR"
+OUTPUT_DIR="$MW"; merge_per_domain_dns > /dev/null 2>&1
+t "resolved outranks cname_only across datasets" "resolved" \
+  "$(awk -F'\t' '$1=="m.example.com"{print $7}' "$MW/canonical_dns.tsv")"
+OUTPUT_DIR="$_od_save"
+
+# ── Stage budgets and crawl caps ─────────────────────────────────────────────
+t "zero stage budget means no deadline"   "0" "$(_stage_deadline 0)"
+t "empty stage budget means no deadline"  "0" "$(_stage_deadline '')"
+t "positive stage budget is in the future" "1" \
+  "$([[ "$(_stage_deadline 60)" -gt "$(date +%s)" ]] && echo 1 || echo 0)"
+
+# _cap_crawl_hosts' stdout is captured as "<kept> <total>", so its warning must
+# go to stderr — a log line on stdout silently becomes part of the value.
+CAPIN="$W2/cap_in.txt"; CAPOUT="$W2/cap_out.txt"
+printf 'h1\nh2\nh3\nh4\nh5\n' > "$CAPIN"
+CAPC="$(_cap_crawl_hosts "$CAPIN" 3 "$CAPOUT" test 2>/dev/null)"
+t "crawl cap keeps the configured number" "3" "$(wc -l < "$CAPOUT" | tr -d ' ')"
+t "crawl cap reports kept and total only" "3 5" "$CAPC"
+CAPC="$(_cap_crawl_hosts "$CAPIN" 0 "$CAPOUT" test 2>/dev/null)"
+t "crawl cap of 0 means unlimited"        "5" "$(wc -l < "$CAPOUT" | tr -d ' ')"
+t "unlimited crawl cap reports kept == total" "5 5" "$CAPC"
+
+# A stage budget must stop launching, leave the truncation flag, and record the
+# truncation at RUN level — a shell variable does not survive the crawl stages'
+# background subshells, so without the file an incomplete run reports success.
+_bp_noop() { sleep "${BP_SLEEP:-0}"; }
+BPW="$(mktemp -d)"; printf 'a\nb\nc\nd\n' > "$BPW/in.txt"
+_od_save2="$OUTPUT_DIR"; OUTPUT_DIR="$BPW"
+METHO_STAGE_LABEL="test-stage" METHO_STAGE_DEADLINE="$(( $(date +%s) ))" \
+    bounded_parallel 1 "$BPW/in.txt" _bp_noop > /dev/null 2>&1
+t "spent stage budget sets the truncation flag" "1" "$METHO_STAGE_TRUNCATED"
+t "spent stage budget launches nothing"         "1" "$(_count_in "$BPW/stage_truncations.txt" 'test-stage.*0/4')"
+t "truncation is recorded with the run, not a variable" "1" "$(_count_in "$BPW/stage_truncations.txt" '.')"
+
+METHO_STAGE_LABEL="ok-stage" METHO_STAGE_DEADLINE=0 \
+    bounded_parallel 2 "$BPW/in.txt" _bp_noop > /dev/null 2>&1
+t "an unbudgeted stage reports no truncation" "0" "$METHO_STAGE_TRUNCATED"
+t "an unbudgeted stage adds no record"        "0" "$(_count_in "$BPW/stage_truncations.txt" 'ok-stage')"
+OUTPUT_DIR="$_od_save2"
+
+# ── Probe ledger ─────────────────────────────────────────────────────────────
+# The ledger holds every host handed to httpx, responders AND silent hosts.
+# Phase 3's "already probed" test used to be httpx_metadata.tsv, which contains
+# responders only — so on a real run 7,905 probed-and-silent hosts looked
+# unprobed and were probed again (~64% of a 47-minute round, for nothing).
+LW="$(mktemp -d)"
+_led_save="${METHO_HTTPX_LEDGER:-}"
+METHO_HTTPX_LEDGER="$LW/ledger.txt"
+printf 'a.example.com\nb.example.com\n' > "$LW/in.txt"
+httpx_ledger_record "$LW/in.txt"
+httpx_ledger_record "$LW/in.txt"
+t "ledger read is deduped"              "2" "$(httpx_ledger_read | wc -l | tr -d '[:space:]')"
+t "ledger keeps the silent host"        "1" "$(httpx_ledger_read | awk '$0=="b.example.com"{c++} END{print c+0}')"
+t "missing ledger reads as empty"       "0" "$(METHO_HTTPX_LEDGER="$LW/none.txt" httpx_ledger_read | wc -l | tr -d '[:space:]')"
+
+# The late pass must skip a host that was probed and stayed silent, and must
+# still reach one that was never probed.
+PW="$(mktemp -d)"; mkdir -p "$PW/phase3"
+printf 'hostname\troot_domain\tdiscovery_sources\tA\tAAAA\tCNAME\tresolution_status\n' > "$PW/dns.tsv"
+printf 'silent.example.com\texample.com\tsubfaster\t93.184.216.34\t\t\tresolved\n' >> "$PW/dns.tsv"
+printf 'fresh.example.com\texample.com\tsubfaster\t93.184.216.35\t\t\tresolved\n' >> "$PW/dns.tsv"
+printf 'silent.example.com\n' > "$PW/ledger.txt"
+_od_save3="$OUTPUT_DIR"; _cds_save="$CANONICAL_DNS_TSV"; _mts_save="${HTTPX_META_TSV:-}"
+OUTPUT_DIR="$PW"; CANONICAL_DNS_TSV="$PW/dns.tsv"; HTTPX_META_TSV="$PW/absent.tsv"
+METHO_HTTPX_LEDGER="$PW/ledger.txt"
+_probe_late_resolved_hosts > /dev/null 2>&1
+# Asserted through the ledger, which is append-only: a host the late pass
+# actually probed appears once more. (The .late_probe.txt candidate file is
+# removed by the function on the way out, so it cannot be inspected afterwards.)
+t "late pass probes a host that was never probed" "1" \
+  "$(_count_in "$PW/ledger.txt" '^fresh\.example\.com$')"
+t "late pass does not re-probe a probed-and-silent host" "1" \
+  "$(_count_in "$PW/ledger.txt" '^silent\.example\.com$')"
+OUTPUT_DIR="$_od_save3"; CANONICAL_DNS_TSV="$_cds_save"; HTTPX_META_TSV="$_mts_save"
+METHO_HTTPX_LEDGER="$_led_save"
+
+# ── Phase 3 IP extraction keeps BOTH address families ───────────────────────
+# The AAAA column was written by the DNS layer and read by nothing at all: an
+# IPv6-only host could be `resolved`, be probed by httpx, and still be missing
+# from the IP inventory, the ASN lookup and the classification — silently,
+# because no stage complained. IPv6 is inventoried, not scanned (naabu has no
+# IPv6 support), so the two families must stay in separate files.
+IPW="$(mktemp -d)"
+printf 'hostname\troot_domain\tdiscovery_sources\tA\tAAAA\tCNAME\tresolution_status\n' > "$IPW/dns.tsv"
+printf 'v4only.example.com\texample.com\tsubfaster\t93.184.216.34\t\t\tresolved\n'   >> "$IPW/dns.tsv"
+printf 'v6only.example.com\texample.com\tsubfaster\t\t2a05:d014:9ed::1\t\tresolved\n' >> "$IPW/dns.tsv"
+printf 'both.example.com\texample.com\tsubfaster\t93.184.216.35\t2a05:d014:9ed::2\t\tresolved\n' >> "$IPW/dns.tsv"
+printf 'dead.example.com\texample.com\tsubfaster\t\t\t\tbogon\n'                     >> "$IPW/dns.tsv"
+IP_COUNT="$(_build_ip_maps "$IPW/dns.tsv" "$IPW")"
+t "ip map counts only rows with an address" "2" "$IP_COUNT"
+t "IPv6-only host is inventoried"           "1" "$(_count_in "$IPW/domain_ip_map_v6.txt" '^v6only\.example\.com ')"
+t "dual-stack host appears in both maps"    "1" "$(_count_in "$IPW/domain_ip_map_v6.txt" '^both\.example\.com ')"
+t "IPv6 map excludes non-resolved hosts"    "0" "$(_count_in "$IPW/domain_ip_map_v6.txt" '^dead\.example\.com ')"
+t "IPv4 map carries no IPv6 addresses"      "0" "$(_count_in "$IPW/domain_ip_map.txt" ':')"
+t "IPv6-only host is absent from the scan inventory" "0" "$(_count_in "$IPW/all_ips.txt" ':')"
+
+# ── Naabu sweep sizing ──────────────────────────────────────────────────────
+# naabu's cost is linear in the candidate count, so a single capped run drops
+# whatever does not fit. Real numbers from a live run: 6,501 candidates at the
+# defaults need 13,302s against a 3,600s cap, and the old code scanned roughly a
+# quarter of them while reporting a finished scan.
+t "chunk size fits the cap"            "1650" "$(_naabu_chunk_hosts 3600 300 2)"
+t "chunk size is never below one"      "1"    "$(_naabu_chunk_hosts 100 300 2)"
+t "chunk size survives a zero per-host" "3300" "$(_naabu_chunk_hosts 3600 300 0)"
+t "small target keeps its tight cap"   "700"  "$(_scaled_scan_cap 200 300 2 3600)"
+t "full chunk is bounded by the cap"   "3600" "$(_scaled_scan_cap 1650 300 2 3600)"
+t "oversized chunk is bounded too"     "3600" "$(_scaled_scan_cap 5000 300 2 3600)"
+t "a zero-host chunk still gets a cap" "300"  "$(_scaled_scan_cap 0 300 2 3600)"
+# 6,501 candidates must be fully covered by whole chunks within the default
+# sweep budget, which is the property the old single run could not satisfy.
+_CH="$( _naabu_chunk_hosts 3600 300 2 )"
+_CHUNKS=$(( (6501 + _CH - 1) / _CH ))
+t "6,501 candidates split into 4 chunks"      "4"     "$_CHUNKS"
+t "chunks cover every candidate"              "1"     "$([[ $(( _CHUNKS * _CH )) -ge 6501 ]] && echo 1 || echo 0)"
+t "projected sweep exceeds one cap but fits the budget" "1" \
+  "$([[ $(( 300 + 6501 * 2 )) -gt 3600 && $(( 300 + 6501 * 2 )) -le $(( 3600 * 4 )) ]] && echo 1 || echo 0)"
+
+# ── Run state must not survive into a reused output directory ───────────────
+# Reuse is expected — setup_dirs already removes the DoH port file for exactly
+# that reason. These three files are also per-RUN state, and each one is
+# dangerous if it lingers:
+#   stage_truncations.txt  a stale one makes a clean run report INCOMPLETE
+#   httpx_probed.txt       stale entries make Phase 3 skip hosts this run never
+#                          probed — silent coverage loss
+#   httpx_metadata.tsv     merged into rather than replaced, so hosts that no
+#                          longer answer stay in the dataset
+SW="$(mktemp -d)"
+_od_save4="$OUTPUT_DIR"; OUTPUT_DIR="$SW"
+printf 'x\n' > "$SW/stage_truncations.txt"
+printf 'host.example.com\n' > "$SW/httpx_probed.txt"
+printf 'hostname\nhost.example.com\n' > "$SW/httpx_metadata.tsv"
+setup_dirs > /dev/null 2>&1
+t "setup_dirs clears a stale truncation record" "0" "$([[ -e "$SW/stage_truncations.txt" ]] && echo 1 || echo 0)"
+t "setup_dirs clears a stale probe ledger"      "0" "$([[ -e "$SW/httpx_probed.txt" ]] && echo 1 || echo 0)"
+t "setup_dirs clears stale httpx metadata"      "0" "$([[ -e "$SW/httpx_metadata.tsv" ]] && echo 1 || echo 0)"
+OUTPUT_DIR="$_od_save4"
+
+# ── The stage budget must stop the WORK, not just the loop ──────────────────
+# The per-host workers run their tool through `timeout`, so the actual crawl is
+# a GRANDCHILD. Killing only the wrapper subshell leaves it running — burning
+# CPU, network and the target's rate budget into the following stages for up to
+# its own per-host cap. The first check documents why the second exists.
+# The worker shape matters: bounded_parallel forks a subshell that runs a shell
+# FUNCTION, and the function then runs its tool. A subshell whose body is a
+# single external command is exec'd instead, collapsing the chain and hiding the
+# very gap being tested — so use a function here, as the pipeline does.
+KT_PLAIN="$(bash -c '
+    _kt_wrapper() { timeout 33 sleep 33; }
+    _kt_wrapper & w=$!
+    sleep 0.5
+    g=$(pgrep -P "$w" 2>/dev/null | head -1)
+    kill -TERM "$w" 2>/dev/null
+    sleep 0.5
+    if kill -0 "$g" 2>/dev/null; then echo ALIVE; else echo DEAD; fi
+    pkill -f "sleep 33" 2>/dev/null
+' 2>/dev/null | head -1)"
+t "a plain kill leaves the worker's tool running" "ALIVE" "${KT_PLAIN:-}"
+
+# _metho_kill_tree walks the process tree with pgrep, so it is only meaningful
+# where procps exists — and the runtime image now installs it for exactly that
+# reason. Guarded rather than assumed: on a minimal host without procps the walk
+# degrades to the old "kill the wrapper only" behaviour, and asserting DEAD there
+# would report a code defect that is really a missing dependency.
+if command -v pgrep &>/dev/null; then
+    KT_TREE="$(bash -c '
+        source "'"${SCRIPT_DIR}"'/lib/utils.sh" 2>/dev/null
+        _kt_wrapper() { timeout 33 sleep 33; }
+        _kt_wrapper & w=$!
+        sleep 0.5
+        g=$(pgrep -P "$w" 2>/dev/null | head -1)
+        _metho_kill_tree "$w"
+        sleep 0.5
+        if kill -0 "$g" 2>/dev/null; then echo ALIVE; else echo DEAD; fi
+        pkill -f "sleep 33" 2>/dev/null
+    ' 2>/dev/null | head -1)"
+    t "_metho_kill_tree also stops the worker's tool" "DEAD" "${KT_TREE:-}"
+else
+    echo "SKIP: _metho_kill_tree test needs pgrep (procps) — not installed here"
+fi
+
+# ── Merges are scoped to THIS run's root domains ────────────────────────────
+# phase1/*/ also matches directories left by earlier runs in a reused output
+# directory. Merging those imports hostnames nobody asked for this time, and —
+# for the probe ledger — lets a host this run resolved but never probed be
+# skipped by Phase 3 because a previous run probed it.
+RDW="$(mktemp -d)"; mkdir -p "$RDW/phase1/keep.test" "$RDW/phase1/stale.test"
+printf 'keep.test\n' > "$RDW/root_domains.txt"
+_od_save5="$OUTPUT_DIR"; OUTPUT_DIR="$RDW"
+t "run-scoped dirs keep this run's root"  "1" "$(_root_domain_dirs | grep -c 'keep\.test' || true)"
+t "run-scoped dirs drop a previous run's" "0" "$(_root_domain_dirs | grep -c 'stale\.test' || true)"
+: > "$RDW/root_domains.txt"
+t "no root list falls back to every directory" "2" "$(_root_domain_dirs | grep -c . || true)"
+OUTPUT_DIR="$_od_save5"
+
+# ── timeout(1)'s exit status is how a cap kill is told apart ────────────────
+# Recording on "non-zero" would cry wolf on the routine failures (a passive
+# source with no token, an empty grep); recording on 124 records only the case
+# where coverage below the stage became a lower bound.
+t "124 is a cap kill"          "1" "$(_was_capped 124 && echo 1 || echo 0)"
+t "1 is an ordinary failure"   "0" "$(_was_capped 1 && echo 1 || echo 0)"
+t "0 is success"               "0" "$(_was_capped 0 && echo 1 || echo 0)"
+t "empty is not a cap kill"    "0" "$(_was_capped '' && echo 1 || echo 0)"
+
+# ── nmap -sV port union: support floor ──────────────────────────────────────
+# The union is global, so a port seen on one odd host is probed across the whole
+# estate. On a live run 226 of 247 ports appeared on exactly 2 hosts — all GCP
+# front-end artefacts — and they filled the union end to end.
+NPU="$(mktemp)"
+{
+  for i in 1 2 3 4 5; do echo "10.0.0.$i:443"; done   # well-known, broad
+  echo "10.0.0.1:8080"; echo "10.0.0.2:8080"          # high port, 2 hosts
+  echo "10.0.0.1:3306"; echo "10.0.0.2:3306"; echo "10.0.0.3:3306"  # high port, 3 hosts
+  echo "10.0.0.1:49160"                                # high port, 1 host only
+  for i in 1 2 3 4 5 6; do echo "10.0.0.$i:1023"; done # well-known-ish, broad
+} > "$NPU"
+_has_port() { # _has_port <csv> <port>
+    [[ ",${1:-}," == *",${2:-},"* ]] && echo 1 || echo 0
+}
+t "union keeps a broad well-known port"  "1" "$(_has_port "$(_nmap_port_union "$NPU" 100 2)" 443)"
+t "union drops a 1-host high port"        "0" "$(_has_port "$(_nmap_port_union "$NPU" 100 2)" 49160)"
+t "union keeps a 3-host high port"        "1" "$(_has_port "$(_nmap_port_union "$NPU" 100 2)" 3306)"
+t "union drops a 2-host high port at floor 3" "0" "$(_has_port "$(_nmap_port_union "$NPU" 100 3)" 8080)"
+t "union keeps it at floor 2"             "1" "$(_has_port "$(_nmap_port_union "$NPU" 100 2)" 8080)"
+t "union honours the top-N cap"           "1" "$([[ $(_nmap_port_union "$NPU" 1 2 | tr ',' '\n' | grep -c .) -eq 1 ]] && echo 1 || echo 0)"
+t "union of an empty file is empty"       ""  "$(_nmap_port_union "$NPU.nonexistent" 100 2)"
+
+# ── Every documented knob must be reachable from the environment ────────────
+# A plain `VAR=default` assignment ignores the environment, so a knob documented
+# as tunable — and in several cases advertised IN A WARNING as the thing to raise
+# — can only be changed by editing the file. Eight were in that state:
+# CRAWL_STAGE_TIMEOUT and HTTPX_THREADS_MAX both had log messages telling the
+# operator to raise them, which was impossible. This guards the class.
+for _kv in CRAWL_STAGE_TIMEOUT=999 HTTPX_THREADS_MAX=999 WAYMORE_TIMEOUT=999 \
+           CLOUD_ENUM_TIMEOUT=999 DNSGEN_MAX_INPUT=999 DNSGEN_SKIP_THRESHOLD=999 \
+           DNSGEN_MAX_OUTPUT_BYTES=999 NAABU_RATE=999 NAABU_RETRIES=999 \
+           NAABU_TIMEOUT=999 NAABU_TOP_PORTS=999 NAABU_TIMEOUT_MAX=999 \
+           NAABU_SECONDS_PER_HOST=999 NAABU_TOTAL_TIMEOUT_MAX=999 \
+           NMAP_MIN_PORT_HOSTS=999 NMAP_TIMEOUT_MAX=999 NMAP_INCLUDE_CLOUD=1 ; do
+    _k="${_kv%%=*}"; _v="${_kv#*=}"
+    _got="$(env "$_k=$_v" bash -c "source '${SCRIPT_DIR}/lib/utils.sh' >/dev/null 2>&1; printf '%s' \"\${${_k}}\"")"
+    t "knob ${_k} is settable from the environment" "$_v" "$_got"
+done
+
+# ── DNS transport health: ONE definition ────────────────────────────────────
+# The flag answers "did the transport answer at all?", which is a different
+# question from "did many names resolve". The merge used to re-derive it from a
+# >=2% resolution rate, so the same flag meant one thing during Phase 1 and
+# another in Phase 3 — and the Phase 3 retry was governed by the weaker one.
+# These two cases are the ones where the two definitions DISAGREE.
+HW="$(mktemp -d)"; mkdir -p "$HW/phase1/h.test"
+printf 'h.test\n' > "$HW/root_domains.txt"
+printf 'hostname\troot_domain\tdiscovery_sources\tA\tAAAA\tCNAME\tresolution_status\n' > "$HW/phase1/h.test/canonical_dns.tsv"
+for i in $(seq 1 100); do
+    if (( i == 1 )); then
+        printf 'r%d.h.test\th.test\tsubfaster\t1.2.3.4\t\t\tresolved\n' "$i"
+    else
+        printf 'r%d.h.test\th.test\tsubfaster\t\t\t\tnxdomain\n' "$i"
+    fi
+done >> "$HW/phase1/h.test/canonical_dns.tsv"
+
+_od_save6="$OUTPUT_DIR"; _mdw_save="${METHO_DNS_WORKING:-}"
+# 1% resolved (below the old threshold) but the transport was observed healthy.
+printf '1\n' > "$HW/phase1/h.test/canonical_dns.tsv.dns_health"
+OUTPUT_DIR="$HW"; METHO_DNS_WORKING=0
+merge_per_domain_dns > /dev/null 2>&1
+t "healthy transport on a 1%-resolved corpus keeps retries ON" "1" "$METHO_DNS_WORKING"
+
+# 100% resolved but the transport was observed blackholed: the old rate
+# heuristic said healthy here, and was wrong.
+printf '0\n' > "$HW/phase1/h.test/canonical_dns.tsv.dns_health"
+awk -F'\t' -v OFS='\t' 'NR>1{ $7="resolved"; $4="1.2.3.4" } { print }' \
+    "$HW/phase1/h.test/canonical_dns.tsv" > "$HW/tmp.tsv" && mv "$HW/tmp.tsv" "$HW/phase1/h.test/canonical_dns.tsv"
+OUTPUT_DIR="$HW"; METHO_DNS_WORKING=1
+merge_per_domain_dns > /dev/null 2>&1
+t "blackholed transport on a 100%-resolved corpus disables retries" "0" "$METHO_DNS_WORKING"
+OUTPUT_DIR="$_od_save6"; METHO_DNS_WORKING="$_mdw_save"
+
+# The observation is persisted next to the dataset it was made against, because
+# a flag set inside a Phase 1 subshell does not survive it.
+printf 'h2.example.com\n' > "$W2/in-h2.txt" 2>/dev/null || true
+H2W="$(mktemp -d)"; OUTPUT_DIR="$H2W"; CANONICAL_DNS_TSV="$H2W/canonical_dns.tsv"
+init_canonical_dns > /dev/null 2>&1
+printf 'h2.example.com\n' > "$H2W/h2.txt"
+canonical_dns_add_sources "test" "$H2W/h2.txt" "example.com" > /dev/null 2>&1
+{ for i in $(seq 1 25); do echo "hb${i}.example.com"; done; } > "$H2W/hb.txt"
+canonical_dns_add_sources "test" "$H2W/hb.txt" "example.com" > /dev/null 2>&1
+FAKE_DNSX_A="$(tr '\n' ' ' < "$H2W/hb.txt")" FAKE_DNSX_NX="" \
+    canonical_dns_resolve_pending > /dev/null 2>&1
+t "a healthy batch persists its observation" "1" "$(cat "$H2W/canonical_dns.tsv.dns_health" 2>/dev/null | tr -d '[:space:]')"
+{ for i in $(seq 1 25); do echo "hd${i}.example.com"; done; } > "$H2W/hd.txt"
+canonical_dns_add_sources "test" "$H2W/hd.txt" "example.com" > /dev/null 2>&1
+FAKE_DNSX_A="" FAKE_DNSX_NX="" FAKE_DNSX_FAIL=1 \
+    canonical_dns_resolve_pending > /dev/null 2>&1
+t "a blackholed batch persists that too" "0" "$(cat "$H2W/canonical_dns.tsv.dns_health" 2>/dev/null | tr -d '[:space:]')"
+OUTPUT_DIR="$W2"; CANONICAL_DNS_TSV="${W2}/canonical_dns.tsv"
+
+# ── cloud_enum stays on the DoH transport when the proxy offers a plain IP ──
+# cloud_enum's dnspython accepts bare IPs only and always dials UDP/53, so in
+# DoH mode it used to silently leave the DoH transport for the system resolver —
+# a different DNS view from every other tool in the run, which is precisely the
+# split-horizon divergence DoH exists to remove.
+DPW="$(mktemp -d)"
+_od_save7="$OUTPUT_DIR"; _rf_save="${RESOLVERS_FILE:-}"
+OUTPUT_DIR="$DPW"; RESOLVERS_FILE="${DPW}/doh_resolvers.txt"
+printf '127.0.0.1:55885\n' > "$RESOLVERS_FILE"
+_dohpav() { _doh_plain_resolver_available && echo 1 || echo 0; }
+t "no extra listener -> unavailable"        "0" "$(_dohpav)"
+: > "${DPW}/.doh_extra_port"
+t "an empty port file means none bound"     "0" "$(_dohpav)"
+printf '53\n' > "${DPW}/.doh_extra_port"
+t "a listener on 53 is usable"              "1" "$(_dohpav)"
+PLAIN="$(_plain_ip_resolver_file 2>/dev/null)"
+t "plain-IP list leads with the proxy"      "127.0.0.1" "$(head -1 "$PLAIN")"
+t "plain-IP list still qualifies as bare IPs" "0" "$(_resolver_file_is_plain_ips "$PLAIN"; echo $?)"
+printf '5353\n' > "${DPW}/.doh_extra_port"
+t "a non-53 port is no use to cloud_enum"   "0" "$(_dohpav)"
+OUTPUT_DIR="$_od_save7"; RESOLVERS_FILE="$_rf_save"
+
+# ── HTTP probing may include bogon hosts; scanning never does ───────────────
+# A `bogon` host is unreachable from the INTERNET, which is not the same as
+# unreachable from the operator: on a network routed into the target's private
+# or CGNAT space it answers normally, and two internal OpenSearch clusters were
+# left out of the probe set that way with no way to bring them back.
+#
+# The split is deliberate. httpx re-resolves each name itself, so it needs no
+# recorded address; naabu and nmap DO need it, and aiming a port scanner at
+# private space is a far less defensible action than one HTTP request.
+PBW="$(mktemp -d)"
+printf 'hostname\troot_domain\tdiscovery_sources\tA\tAAAA\tCNAME\tresolution_status\n' > "$PBW/dns.tsv"
+printf 'pub.example.com\texample.com\tsubfaster\t93.184.216.34\t\t\tresolved\n' >> "$PBW/dns.tsv"
+printf 'priv.example.com\texample.com\tsubfaster\t\t\tinternal.elb.amazonaws.com\tbogon\n' >> "$PBW/dns.tsv"
+_cds_save2="${CANONICAL_DNS_TSV:-}"
+CANONICAL_DNS_TSV="$PBW/dns.tsv"
+_pr_has() { canonical_dns_extract_probeable | grep -c -- "$1" || true; }
+METHO_PROBE_RESERVED=0
+t "bogon is not probed by default"          "0" "$(_pr_has '^priv\.example\.com$')"
+t "resolved is always probed"               "1" "$(_pr_has '^pub\.example\.com$')"
+METHO_PROBE_RESERVED=1
+t "bogon IS probed with --probe-reserved"   "1" "$(_pr_has '^priv\.example\.com$')"
+t "probe set stays complete and clean"      "2" "$(canonical_dns_extract_probeable | wc -l | tr -d '[:space:]')"
+METHO_PROBE_RESERVED=0
+# …and bogon hosts must stay out of the SCAN side whatever the flag says.
+_build_ip_maps "$PBW/dns.tsv" "$PBW" > /dev/null 2>&1
+t "bogon never enters the scan inventory"   "0" "$(grep -c 'priv\.example\.com' "$PBW/domain_ip_map.txt" 2>/dev/null || true)"
+CANONICAL_DNS_TSV="$_cds_save2"
+
+# ── httpx is bounded, and says so when the bound bites ──────────────────────
+# httpx was the only long stage with NO wall-clock cap. Phase 1 bounds it
+# indirectly through the per-domain watchdog, but Phase 3's late probe runs
+# outside any watchdog — and that probe re-sends thousands of targets — so an
+# unbounded round there could hang the entire run with no timeout and no trace.
+SLOWSTUB="$(mktemp -d)"
+cat > "$SLOWSTUB/httpx" <<'EOF'
+#!/usr/bin/env bash
+sleep 30
+EOF
+chmod +x "$SLOWSTUB/httpx"
+HTW="$(mktemp -d)"; printf 'a.example.com\nb.example.com\n' > "$HTW/in.txt"
+_od_save8="$OUTPUT_DIR"; _path_save="$PATH"
+OUTPUT_DIR="$HTW"; PATH="$SLOWSTUB:$PATH"
+_ht_start=$(date +%s)
+HTTPX_TIMEOUT_BASE=1 HTTPX_SECONDS_PER_TARGET=0 HTTPX_TIMEOUT_MAX=2 \
+    httpx_probe "$HTW/in.txt" "$HTW/out.json" > /dev/null 2>&1
+_ht_elapsed=$(( $(date +%s) - _ht_start ))
+PATH="$_path_save"; OUTPUT_DIR="$_od_save8"
+t "an httpx round is cut off at its cap"  "1" "$([[ $_ht_elapsed -lt 15 ]] && echo 1 || echo 0)"
+t "an httpx cap kill is recorded"         "1" "$(_count_in "$HTW/stage_truncations.txt" 'httpx')"
+
+# ── nmap results: keep identified services, side-line tcpwrapped ────────────
+# `tcpwrapped` = handshake completed, nothing answered any probe: a middlebox,
+# not a service. 1,783 of 1,925 findings (93%) on a real run, and it buried the
+# real identifications. Kept in its own file, never dropped.
+#
+# The verdict must be decided PER PORT: nmap puts every open port for a host on
+# one line, and 47 real lines carried a genuine service beside wrapped ones.
+# Judging the line threw those services away — `80 http//Amazon CloudFront httpd`
+# sat on exactly such a line, so the fixture below covers that case.
+NMW="$(mktemp -d)"
+printf '# Nmap 7.95 scan\nHost: 10.0.0.1 ()\tStatus: Up\nHost: 10.0.0.1 ()\tPorts: 53/open/tcp//domain?///, 993/open/tcp//tcpwrapped///\tIgnored State: filtered (98)\nHost: 10.0.0.2 ()\tPorts: 443/open/tcp//ssl|https///\tIgnored State: filtered (99)\nHost: 10.0.0.3 ()\tPorts: 80/open/tcp//http//Amazon CloudFront httpd/, 993/open/tcp//tcpwrapped///\n' > "$NMW/scan.txt"
+_nmap_split_ports "$NMW/scan.txt" "$NMW/ident" "$NMW/wrapped"
+t "identified services are kept"          "3" "$(wc -l < "$NMW/ident" | tr -d '[:space:]')"
+t "tcpwrapped handshakes are side-lined"  "2" "$(wc -l < "$NMW/wrapped" | tr -d '[:space:]')"
+t "pairs carry no stray whitespace"       "0" "$(grep -c ' ' "$NMW/ident" || true)"
+t "the real service on a MIXED line survives" "1" "$(_count_in "$NMW/ident" '^10\.0\.0\.3:80$')"
+t "the wrapped port beside it does not"       "0" "$(_count_in "$NMW/ident" '^10\.0\.0\.3:993$')"
+t "that wrapped port is recorded, not lost"   "1" "$(_count_in "$NMW/wrapped" '^10\.0\.0\.3:993$')"
+
+# ── Tuning knobs validated at startup ────────────────────────────────────────
+# Run in a subshell: validate_args calls exit 1 on bad input, which would take
+# the whole suite down with it.
+CLAMPED="$( ( DOMAINS="example.com"; HTTPX_THREADS=999; HTTPX_THREADS_MAX=200
+             validate_args > /dev/null 2>&1; echo "$HTTPX_THREADS" ) )"
+t "httpx threads above the ceiling are clamped" "200" "$CLAMPED"
+KEPT="$( ( DOMAINS="example.com"; HTTPX_THREADS=120; HTTPX_THREADS_MAX=200
+           validate_args > /dev/null 2>&1; echo "$HTTPX_THREADS" ) )"
+t "httpx threads below the ceiling are honoured" "120" "$KEPT"
+UNDERSIZED="$( ( DOMAINS="example.com"; DNS_MODE=doh; PARALLEL_DOMAINS=3
+                  DNSX_THREADS="" DNSX_THREADS_DOH=64 DOH_PROXY_THREADS=128
+                  validate_args 2>/dev/null ) | grep -c 'DoH proxy undersized' )"
+t "an undersized DoH proxy is reported" "1" "$UNDERSIZED"
 
 echo ""
 echo "RESULT: $PASS passed, $FAIL failed"

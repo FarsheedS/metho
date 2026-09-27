@@ -78,6 +78,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   curl                -- crt.name API queries
 #   jq                  -- JSONL parsing throughout the pipeline
 #   ca-certificates     -- TLS for curl/pip/httpx
+#   procps              -- pgrep/pkill. A stage budget that expires SIGTERMs a
+#                          worker's descendants, and the per-host workers run
+#                          their tool through `timeout`, so the real crawler is a
+#                          GRANDCHILD: killing the wrapper subshell alone leaves
+#                          it running into the next stage. procps is not part of
+#                          a slim base image, and without it the tree walk
+#                          silently degrades to killing the wrapper only.
 # NOT needed: wget (curl covers it), whois (cymru query uses nc),
 #             git (repos are COPYed from the builder).
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -91,6 +98,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     jq \
     ca-certificates \
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
 # Python symlink -- some tools use '#!/usr/bin/env python'

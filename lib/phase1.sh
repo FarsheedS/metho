@@ -40,7 +40,18 @@ run_phase1() {
         wait "$_worker" 2>/dev/null; local _rc=$?
         kill -TERM "$_watch" 2>/dev/null; wait "$_watch" 2>/dev/null
         if [[ "$_rc" -gt 128 ]]; then
-            log_warn "Domain $_d exceeded ${_cap}s wall-clock cap — worker killed, moving on (partial results kept)"
+            # An ERROR, not a warning. The run continues and everything already
+            # written is kept, but this domain is INCOMPLETE: it died wherever it
+            # happened to be, so every stage after that point never ran. It was
+            # logged as a single [!] line and then the run went on to report
+            # success — on a real run that hid the loss of Katana, SubDomainizer
+            # and Stage 7 for the larger of two domains.
+            log_error "Domain $_d exceeded ${_cap}s wall-clock cap — worker KILLED, this domain is INCOMPLETE (partial results kept)"
+            log_error "  Stages after the kill point never ran for $_d. Raise --domain-timeout, lower --cewl-max-hosts/--crawl-max-hosts, or use --skip-permutation."
+            # Durable markers: the per-domain one for the operator, the run-level
+            # one for the final summary.
+            : > "${pdir}/${_d}.truncated" 2>/dev/null || true
+            _record_truncation "$_d" "domain-watchdog" "killed at ${_cap}s"
         fi
         return 0
     }
@@ -62,6 +73,22 @@ run_phase1() {
 
     log_info "Processing ${domain_count} domains with ${_workers} parallel workers (per-worker httpx rate: ${METHO_HTTPX_RATE}/s, aggregate ${RATE_LIMIT:-100}/s)..."
     bounded_parallel "$_workers" "$root_domains_file" _process_domain_wrapper
+
+    # Surface incompleteness here, while the operator is still watching, rather
+    # than leaving it as one buried [!] line. Everything downstream (Phase 2,
+    # Phase 3, consolidation) reads these domains' data and cannot tell that
+    # some of it was never collected.
+    local _trunc_file="${OUTPUT_DIR}/stage_truncations.txt"
+    if [[ -s "$_trunc_file" ]]; then
+        log_error "Phase 1 finished with INCOMPLETE work:"
+        while IFS=$'\t' read -r _td _tw _tdetail; do
+            [[ -n "$_td" ]] || continue
+            log_error "  ${_td}: ${_tw} — ${_tdetail}"
+        done < "$_trunc_file"
+        log_error "  Every count below is a LOWER BOUND for the domains listed above."
+        log_error "  Re-run the affected domains with a larger --domain-timeout, or with"
+        log_error "  --cewl-max-hosts/--crawl-max-hosts lowered, before trusting coverage."
+    fi
 
     # The per-worker rate only applies while several Phase 1 domains run at
     # once. Clearing it restores the full --rate-limit for the single-threaded
@@ -146,6 +173,17 @@ process_domain() {
     # for Phase 2/3.
     export CANONICAL_DNS_TSV="${ddir}/canonical_dns.tsv"
     export HTTPX_META_TSV="${ddir}/httpx_metadata.tsv"
+    # Per-domain probe ledger: every hostname this worker hands to httpx,
+    # responders and silent hosts alike. merge_per_domain_dns folds these into
+    # the global ledger Phase 3's late pass diffs against.
+    #
+    # Reset here, like the TSV below: both grow by appending/merging, so a
+    # per-domain file left by an earlier run in a reused output directory would
+    # carry its hosts into this run — and Phase 3 would then skip hosts that
+    # were never probed. The TSV has always been reset at this point; these two
+    # were not.
+    export METHO_HTTPX_LEDGER="${ddir}/httpx_probed.txt"
+    rm -f "$METHO_HTTPX_LEDGER" "$HTTPX_META_TSV"
     init_canonical_dns
 
     # Seed this domain's root into the per-domain canonical dataset so the
@@ -209,9 +247,18 @@ process_domain() {
             else
                 [[ "$_gh_probe_code" != "200" ]] && log_warn "GitHub token pre-flight returned HTTP ${_gh_probe_code} (not 200) — running anyway"
                 log_info "Running GitHub-subdomains..."
+                local _gh_rc=0
                 with_passive_proxy timeout "${GITHUB_SUBDOMAINS_TIMEOUT:-300}" github-subdomains \
                     -d "$domain" -t "$gh_token" -o github_subdomains.txt \
-                    < /dev/null 2>/dev/null || true
+                    < /dev/null 2>/dev/null || _gh_rc=$?
+                # A capped passive source is a partial subdomain list, and the
+                # count below reads like a complete one. (github-subdomains
+                # historically relied on the token being valid; a slow API is
+                # the other way this source silently shrinks.)
+                if _was_capped "$_gh_rc"; then
+                    _record_truncation "$domain" "github-subdomains" "hit its ${GITHUB_SUBDOMAINS_TIMEOUT:-300}s cap — source coverage is partial"
+                    log_warn "GitHub-subdomains was KILLED at its ${GITHUB_SUBDOMAINS_TIMEOUT:-300}s cap — the count below is a LOWER BOUND"
+                fi
                 local gh_count=0
                 [[ -s github_subdomains.txt ]] && gh_count=$(wc -l < github_subdomains.txt)
                 log_success "GitHub-subdomains: $gh_count subdomains"
@@ -271,13 +318,21 @@ process_domain() {
         # file and only the FIRST root domain is ever processed — the rest are
         # silently consumed as waymore's stdin. This is the same bug class that
         # katana/cewl exhibited; they already carry < /dev/null guards.
+        local _wm_rc=0
         with_passive_proxy timeout "${WAYMORE_TIMEOUT:-600}" waymore \
             -i "$domain" \
             -mode "${WAYMORE_MODE:-U}" \
             -oU "$wm_urls" \
             -oR "$wm_output_dir" \
             -t 30 -p 2 --verbose \
-            < /dev/null 2>/dev/null || true
+            < /dev/null 2>/dev/null || _wm_rc=$?
+        # Waymore is the single largest subdomain source on most targets, so a
+        # cap kill here is the difference between a complete historical sweep
+        # and a partial one — and it otherwise shows up only as a smaller count.
+        if _was_capped "$_wm_rc"; then
+            _record_truncation "$domain" "waymore" "hit its ${WAYMORE_TIMEOUT:-600}s cap — historical URLs are partial"
+            log_warn "Waymore was KILLED at its ${WAYMORE_TIMEOUT:-600}s cap — historical coverage is PARTIAL"
+        fi
 
         if [[ -s "$wm_urls" ]]; then
             # Extract subdomains from URLs, filter to in-scope, deduplicate
@@ -364,7 +419,7 @@ process_domain() {
         # filter, Round 1 re-probed all prior domains' hosts each iteration
         # (O(N²) overall). Only resolved hosts are probed, never the raw
         # candidate list.
-        canonical_dns_extract_resolved \
+        canonical_dns_extract_probeable \
             | grep -E "(^|\.)${domain//./\\.}$" > live_candidates_round1.txt || true
 
         if [[ -s live_candidates_round1.txt ]]; then
@@ -402,8 +457,22 @@ process_domain() {
             fi
         }
 
-        log_info "CeWL: crawling $(wc -l < live_subdomains_round1.txt) hosts (depth ${CEWL_DEPTH:-2}, mem cap ${CEWL_MEM_LIMIT_MB:-1024}MB, ${PARALLEL_HOSTS:-5} in parallel)..."
-        bounded_parallel "${PARALLEL_HOSTS:-5}" live_subdomains_round1.txt _cewl_one_host
+        # Cap the crawl set. CeWL is a wordlist builder, not a discovery tool:
+        # its marginal yield collapses after the first hundred or so hosts, but
+        # its cost is linear in the host count and each host may burn 600s plus
+        # a depth-1 retry. On a 4,371-host target that ran for 18 minutes and
+        # was killed by the domain watchdog, so the stage both cost the most and
+        # delivered nothing.
+        local _cewl_in="wordlists/.cewl_input.txt"
+        local _cewl_counts
+        _cewl_counts=$(_cap_crawl_hosts live_subdomains_round1.txt "${CEWL_MAX_HOSTS:-150}" "$_cewl_in" "CeWL")
+        local _cewl_kept="${_cewl_counts%% *}" _cewl_all="${_cewl_counts##* }"
+
+        log_info "CeWL: crawling ${_cewl_kept} of ${_cewl_all} hosts (depth ${CEWL_DEPTH:-2}, mem cap ${CEWL_MEM_LIMIT_MB:-1024}MB, ${PARALLEL_HOSTS:-5} in parallel, stage budget ${CRAWL_STAGE_TIMEOUT:-1200}s)..."
+        METHO_STAGE_LABEL="CeWL" \
+        METHO_STAGE_DEADLINE="$(_stage_deadline "${CRAWL_STAGE_TIMEOUT:-1200}")" \
+            bounded_parallel "${PARALLEL_HOSTS:-5}" "$_cewl_in" _cewl_one_host
+        rm -f "$_cewl_in"
 
         cat "$_cewl_tmpdir"/*.txt 2>/dev/null > wordlists/custom_wordlist.txt || :
         rm -rf "$_cewl_tmpdir"
@@ -541,7 +610,11 @@ WORDBASE
             -o shuffledns_results.txt \
             >> "$bruteforce_log" 2>&1 || bruteforce_exit=$?
 
-        if [[ "$bruteforce_exit" -ne 0 ]]; then
+        if _was_capped "$bruteforce_exit"; then
+            _record_truncation "$domain" "dnsx-bruteforce" "hit its ${BRUTEFORCE_TIMEOUT:-900}s cap — brute-force coverage is partial"
+            log_warn "dnsx bruteforce was KILLED at its ${BRUTEFORCE_TIMEOUT:-900}s cap — coverage is PARTIAL (see ${bruteforce_log})"
+            tail -5 "$bruteforce_log" 2>/dev/null | sed 's/^/    /'
+        elif [[ "$bruteforce_exit" -ne 0 ]]; then
             log_warn "dnsx bruteforce exited with code ${bruteforce_exit} — see ${bruteforce_log}"
             tail -5 "$bruteforce_log" 2>/dev/null | sed 's/^/    /'
         fi
@@ -654,11 +727,24 @@ WORDBASE
             # STDOUT, not stderr — the "Generated N variations" INFO line
             # and spinner escapes would otherwise land in the permutations
             # file (verified empirically: 4 junk lines for a 1-domain input).
+            # PIPESTATUS must be read before anything else runs, and the pipeline
+            # may legitimately "fail" (grep exits 1 on no match), so errexit is
+            # suspended around it — the same save/restore idiom bounded_parallel
+            # uses. The byte cap downstream means dnsgen is the first stage of
+            # this pipeline (index 0).
+            local _dg_prev_e=0 _dg_rc=0
+            case $- in *e*) _dg_prev_e=1; set +e;; esac
             timeout "${DNSGEN_TIMEOUT:-120}" dnsgen dnsgen_input.txt \
                 < /dev/null 2>/dev/null \
                 | head -c "${DNSGEN_MAX_OUTPUT_BYTES:-26214400}" \
                 | grep -E '^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$' \
-                > dnsgen_permutations.txt || true
+                > dnsgen_permutations.txt
+            _dg_rc=${PIPESTATUS[0]}
+            [[ "$_dg_prev_e" == 1 ]] && set -e
+            if _was_capped "$_dg_rc"; then
+                _record_truncation "$domain" "dnsgen" "hit its ${DNSGEN_TIMEOUT:-120}s cap — permutations are partial"
+                log_warn "dnsgen was KILLED at its ${DNSGEN_TIMEOUT:-120}s cap — the permutation set is PARTIAL"
+            fi
 
             # Drop a possibly-truncated last line (head -c cuts mid-line)
             [[ -s dnsgen_permutations.txt ]] && sed -i '$ d' dnsgen_permutations.txt 2>/dev/null || true
@@ -753,7 +839,7 @@ WORDBASE
         # (which, globally, includes earlier domains' hosts) with this domain's
         # brute-force additions so no other-domain or unresolved label is probed.
         comm -12 \
-            <(canonical_dns_extract_resolved | grep -E "(^|\.)${domain//./\\.}$" | sort -u) \
+            <(canonical_dns_extract_probeable | grep -E "(^|\.)${domain//./\\.}$" | sort -u) \
             <(sort -u new_subdomains_round2.txt) \
             > new_resolved_round2.txt || true
 
@@ -830,8 +916,21 @@ WORDBASE
                 < /dev/null > "${ka_tmp}/${tag}.jsonl" 2>/dev/null || true
         }
 
-        log_info "Katana: crawling $(wc -l < live_subdomains_round2.txt) hosts (katana cap ${KATANA_CRAWL_DURATION:-9m}, hard timeout ${KATANA_TIMEOUT:-600}s, ${PARALLEL_HOSTS:-5} in parallel)..."
-        bounded_parallel "${PARALLEL_HOSTS:-5}" live_subdomains_round2.txt _katana_one_host
+        # Cap the crawl set and bound the stage. Katana gives each host up to
+        # KATANA_TIMEOUT (600s), so the stage's worst case is linear in the host
+        # count: at 4,371 live hosts and PARALLEL_HOSTS=5 that is ~30 hours,
+        # which the per-domain watchdog ends long before the crawl finishes —
+        # and it ends the stages after it too.
+        local _ka_in="katana/.crawl_input.txt"
+        local _ka_counts _ka_kept _ka_all
+        _ka_counts=$(_cap_crawl_hosts live_subdomains_round2.txt "${CRAWL_MAX_HOSTS:-300}" "$_ka_in" "Katana")
+        _ka_kept="${_ka_counts%% *}"; _ka_all="${_ka_counts##* }"
+
+        log_info "Katana: crawling ${_ka_kept} of ${_ka_all} hosts (katana cap ${KATANA_CRAWL_DURATION:-9m}, hard timeout ${KATANA_TIMEOUT:-600}s, ${PARALLEL_HOSTS:-5} in parallel, stage budget ${CRAWL_STAGE_TIMEOUT:-1200}s)..."
+        METHO_STAGE_LABEL="Katana" \
+        METHO_STAGE_DEADLINE="$(_stage_deadline "${CRAWL_STAGE_TIMEOUT:-1200}")" \
+            bounded_parallel "${PARALLEL_HOSTS:-5}" "$_ka_in" _katana_one_host
+        rm -f "$_ka_in"
 
         cat "$ka_tmp"/*.jsonl 2>/dev/null > katana/raw_output.jsonl || : > katana/raw_output.jsonl
         rm -f "$ka_tmp"/*.jsonl
@@ -839,7 +938,7 @@ WORDBASE
         if [[ -s katana/raw_output.jsonl ]]; then
             local ka_lines ka_hosts_count
             ka_lines=$(wc -l < katana/raw_output.jsonl | tr -d ' ')
-            ka_hosts_count=$(wc -l < live_subdomains_round2.txt | tr -d ' ')
+            ka_hosts_count="${_ka_kept:-0}"
 
             # Discovered URLs (preserve separately from hostnames)
             grep -oE 'https?://[^"'"'"' ]+' katana/raw_output.jsonl 2>/dev/null | \
@@ -850,17 +949,29 @@ WORDBASE
             local escaped_domain="${domain//./\\.}"
             grep -E "(^|\.)${escaped_domain}$" katana/all_domains.txt | sort -u > katana/discovered_hosts.txt || true
 
-            # JavaScript assets (from -jc flag)
-            jq -r 'select(.javascript != null) | .javascript[]? | select(. != null)' katana/raw_output.jsonl 2>/dev/null | \
-                sort -u > katana/javascript_assets.txt || true
+            # JavaScript assets.
+            #
+            # Katana emits the `.javascript` array only under -jsl (jsluice); the
+            # flags actually passed here are -jc -j, whose records carry exactly
+            # {request,response,timestamp} or {error,request,timestamp}. So the
+            # jq below matched nothing on a real run — 130,293 JSON lines, zero
+            # records with a "javascript" key — and the stage reported
+            # "0 JS assets across 21 hosts" while its own log line advertised JS
+            # analysis. The jq is kept (correct the moment -jsl is enabled) and
+            # the list is derived from what the crawl did collect: the .js URLs.
+            {
+                jq -r 'select(.javascript != null) | .javascript[]? | select(. != null)' katana/raw_output.jsonl 2>/dev/null
+                grep -oiE 'https?://[^"'"'"' ]+\.js([?#][^"'"'"' ]*)?' katana/raw_output.jsonl 2>/dev/null
+            } | sort -u > katana/javascript_assets.txt || true
 
             local ka_sub_count=0
             [[ -s katana/discovered_hosts.txt ]] && ka_sub_count=$(wc -l < katana/discovered_hosts.txt)
             log_success "Katana: ${ka_lines} JSON lines, ${ka_sub_count} in-scope subdomains, $(wc -l < katana/discovered_urls.txt 2>/dev/null || echo 0) URLs, $(wc -l < katana/javascript_assets.txt 2>/dev/null || echo 0) JS assets across ${ka_hosts_count} hosts"
         else
-            local ka_hosts_count
-            ka_hosts_count=$(wc -l < live_subdomains_round2.txt | tr -d ' ')
-            log_info "Katana: scanned ${ka_hosts_count} seeds, no output captured"
+            # The CAPPED count, matching the stage header and the success
+            # branch: reporting the uncapped list length here claimed 4,371
+            # hosts were crawled when CRAWL_MAX_HOSTS had limited it to 300.
+            log_info "Katana: scanned ${_ka_kept:-0} of ${_ka_all:-0} seeds, no output captured"
         fi
         rm -rf "$ka_tmp"
     else
@@ -895,14 +1006,25 @@ WORDBASE
             [[ -s "$out" ]] || rm -f "$out"
         }
 
-        log_info "Subdomainizer: scanning $(wc -l < live_subdomains_round2.txt) hosts (${PARALLEL_HOSTS:-5} in parallel)..."
-        bounded_parallel "${PARALLEL_HOSTS:-5}" live_subdomains_round2.txt _subdomainizer_one_host
+        # Same cap and stage budget as Katana: SubDomainizer runs concurrently
+        # with it against the same host list, so an uncapped pair doubles the
+        # per-host cost of the stage while sharing one domain budget.
+        local _sd_in="subdomainizer/.crawl_input.txt"
+        local _sd_counts _sd_kept _sd_all
+        _sd_counts=$(_cap_crawl_hosts live_subdomains_round2.txt "${CRAWL_MAX_HOSTS:-300}" "$_sd_in" "SubDomainizer")
+        _sd_kept="${_sd_counts%% *}"; _sd_all="${_sd_counts##* }"
+
+        log_info "Subdomainizer: scanning ${_sd_kept} of ${_sd_all} hosts (${PARALLEL_HOSTS:-5} in parallel, stage budget ${CRAWL_STAGE_TIMEOUT:-1200}s)..."
+        METHO_STAGE_LABEL="SubDomainizer" \
+        METHO_STAGE_DEADLINE="$(_stage_deadline "${CRAWL_STAGE_TIMEOUT:-1200}")" \
+            bounded_parallel "${PARALLEL_HOSTS:-5}" "$_sd_in" _subdomainizer_one_host
+        rm -f "$_sd_in"
 
         cat subdomainizer/*.txt 2>/dev/null > subdomainizer/raw_output.txt || : > subdomainizer/raw_output.txt
 
         if [[ -s subdomainizer/raw_output.txt ]] || [[ -s subdomainizer/stdout.log ]]; then
             local sd_hosts
-            sd_hosts=$(wc -l < live_subdomains_round2.txt | tr -d ' ')
+            sd_hosts="${_sd_kept:-0}"
             {
                 cat subdomainizer/raw_output.txt
                 cat subdomainizer/stdout.log 2>/dev/null
@@ -922,9 +1044,8 @@ WORDBASE
             [[ -s subdomainizer_subdomains.txt ]] && sd_count=$(wc -l < subdomainizer_subdomains.txt)
             log_success "Subdomainizer subdomains (${sd_hosts} hosts scanned): $sd_count"
         else
-            local sd_hosts
-            sd_hosts=$(wc -l < live_subdomains_round2.txt | tr -d ' ')
-            log_info "Subdomainizer: ran on ${sd_hosts} hosts, nothing found"
+            # Capped count, same reason as the Katana branch above.
+            log_info "Subdomainizer: ran on ${_sd_kept:-0} of ${_sd_all:-0} hosts, nothing found"
         fi
     else
         log_skip "Subdomainizer skipped (tool missing or no live hosts)"
@@ -979,34 +1100,38 @@ WORDBASE
     # inside the function via METHO_DNS_WORKING).
     canonical_dns_resolve_pending include_timeouts
 
-    # Probe ONLY the subdomains discovered since Round 2 (crawling
-    # candidates that aren't already probed). Merge their live URLs with
-    # the Round 2 live set.
-    : > new_subdomains_final.txt
-    if [[ -s all_subdomains_round2.txt ]]; then
-        comm -13 all_subdomains_round2.txt all_subdomains_final.txt \
-            > new_subdomains_final.txt || true
-    fi
+    # How many NAMES the crawling stages added since Round 2. Reported only —
+    # this is not the Round 3 candidate set, which is the ledger delta below.
+    # (It used to be written to new_subdomains_final.txt, where it was read once
+    # for this log line and then overwritten by the delta; a leftover file whose
+    # name suggests it drives probing is worse than no file.)
     local crawl_new=0
-    [[ -s new_subdomains_final.txt ]] && crawl_new=$(wc -l < new_subdomains_final.txt)
-    log_info "New subdomains since Round 2 (from crawling): $crawl_new"
+    if [[ -s all_subdomains_round2.txt && -s all_subdomains_final.txt ]]; then
+        crawl_new=$(comm -13 all_subdomains_round2.txt all_subdomains_final.txt | wc -l | tr -d '[:space:]')
+    fi
+    log_info "New subdomains since Round 2 (from crawling): ${crawl_new:-0}"
 
-    if [[ "$crawl_new" -gt 0 ]]; then
-        # HTTPX Round 3 probes ONLY the crawler-discovered subdomains that
-        # actually resolved and belong to this domain (same reasoning as Round 2:
-        # the resolved set includes earlier domains' hosts; keep only this
-        # domain's resolved crawl additions).
-        comm -12 \
-            <(canonical_dns_extract_resolved | grep -E "(^|\.)${domain//./\\.}$" | sort -u) \
-            <(sort -u new_subdomains_final.txt) \
-            > new_resolved_final.txt || true
+    # Round 3's candidate set is "resolved for this domain AND never probed" —
+    # a LEDGER question, not a discovery-order one.
+    #
+    # It used to be a name delta against the previous round's discovered set
+    # (`comm -13`), which silently excluded every host whose NAME was already
+    # known but which had never actually been probed. The timeout pile recovered
+    # by the retry pass above is exactly that population: on a real run, 2,497
+    # recovered names were unreachable from Phase 1 entirely and could only ever
+    # be probed by Phase 3's late pass.
+    canonical_dns_extract_probeable \
+        | grep -E "(^|\.)${domain//./\\.}$" | sort -u > .r3_resolved.txt || true
+    httpx_ledger_read | sort -u > .r3_probed.txt
+    comm -23 .r3_resolved.txt .r3_probed.txt > new_resolved_final.txt || true
+    rm -f .r3_resolved.txt .r3_probed.txt
 
-        if [[ -s new_resolved_final.txt ]]; then
-            httpx_probe new_resolved_final.txt httpx_results_final.json
-        else
-            log_info "Round 3: no crawler subdomains resolved — nothing new to probe"
-            : > httpx_results_final.json
-        fi
+    local r3_new=0
+    [[ -s new_resolved_final.txt ]] && r3_new=$(wc -l < new_resolved_final.txt)
+
+    if [[ "$r3_new" -gt 0 ]]; then
+        log_info "HTTPX Round 3: $r3_new resolved host(s) never probed this run (crawl additions + timeout recoveries)"
+        httpx_probe new_resolved_final.txt httpx_results_final.json
         if [[ -s httpx_results_final.json ]]; then
             jq -r '.url' httpx_results_final.json | sort -u > new_live_subdomains_final.txt || true
         else
@@ -1019,7 +1144,7 @@ WORDBASE
             > httpx_results_final.json.tmp || true
         mv -f httpx_results_final.json.tmp httpx_results_final.json
     else
-        log_info "No new subdomains from crawling — reusing Round 2 live results"
+        log_info "Round 3: no unprobed resolved hosts remain — reusing Round 2 live results"
         cp live_subdomains_round2.txt live_subdomains_final.txt 2>/dev/null || : > live_subdomains_final.txt
         cp httpx_results_round2.json httpx_results_final.json 2>/dev/null || : > httpx_results_final.json
     fi

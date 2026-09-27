@@ -104,6 +104,14 @@ fi
 
 # ── Phase 3: IP → Classification → Port Scan ────────────────────────────────
 if ! should_skip_phase 3; then
+    # Phase 3's late pass diffs against the probe ledger. When Phase 1 ran, its
+    # merge already produced that ledger; with --skip-phase 1 it never runs, and
+    # the ledger would be empty (setup_dirs deletes any stale copy), so the late
+    # pass would re-probe every resolved host that stayed silent. Rebuild it from
+    # whatever per-domain ledgers exist.
+    if should_skip_phase 1; then
+        merge_probe_ledgers || true
+    fi
     run_phase3
 
     checkpoint "Phase 3 complete. IPs: $(wc -l < "${OUTPUT_DIR}/phase3/all_resolved_ips.txt" 2>/dev/null || echo '?') | ASNs: $(wc -l < "${OUTPUT_DIR}/phase3/asn_list.txt" 2>/dev/null || echo '?')" || true
@@ -120,5 +128,28 @@ run_consolidation
 # completed. Does not re-run tools or duplicate raw artifacts.
 generate_per_root_results
 
-log_success "Recon pipeline complete!"
+# ── Run completeness check ──────────────────────────────────────────────────
+# A domain worker killed by its wall-clock watchdog leaves every later stage
+# unrun for that domain. That used to be one [!] line buried in the log while
+# the pipeline still announced success, so an operator reading only the tail
+# would take a truncated domain for a covered one. Anything recorded here means
+# the results are INCOMPLETE for the domains named.
+TRUNCATIONS_FILE="${OUTPUT_DIR}/stage_truncations.txt"
+if [[ -s "$TRUNCATIONS_FILE" ]]; then
+    echo ""
+    log_error "════════════════════════════════════════════════════════════════"
+    log_error "  RUN INCOMPLETE — $(wc -l < "$TRUNCATIONS_FILE" | tr -d ' ') truncation(s) recorded"
+    log_error "════════════════════════════════════════════════════════════════"
+    while IFS=$'\t' read -r _td _tw _tdetail; do
+        [[ -n "$_td" ]] || continue
+        log_error "  ${_td}: ${_tw} — ${_tdetail}"
+    done < "$TRUNCATIONS_FILE"
+    log_error "  Results for those domains are LOWER BOUNDS, not coverage."
+    log_error "  Details: ${TRUNCATIONS_FILE}"
+    log_error "════════════════════════════════════════════════════════════════"
+    echo ""
+    log_warn "Recon pipeline finished, but WITH TRUNCATION — see the errors above."
+else
+    log_success "Recon pipeline complete!"
+fi
 log_info "Full log saved to ${OUTPUT_DIR}/recon.log"
