@@ -356,7 +356,14 @@ class DohProxy:
             # A dead client or a closed socket is not worth failing the run for.
             self.stats.bump("dropped")
 
-    def serve(self, host: str, port: int, port_file: str | None) -> int:
+    def serve(
+        self,
+        host: str,
+        port: int,
+        port_file: str | None,
+        extra_binds: list[str] | None = None,
+        extra_port_file: str | None = None,
+    ) -> int:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         # A large receive buffer keeps a burst of dnsx queries from being
@@ -399,8 +406,57 @@ class DohProxy:
                 fh.write(f"{bound_port}\n")
             os.replace(tmp, port_file)
 
+        # ── Extra listener(s) ───────────────────────────────────────────────
+        # Some consumers cannot use the ephemeral port. cloud_enum's dnspython
+        # accepts bare IPs only and always dials UDP/53, so in DoH mode it falls
+        # back to the system resolver and gets a DIFFERENT DNS view from every
+        # other tool in the pipeline — the split-horizon divergence DoH exists to
+        # remove. A second socket on a well-known port puts those consumers back
+        # on the same transport.
+        #
+        # Best-effort on purpose: a failure here must not take the proxy down,
+        # because everything else depends on the primary ephemeral listener.
+        extra_socks: list[socket.socket] = []
+        for spec in (extra_binds or []):
+            try:
+                ehost, _, eport = spec.rpartition(":")
+                if not ehost or not eport:
+                    raise ValueError("expected HOST:PORT")
+                esock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                esock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    esock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+                except OSError:
+                    pass
+                esock.bind((ehost, int(eport)))
+                extra_socks.append(esock)
+            except (OSError, ValueError) as exc:
+                print(
+                    f"[doh-proxy] extra listener {spec} unavailable ({exc}) — "
+                    "continuing with the ephemeral port only",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        if extra_port_file:
+            # One line per bound extra socket; an EMPTY file means "none bound",
+            # which the caller must read as unavailable rather than malformed.
+            tmp = f"{extra_port_file}.tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    for es in extra_socks:
+                        fh.write(f"{es.getsockname()[1]}\n")
+                os.replace(tmp, extra_port_file)
+            except OSError:
+                pass
+
+        extra_desc = ""
+        if extra_socks:
+            extra_desc = ", extra " + ", ".join(
+                f"{es.getsockname()[0]}:{es.getsockname()[1]}" for es in extra_socks
+            )
         print(
-            f"[doh-proxy] listening on {host}:{bound_port} "
+            f"[doh-proxy] listening on {host}:{bound_port}{extra_desc} "
             f"({len(self.endpoints)} endpoint(s), {self.threads} threads)",
             file=sys.stderr,
             flush=True,
@@ -408,31 +464,36 @@ class DohProxy:
 
         def _shutdown(_signum, _frame):
             self._stop.set()
-            try:
-                sock.close()
-            except OSError:
-                pass
+            for _s in [sock, *extra_socks]:
+                try:
+                    _s.close()
+                except OSError:
+                    pass
 
         signal.signal(signal.SIGTERM, _shutdown)
         signal.signal(signal.SIGINT, _shutdown)
 
-        last_report = time.monotonic()
-        try:
-            while not self._stop.is_set():
-                try:
-                    wire, addr = sock.recvfrom(65535)
-                except OSError:
-                    break  # socket closed by the signal handler
-                if not wire:
-                    continue
-                self.stats.bump("queries")
-                self.pool.submit(self._handle, sock, wire, addr)
+        # One thread per extra socket; the primary socket is served on this
+        # thread. All share the query pool and the counters.
+        extra_threads = [
+            threading.Thread(target=self._recv_loop, args=(es, False), daemon=True)
+            for es in extra_socks
+        ]
+        for _t in extra_threads:
+            _t.start()
 
-                now = time.monotonic()
-                if now - last_report >= 30:
-                    self._report()
-                    last_report = now
+        try:
+            self._recv_loop(sock, True)
         finally:
+            # Close the extras FIRST so their loops return before the pool is
+            # gone — a worker submitting to a shut-down pool raises.
+            for _s in extra_socks:
+                try:
+                    _s.close()
+                except OSError:
+                    pass
+            for _t in extra_threads:
+                _t.join(timeout=2)
             self._report()
             self.pool.shutdown(wait=False, cancel_futures=True)
             try:
@@ -440,6 +501,32 @@ class DohProxy:
             except OSError:
                 pass
         return 0
+
+    def _recv_loop(self, sock: socket.socket, report: bool) -> None:
+        """Receive-and-dispatch loop for ONE socket.
+
+        Only the primary loop reports periodically — the counters are shared, so
+        one reporter is enough and two would double-print every interval.
+        """
+        last_report = time.monotonic()
+        while not self._stop.is_set():
+            try:
+                wire, addr = sock.recvfrom(65535)
+            except OSError:
+                return  # socket closed by the signal handler / shutdown
+            if not wire:
+                continue
+            self.stats.bump("queries")
+            try:
+                self.pool.submit(self._handle, sock, wire, addr)
+            except RuntimeError:
+                return  # pool already shut down
+            if not report:
+                continue
+            now = time.monotonic()
+            if now - last_report >= 30:
+                self._report()
+                last_report = now
 
     def _report(self) -> None:
         queries, answered, dropped, errors = self.stats.snapshot()
@@ -465,6 +552,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="write the bound port here once listening")
     parser.add_argument("--endpoints", default=",".join(DEFAULT_ENDPOINTS),
                         help="comma-separated DoH endpoint URLs")
+    parser.add_argument("--extra-bind", action="append", default=[],
+                        help="extra UDP address to also listen on, HOST:PORT "
+                             "(repeatable). Best-effort: a bind failure is "
+                             "reported and ignored")
+    parser.add_argument("--extra-port-file", default=None,
+                        help="write each successfully bound extra port here, "
+                             "one per line (empty file = none bound)")
     parser.add_argument("--threads", type=int, default=64)
     parser.add_argument("--timeout", type=float, default=6.0)
     parser.add_argument("--verbose", action="store_true")
@@ -486,7 +580,8 @@ def main(argv: list[str] | None = None) -> int:
     proxy = DohProxy(endpoints, threads=max(1, args.threads),
                      timeout=args.timeout, verbose=args.verbose)
     try:
-        return proxy.serve(args.host, args.port, args.port_file)
+        return proxy.serve(args.host, args.port, args.port_file,
+                           args.extra_bind, args.extra_port_file)
     except OSError as exc:
         print(f"[doh-proxy] cannot bind {args.host}:{args.port}: {exc}", file=sys.stderr)
         return 1

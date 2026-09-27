@@ -41,21 +41,38 @@ run_phase2() {
         # Extract resolved hostnames from the canonical DNS dataset rather than
         # re-reading the Phase 1 output files. This ensures we only query hosts
         # that actually resolved, and avoids re-resolving the entire corpus.
+        #
+        # `resolved` = has an address, so `cname_only` hosts are NOT queried here.
+        # That is deliberate rather than an oversight: their CNAME is already in
+        # the dataset, and a name with no address is unlikely to carry MX/NS/TXT.
+        # Their takeover-relevant CNAMEs still reach the cloud-asset report,
+        # which re-derives cloud assets from the CNAME column for every status
+        # (lib/results.sh).
         local canonical_hosts="${pdir}/.canonical_hosts.txt"
         canonical_dns_extract_resolved > "$canonical_hosts"
 
         if [[ -s "$canonical_hosts" ]]; then
             log_info "  Querying $(wc -l < "$canonical_hosts") resolved hosts for cloud record types (CNAME/MX/NS/TXT)"
 
+            # Redirect rather than `| tee … >/dev/null`: identical output, and it
+            # keeps timeout(1)'s exit status capturable so a cap kill can be told
+            # apart from a real failure. This pass feeds both the cloud-asset
+            # report and new hostnames into the dataset, so a silent partial run
+            # understates both.
+            local _p2_rc=0
             cat "$canonical_hosts" \
                 | timeout "${DNSX_TIMEOUT}" dnsx -cname -mx -ns -txt \
                     -json -retry "${DNSX_RETRY}" \
                     -r "${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt}" \
                     -timeout "$(_dnsx_query_timeout)" \
                     -t "$(_dnsx_threads)" \
-                    2>>"$dnsx_log" \
-                | tee "${pdir}/dnsx_output.json" >/dev/null || \
-                    log_warn "DNSx exited non-zero (or was killed by DNSX_TIMEOUT) — see ${dnsx_log}"
+                    > "${pdir}/dnsx_output.json" 2>>"$dnsx_log" || _p2_rc=$?
+            if _was_capped "$_p2_rc"; then
+                _record_truncation "all" "dnsx-cloud-records" "hit its ${DNSX_TIMEOUT}s cap — cloud records are partial"
+                log_warn "DNSx cloud-record pass was KILLED at its ${DNSX_TIMEOUT}s cap — records are PARTIAL"
+            elif (( _p2_rc != 0 )); then
+                log_warn "DNSx exited non-zero (${_p2_rc}) — see ${dnsx_log}"
+            fi
 
             if [[ -s "${pdir}/dnsx_output.json" ]]; then
                 # Extract all DNS records for cloud domain filtering
@@ -141,7 +158,7 @@ run_phase2() {
                 _seen+=" $kw"
                 _kw_list+="${_kw_list:+, }$kw"
             done
-            log_info "  Cloud_Enum keywords: $_kw_list (wall-clock cap ${CLOUD_ENUM_TIMEOUT:-1800}s)"
+            log_info "  Cloud_Enum keywords: $_kw_list (wall-clock cap ${CLOUD_ENUM_TIMEOUT:-900}s)"
 
             # Emit one -k per keyword. cloud_enum parses its resolver file
             # with dnspython, which accepts BARE IP ADDRESSES ONLY — the DoH
@@ -155,7 +172,14 @@ run_phase2() {
             if [[ -z "$nsf_file" ]]; then
                 log_warn "cloud_enum needs a resolver file of bare IPs and neither the active one nor the system resolver qualifies — its DNS checks will be skipped"
             elif [[ "$nsf_file" != "${RESOLVERS_FILE:-}" ]]; then
-                log_warn "cloud_enum cannot read the active resolver file (it accepts bare IPs only) — falling back to the system resolver ($(head -1 "$nsf_file")) for its DNS checks"
+                if _doh_plain_resolver_available; then
+                    # The DoH proxy answers on a bare IP too, so cloud_enum stays
+                    # on the same transport as every other tool. Previously this
+                    # branch could not exist and cloud_enum always left DoH.
+                    log_info "cloud_enum: using the DoH proxy's plain-IP listener (127.0.0.1) — same DNS view as the rest of the run"
+                else
+                    log_warn "cloud_enum cannot read the active resolver file (it accepts bare IPs only) — falling back to the system resolver ($(head -1 "$nsf_file")) for its DNS checks"
+                fi
             fi
             local -a ce_args=()
             [[ -n "$nsf_file" ]] && ce_args+=(-nsf "$nsf_file")
@@ -164,9 +188,19 @@ run_phase2() {
             done
             ce_args+=(-l "${pdir}/cloud_enum_results.json" -f json -t "$THREADS")
 
-            timeout "${CLOUD_ENUM_TIMEOUT:-1800}" python3 \
-                /opt/tools/cloud_enum/cloud_enum.py "${ce_args[@]}" 2>>"$ce_log" || \
-                    log_warn "Cloud_Enum exited non-zero or was killed by CLOUD_ENUM_TIMEOUT -- see ${ce_log}"
+            local _ce_rc=0
+            timeout "${CLOUD_ENUM_TIMEOUT:-900}" python3 \
+                /opt/tools/cloud_enum/cloud_enum.py "${ce_args[@]}" 2>>"$ce_log" || _ce_rc=$?
+            if _was_capped "$_ce_rc"; then
+                # Observed: a real run spent its full 900s and was killed with
+                # 54 assets logged. The assets found are kept, but the run went
+                # on to report COMPLETE — cloud_enum was the one capped stage
+                # whose loss left no trace at all.
+                _record_truncation "all" "cloud_enum" "hit its ${CLOUD_ENUM_TIMEOUT:-900}s cap — cloud assets are partial"
+                log_warn "Cloud_Enum was KILLED at its ${CLOUD_ENUM_TIMEOUT:-900}s cap — cloud-asset coverage is PARTIAL (assets logged so far are kept)"
+            elif (( _ce_rc != 0 )); then
+                log_warn "Cloud_Enum exited non-zero (${_ce_rc}) -- see ${ce_log}"
+            fi
             # A non-zero exit does not necessarily mean the results are gone:
             # cloud_enum appends to its JSON log as it goes, so whatever it
             # logged before stopping is still parsed below. The usual trigger

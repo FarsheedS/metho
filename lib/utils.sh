@@ -143,6 +143,13 @@ load_resolvers() {
 DOH_PROXY_PID=""
 DOH_PROXY_PORT=""
 
+# The DoH proxy also listens on this bare-IP UDP port, so consumers that cannot
+# use an ephemeral HOST:PORT resolver (cloud_enum's dnspython dials UDP/53 with
+# a bare IP) stay on the DoH transport instead of silently leaving it for the
+# system resolver. 53 needs root, which the container has; the bind is
+# best-effort, so outside a container this degrades to the old behaviour.
+DOH_PROXY_EXTRA_PORT="${DOH_PROXY_EXTRA_PORT:-53}"
+
 # Directory holding this script, so the proxy can be found whether the tree is
 # mounted at /opt/scripts or run straight from a checkout.
 _metho_lib_dir() {
@@ -178,6 +185,8 @@ _load_doh_resolvers() {
         --host 127.0.0.1 \
         --port 0 \
         --port-file "$port_file" \
+        --extra-bind "127.0.0.1:${DOH_PROXY_EXTRA_PORT:-53}" \
+        --extra-port-file "${OUTPUT_DIR}/.doh_extra_port" \
         --endpoints "$endpoints" \
         --threads "${DOH_PROXY_THREADS:-128}" \
         --timeout "${DOH_PROXY_TIMEOUT:-4}" \
@@ -265,6 +274,10 @@ _doh_proxy_stop() {
     wait "$DOH_PROXY_PID" 2>/dev/null || true
     DOH_PROXY_PID=""
     DOH_PROXY_PORT=""
+    # The plain-IP listener died with the proxy. Leaving its port file behind
+    # would make _doh_plain_resolver_available keep saying "available" and
+    # point cloud_enum at a dead 127.0.0.1:53.
+    rm -f "${OUTPUT_DIR}/.doh_extra_port" 2>/dev/null || true
 }
 
 # Check the active transport is still usable before a batch depends on it.
@@ -433,6 +446,19 @@ _health_check_resolvers() {
 # True when every entry in the file is a bare IP address — no protocol prefix,
 # no port. Split out from _plain_ip_resolver_file so it can be tested without
 # touching the network.
+# Is the DoH proxy ALSO listening on a bare-IP address (normally 127.0.0.1:53)?
+#
+# cloud_enum's dnspython accepts bare IPs only and always dials UDP/53, so in
+# DoH mode it could not use the active resolver file at all and silently fell
+# back to the system resolver — a DIFFERENT DNS view from every other tool in
+# the run, which is exactly the split-horizon divergence DoH mode exists to
+# remove. The proxy binds the extra socket best-effort, so this can be false;
+# the caller falls back as before.
+_doh_plain_resolver_available() {
+    local f="${OUTPUT_DIR}/.doh_extra_port"
+    [[ -s "$f" ]] && grep -qx '53' "$f" 2>/dev/null
+}
+
 _resolver_file_is_plain_ips() {
     local f="$1" line
     [[ -s "$f" ]] || return 1
@@ -477,6 +503,13 @@ _plain_ip_resolver_file() {
     # not logged yet are lost.
     local out="${OUTPUT_DIR}/.sys_resolvers.txt"
     : > "$out"
+    # The DoH proxy's plain-IP listener goes FIRST when it exists: it is the only
+    # resolver here that gives cloud_enum the same view as the rest of the run.
+    # The fallbacks stay behind it, because cloud_enum does not catch
+    # dns.resolver.NoAnswer and a single unreachable nameserver aborts its run.
+    if _doh_plain_resolver_available; then
+        printf '%s\n' "127.0.0.1" >> "$out"
+    fi
     local sys
     sys=$(_probe_system_resolver)
     [[ -n "$sys" ]] && printf '%s\n' "$sys" >> "$out"
@@ -637,6 +670,29 @@ crtname_query() {
 bounded_parallel() {
     local concurrency="$1" input="$2" func="$3"; shift 3
     local running=0 _prev_errexit
+    # Optional stage deadline, passed in by the caller as an ABSOLUTE epoch
+    # second in METHO_STAGE_DEADLINE (0/empty = unlimited), with
+    # METHO_STAGE_LABEL naming the stage in log output.
+    #
+    # This is the aggregate bound the per-host caps cannot provide. CeWL and
+    # Katana each give a host up to 600s, so a stage's worst case is
+    # (hosts ÷ concurrency) × 600s — hours on a large target. Without an
+    # aggregate deadline the only thing that stops it is the per-domain
+    # watchdog, which kills the WHOLE domain worker mid-stage and takes the
+    # stages after it down too. That happened on a real run: CeWL was killed at
+    # 2,439/4,371 hosts and Katana, SubDomainizer and Stage 7 never ran.
+    local deadline="${METHO_STAGE_DEADLINE:-0}"
+    [[ "$deadline" =~ ^[0-9]+$ ]] || deadline=0
+    local label="${METHO_STAGE_LABEL:-stage}"
+    local _total=0
+    # `|| true` matters: this sits ABOVE the set +e guard below, and under
+    # `set -euo pipefail` an unreadable $input makes the redirect fail, the
+    # pipeline return non-zero and the whole run abort. Every input-reading
+    # statement used to live inside the guarded region; this one is new.
+    _total=$(wc -l < "$input" 2>/dev/null | tr -d '[:space:]' || true)
+    [[ "$_total" =~ ^[0-9]+$ ]] || _total=0
+    local _launched=0 _truncated=0
+    METHO_STAGE_TRUNCATED=0
     # Guard: a non-positive PARALLEL_HOSTS would mean no workers spawn.
     [[ "$concurrency" -lt 1 ]] && concurrency=1
     # Detect `wait -n` support (bash >= 4.3). Done once; cheap.
@@ -666,11 +722,19 @@ bounded_parallel() {
     case $- in *e*) _prev_errexit=1; set +e;; *) _prev_errexit=0;; esac
     while read -r line; do
         [[ -z "$line" ]] && continue
+        # Stop launching once the stage budget is spent. Checked before spawn so
+        # the stage cannot overshoot by one host's worth of work; the workers
+        # already in flight are terminated below.
+        if (( deadline > 0 )) && (( $(date +%s) >= deadline )); then
+            _truncated=1
+            break
+        fi
         # Workers read from /dev/null: a tool that ignores the caller's
         # stdin redirections (katana historically did) must not swallow the
         # remaining input lines this loop is still reading.
         ( "$func" "$line" "$@" || true ) < /dev/null &
         _pids+=("$!")
+        _launched=$((_launched + 1))
         running=$((running + 1))
         if (( running >= concurrency )); then
             if [[ "$_METHO_HAS_WAIT_N" == 1 ]]; then
@@ -684,8 +748,55 @@ bounded_parallel() {
             fi
         fi
     done < "$input"
-    _metho_wait_pids "${_pids[@]}"
+    if (( _truncated )); then
+        # Terminate the in-flight workers — and their DESCENDANTS. Killing the
+        # wrapper subshell alone leaves the tool it launched running: the
+        # crawlers invoke their tool through `timeout`, so the real work is a
+        # grandchild that survives the wrapper's death and keeps burning CPU,
+        # network and the target's rate budget into the following stages, for up
+        # to its own per-host cap. The budget has to stop the work, not just the
+        # loop that started it.
+        #
+        # Partial per-host output is kept on purpose: the crawlers write one
+        # file per host and the caller concatenates whatever exists, so a killed
+        # host yields "no words from that host", never a corrupt wordlist.
+        if [[ ${#_pids[@]} -gt 0 ]]; then
+            local _p
+            for _p in "${_pids[@]}"; do _metho_kill_tree "$_p"; done
+            sleep 2
+            for _p in "${_pids[@]}"; do _metho_kill_tree "$_p" KILL; done
+        fi
+        # The `${arr[@]+…}` guard is not decoration: an empty array expansion is
+        # FATAL under `set -u` on bash < 4.4, and the deadline-already-spent case
+        # (zero hosts launched) is exactly when the array is empty. The shipped
+        # image is bash 5.2, but the test suite is documented as runnable from a
+        # macOS checkout, where bash is 3.2.
+        _metho_wait_pids ${_pids[@]+"${_pids[@]}"}
+        METHO_STAGE_TRUNCATED=1
+        log_warn "${label}: stage budget reached after ${_launched}/${_total} hosts — remaining hosts skipped (per-host partial results kept)"
+        # Record it at RUN level too. A shell variable would not survive: the
+        # crawl stages run inside background subshells, so by the time the run
+        # summary is printed the flag is gone and an incomplete run looks
+        # complete. The run summary reads this file.
+        _record_truncation "${domain:-?}" "$label" "${_launched}/${_total} hosts"
+    else
+        _metho_wait_pids ${_pids[@]+"${_pids[@]}"}
+    fi
     [[ "$_prev_errexit" == 1 ]] && set -e
+}
+
+# Kill a process and everything it started.
+#
+# `kill <wrapper>` does not touch what the wrapper forked, and the per-host
+# workers all run their tool through `timeout` — so the actual crawl is a
+# grandchild that outlives the wrapper. Walk the tree depth-first with
+# `pgrep -P` and signal the leaves first, so nothing is reparented mid-walk.
+_metho_kill_tree() { # <pid> [TERM|KILL]
+    local pid="$1" sig="${2:-TERM}" child
+    for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+        _metho_kill_tree "$child" "$sig"
+    done
+    kill -"$sig" "$pid" 2>/dev/null || true
 }
 
 # Wait for specific PIDs only, never for "all children".
@@ -776,6 +887,37 @@ AUTO=false
 SKIP_PHASES=()
 THREADS=50
 RATE_LIMIT=100
+# httpx concurrency PER PROCESS. Never passed before this existed, so httpx ran
+# at its built-in default of 50 threads.
+#
+# That default, not the rate limit, is what bounded the probe. Measured on a
+# real run: 12,276 targets took 47m12s (4.34 targets/s) while the configured
+# 50/s never engaged, because 50 threads stalled in connect/read timeouts
+# divide out to ~4.5 targets/s (threads ÷ mean latency). Raise this and the
+# rate limit becomes the binding constraint, which is the intended order.
+#
+# Kept deliberately modest: this is the knob that decides how hard every target
+# is hit at once. HTTPX_THREADS_MAX is a hard ceiling so a fat-fingered or
+# scripted value cannot turn a sweep into a flood.
+HTTPX_THREADS="${HTTPX_THREADS:-150}"
+# httpx wall-clock ceiling, scaled per target like naabu's and nmap's.
+#
+# Until this existed httpx was the only long stage with NO cap at all. Phase 1
+# bounds it indirectly through the per-domain watchdog, but Phase 3's late probe
+# runs outside any watchdog — and that probe was measured re-sending ~7,978
+# targets — so a hung httpx there hung the entire run with no timeout, no
+# watchdog and no log line.
+#
+# 1s/target is a deliberate over-estimate of a stage that measured 0.23s/target
+# at 50 threads (and so ~0.077s at the current 150); the cap exists to bound a
+# hang, not to shape normal running, and must not truncate a legitimate round.
+HTTPX_TIMEOUT_BASE="${HTTPX_TIMEOUT_BASE:-60}"
+HTTPX_SECONDS_PER_TARGET="${HTTPX_SECONDS_PER_TARGET:-1}"
+HTTPX_TIMEOUT_MAX="${HTTPX_TIMEOUT_MAX:-3600}"
+# The clamp's error message tells the operator to raise this deliberately, so it
+# has to be raisable — a plain assignment here silently ignored the environment
+# and made that advice impossible to follow without editing this file.
+HTTPX_THREADS_MAX="${HTTPX_THREADS_MAX:-200}"
 CHECKPOINT_TIMEOUT=30
 OUTPUT_DIR="/output"
 CLOUD_ENUM_KEYWORDS=""
@@ -795,12 +937,47 @@ PARALLEL_HOSTS=5
 # merge_per_domain_dns combines them into the global TSV. I/O-bound workloads
 # (DNS, HTTP) tolerate higher concurrency than CPU-bound ones.
 PARALLEL_DOMAINS=3
+# How many hosts the wordlist-building and crawl stages may touch per domain
+# (CeWL at Stage 4a; Katana and SubDomainizer at Stage 6).
+#
+# Those stages crawl host-by-host with no natural bound, so on a large target
+# they run for tens of hours and then get cut off mid-stage by DOMAIN_TIMEOUT.
+# That is not hypothetical: a run with 4,371 live hosts spent 18 minutes in
+# CeWL, was killed by the 5,400s watchdog at 2,439 hosts, and never reached
+# Katana, SubDomainizer or Stage 7 at all.
+#
+# The marginal value falls off a cliff well before the whole live set — the
+# wordlist from host #600 is noise — so capping the input keeps these stages
+# proportional to what they actually contribute. 0 = unlimited.
+CEWL_MAX_HOSTS=150
+CRAWL_MAX_HOSTS=300
+# Wall-clock cap (seconds) for each crawl stage, independent of DOMAIN_TIMEOUT.
+# A host-count cap alone is not enough: per-host caps of 600s (CeWL/Katana)
+# multiply by the host count and can still outlast the domain budget.
+# 0 = unlimited.
+CRAWL_STAGE_TIMEOUT="${CRAWL_STAGE_TIMEOUT:-1200}"
 # Per-domain wall-clock cap (seconds) for Phase 1. A single pathological domain
 # (huge permutation set, or DNS grinding through per-query timeouts) must never
 # gate the whole parallel pool. A watchdog TERMs then KILLs that domain's worker
 # once it outlives the cap; already-written partial results are kept. 0 =
 # unlimited. Default 5400s (90m) is generous — it only catches genuine hangs.
 DOMAIN_TIMEOUT=5400
+# Probe hosts whose every address is reserved/private (status `bogon`).
+#
+# Those hosts are unreachable from the internet but NOT necessarily unreachable
+# from you: on a network routed into the target's private or CGNAT space they
+# answer normally, and on a real run two internal OpenSearch clusters replied
+# HTTP 200 from 100.64.x while being held out of the probe set entirely.
+#
+# HTTP only. `bogon` hosts stay out of the IP dataset, the ASN lookup, the
+# classification, naabu and nmap whatever this is set to: httpx re-resolves each
+# name itself so it needs no recorded address, whereas pointing a port scanner
+# at private space is a different and much less defensible action.
+#
+# Off by default because the cost is real when the space is NOT routed — each
+# such host then costs an httpx timeout, and the address may route to something
+# unrelated to the target. 549 hosts were in that bucket on the run above.
+METHO_PROBE_RESERVED="${METHO_PROBE_RESERVED:-0}"
 # ASN classification config file (shell-sourceable)
 ASN_CONFIG_FILE=""
 # Waymore mode: U (URLs only, default), B (URLs + response bodies).
@@ -812,13 +989,13 @@ WAYMORE_MODE="U"
 # Per-domain wall-clock cap for waymore. Mode U (URLs only) is much faster
 # than mode B (which downloads archived response bodies), so 600s is a sane
 # default; override with WAYMORE_TIMEOUT for very large domains.
-WAYMORE_TIMEOUT=600
+WAYMORE_TIMEOUT="${WAYMORE_TIMEOUT:-600}"
 # Cloud_Enum wall-clock cap. The fuzz list checks most common bucket names
 # first (dev, staging, test, prod, …), so the highest-value permutations
 # happen early. 900s (15 min) covers the vast majority of useful checks;
 # the previous 1800s default spent the second 15 min on low-probability
 # mutations that rarely yield findings.
-CLOUD_ENUM_TIMEOUT=900
+CLOUD_ENUM_TIMEOUT="${CLOUD_ENUM_TIMEOUT:-900}"
 
 # Cap dnsgen input subdomain count. dnsgen v2 default mode yields
 # ~800-1100 permutations per input — 500 inputs → up to ~561K candidates.
@@ -826,7 +1003,7 @@ CLOUD_ENUM_TIMEOUT=900
 # permutation yield drops to near zero anyway (passive sources saturate
 # coverage — reconftw uses the same 500 threshold). Resolved hostnames
 # are prioritized. Set to 0 to disable the cap.
-DNSGEN_MAX_INPUT=500
+DNSGEN_MAX_INPUT="${DNSGEN_MAX_INPUT:-500}"
 
 # Skip dnsgen entirely when a domain has more than this many discovered
 # subdomains. Default is deliberately AGGRESSIVE (100): permutation multiplies
@@ -837,32 +1014,71 @@ DNSGEN_MAX_INPUT=500
 # permute; everything else relies on passive + brute coverage. Raise it for a
 # focused single-domain deep run, use --skip-permutation to disable entirely,
 # or set to 0 to never skip (permute every domain — not recommended at scale).
-DNSGEN_SKIP_THRESHOLD=100
+DNSGEN_SKIP_THRESHOLD="${DNSGEN_SKIP_THRESHOLD:-100}"
 
 # Hard cap on dnsgen output size in bytes (default 25MB ≈ ~350K
 # candidates). Safety net against permutation explosion before the
 # resolution stage.
-DNSGEN_MAX_OUTPUT_BYTES=26214400
+DNSGEN_MAX_OUTPUT_BYTES="${DNSGEN_MAX_OUTPUT_BYTES:-26214400}"
 
 # Naabu packets-per-second cap for the top-1000 SYN sweep. 1000 pps is
 # reconftw's NAABU_RATE default: fast enough that 1000 hosts × 1000 ports
 # finish well within the timeout, throttled enough to avoid saturating
 # the uplink or tripping IPS on the target edge.
-NAABU_RATE=1000
+NAABU_RATE="${NAABU_RATE:-1000}"
 # Naabu SYN retransmit count. 2 matches reconftw's --max-retries default
 # (one initial probe + 2 retries): resilient to single-packet loss
 # without multiplying noise on filtered ports.
-NAABU_RETRIES=2
+NAABU_RETRIES="${NAABU_RETRIES:-2}"
+
+# Naabu top-N ports. 100, not 1000.
+#
+# The port list is the dominant term in the sweep's cost AND in its exposure.
+# At 1,000 ports a 6,501-host sweep is ~6.5M SYNs — ~1.8 hours of continuous SYN
+# traffic from a single IP against the target's own ranges, which is exactly what
+# a mature SOC's IDS is built to notice. At 100 ports it is ~650k SYNs, about
+# 11 minutes, and top-100 still covers essentially every service that matters
+# for recon. Raise it deliberately for a small, targeted sweep; do not raise it
+# while the candidate list is in the thousands.
+NAABU_TOP_PORTS="${NAABU_TOP_PORTS:-100}"
 
 # Naabu wall-clock cap. 0 (default) = derive it from the target count as
-# NAABU_TIMEOUT_BASE + hosts × NAABU_SECONDS_PER_HOST, capped at 1h. A fixed
-# cap silently truncates large sweeps: 423 hosts × 1000 ports at 1000 pps
-# needs ~423s of pure sending before any retransmit, which the old 600s
-# default did not leave room for. Set NAABU_TIMEOUT to a positive value to
-# pin it explicitly.
-NAABU_TIMEOUT=0
+# NAABU_TIMEOUT_BASE + hosts × NAABU_SECONDS_PER_HOST, capped at
+# NAABU_TIMEOUT_MAX. Set NAABU_TIMEOUT to a positive value to pin it explicitly.
+NAABU_TIMEOUT="${NAABU_TIMEOUT:-0}"
 NAABU_TIMEOUT_BASE="${NAABU_TIMEOUT_BASE:-300}"
-NAABU_SECONDS_PER_HOST="${NAABU_SECONDS_PER_HOST:-2}"
+# Seconds of sending per host ≈ top_ports ÷ rate × (1 + retries): at 100 ports,
+# 1000 pps and 2 retries that is ~0.3s, so 1 is a deliberately conservative
+# integer. This constant is not decoration — it sets both the projected sweep
+# time and the chunk size, so it must be recalibrated if NAABU_TOP_PORTS or
+# NAABU_RATE changes. (It said 2 against a 1000-port default, which is how a
+# projection of 13,302s appeared next to a sweep that could never take that
+# long either way.)
+NAABU_SECONDS_PER_HOST="${NAABU_SECONDS_PER_HOST:-1}"
+# Per-chunk ceiling. Together with the constants above it sets the chunk size as
+# (cap − base) ÷ per-host, and it is also the worst case for ONE hung chunk: at
+# 1200s a stuck chunk costs 20 minutes rather than an hour, and the real need for
+# a 900-host/100-port chunk is ~90s, so the headroom is ample.
+NAABU_TIMEOUT_MAX="${NAABU_TIMEOUT_MAX:-1200}"
+# Ceiling on the WHOLE sweep, across all chunks (0 = 4 × NAABU_TIMEOUT_MAX).
+# naabu's cost is linear in the candidate count, so a big enough target cannot
+# fit in one NAABU_TIMEOUT_MAX window. Phase 3 chunks the candidate list so the
+# whole set is covered, and this is the point at which it stops trying and
+# records the sweep as incomplete instead of pretending otherwise.
+NAABU_TOTAL_TIMEOUT_MAX="${NAABU_TOTAL_TIMEOUT_MAX:-0}"
+# nmap -sV wall-clock ceiling. Until now the nmap call had NO timeout at all,
+# which matters most on its fallback path (naabu found nothing, so every
+# candidate is handed to -sV): 6,501 hosts × a 33-port version scan can outlast
+# the rest of the run. Scaled per host like naabu and capped by NMAP_TIMEOUT_MAX.
+NMAP_TIMEOUT_BASE="${NMAP_TIMEOUT_BASE:-60}"
+NMAP_SECONDS_PER_HOST="${NMAP_SECONDS_PER_HOST:-30}"
+NMAP_TIMEOUT_MAX="${NMAP_TIMEOUT_MAX:-3600}"
+# How many hosts a port must have been seen open on before nmap -sV spends time
+# on it. The -sV port list is global (one list for every target), so a port seen
+# once gets probed across the whole estate; on a real run 226 of 247 discovered
+# ports came from GCP front-end artefacts on 2 hosts each. Well-known ports
+# (<1024) bypass this floor. 1 = no floor (previous behaviour).
+NMAP_MIN_PORT_HOSTS="${NMAP_MIN_PORT_HOSTS:-2}"
 
 # Cap on how many ports nmap -sV service-detects in Stage 4b. naabu already
 # records EVERY open port (they are merged into the final ip_port_pairs), so
@@ -903,12 +1119,16 @@ parse_args() {
             --skip-cloud)     SKIP_PHASES+=("2"); shift ;;
             --no-port-scan)   PORT_SCAN=false; shift ;;
             --skip-permutation) SKIP_PERMUTATION=true; shift ;;
+            --probe-reserved) METHO_PROBE_RESERVED=1; shift ;;
             --threads)        _require_int "$1" "$2"; THREADS="$2"; shift 2 ;;
             --parallel-hosts) _require_int "$1" "$2"; PARALLEL_HOSTS="$2"; shift 2 ;;
             --parallel-domains) _require_int "$1" "$2"; PARALLEL_DOMAINS="$2"; shift 2 ;;
             --doh-proxy-threads) _require_int "$1" "$2"; DOH_PROXY_THREADS="$2"; shift 2 ;;
             --domain-timeout) _require_int "$1" "$2"; DOMAIN_TIMEOUT="$2"; shift 2 ;;
             --rate-limit)     _require_int "$1" "$2"; RATE_LIMIT="$2"; shift 2 ;;
+            --httpx-threads)  _require_int "$1" "$2"; HTTPX_THREADS="$2"; shift 2 ;;
+            --cewl-max-hosts) _require_int "$1" "$2"; CEWL_MAX_HOSTS="$2"; shift 2 ;;
+            --crawl-max-hosts) _require_int "$1" "$2"; CRAWL_MAX_HOSTS="$2"; shift 2 ;;
             --nmap-top-ports) _require_int "$1" "$2"; NMAP_TOP_PORTS="$2"; shift 2 ;;
             --timeout)        _require_int "$1" "$2"; CHECKPOINT_TIMEOUT="$2"; shift 2 ;;
             --output)         OUTPUT_DIR="$2"; shift 2 ;;
@@ -943,6 +1163,10 @@ parse_args() {
                 echo "  --skip-cloud              Shorthand for --skip-phase 2"
                 echo "  --no-port-scan            Skip port scanning phase"
                 echo "  --skip-permutation        Disable dnsgen permutation brute force (Stage 4b) for all domains"
+                echo "  --probe-reserved          ALSO probe hosts whose only addresses are reserved/private"
+                echo "                            (status 'bogon'). They are unreachable from the internet but"
+                echo "                            reachable on a network routed into the target's private/CGNAT"
+                echo "                            space. HTTP only — they are still never port-scanned." 
                 echo "  --threads N               Cloud_Enum thread count (default: 50). dnsx concurrency is"
                 echo "                            transport-aware — see DNSX_THREADS_DOH/_UDP"
                 echo "  --parallel-hosts N         Hosts crawled in parallel per tool (default: 5)"
@@ -953,6 +1177,14 @@ parse_args() {
                 echo "                            dnsx's own timeout and are recorded as 'timeout'"
                 echo "  --domain-timeout N        Per-domain wall-clock cap in seconds (default: 5400; 0=off)"
                 echo "  --rate-limit N            Requests/second (default: 100)"
+                echo "  --httpx-threads N         httpx threads per process (default: 150, hard maximum"
+                echo "                            ${HTTPX_THREADS_MAX}). This, not --rate-limit, is what bounds"
+                echo "                            probe throughput. Values above the maximum are clamped"
+                echo "                            and reported, not honoured silently."
+                echo "  --cewl-max-hosts N        Max live hosts CeWL may crawl for the brute-force"
+                echo "                            wordlist (default: 150; 0=unlimited)"
+                echo "  --crawl-max-hosts N       Max live hosts Katana/SubDomainizer may crawl"
+                echo "                            (default: 300; 0=unlimited)"
                 echo "  --nmap-top-ports N        Cap nmap -sV to the N most-common open ports (default: 100; 0=no cap)"
                 echo "  --timeout N               Checkpoint auto-continue seconds (default: 30)"
                 echo "  --output DIR              Output directory (default: /output)"
@@ -1018,6 +1250,44 @@ validate_args() {
         U|B) ;;
         *) log_error "Invalid --waymore-mode: $WAYMORE_MODE (must be U or B; R is not supported because the pipeline consumes URL output)"; exit 1 ;;
     esac
+
+    # ── httpx thread ceiling ────────────────────────────────────────────────
+    # Clamped rather than rejected: this is a tuning knob, and refusing to
+    # start over it would be worse than running at the documented ceiling. The
+    # clamp is always reported, because silently ignoring a requested value is
+    # how "I set 500 and it still took an hour" becomes unexplainable.
+    if (( HTTPX_THREADS > HTTPX_THREADS_MAX )); then
+        log_warn "HTTPX_THREADS=${HTTPX_THREADS} exceeds the ${HTTPX_THREADS_MAX}-thread ceiling — clamping to ${HTTPX_THREADS_MAX}."
+        log_warn "  Raise the ceiling deliberately via HTTPX_THREADS_MAX if you intend to hit targets harder."
+        HTTPX_THREADS="$HTTPX_THREADS_MAX"
+    fi
+    if (( HTTPX_THREADS < 1 )); then
+        log_warn "HTTPX_THREADS=${HTTPX_THREADS} is not usable — using 1."
+        HTTPX_THREADS=1
+    fi
+    export HTTPX_THREADS
+    # METHO_PROBE_RESERVED is read inside per-domain subshells and by Phase 3.
+    export METHO_PROBE_RESERVED
+
+    # ── DoH proxy sizing ────────────────────────────────────────────────────
+    # In DoH mode every tool's DNS goes through ONE local proxy with a fixed
+    # worker pool. The in-flight count against it is at least
+    #     PARALLEL_DOMAINS × (dnsx threads)
+    # and when that exceeds the pool, surplus queries queue past the client's
+    # own timeout and are recorded as unresolved hosts — the exact failure the
+    # proxy exists to avoid. Shipped defaults were 3 × 64 = 192 against 128
+    # workers, i.e. over budget before httpx's own lookups are counted, and
+    # nothing validated the invariant the README states. Now something does.
+    if [[ "$DNS_MODE" == "doh" ]]; then
+        local _doh_pool="${DOH_PROXY_THREADS:-128}"
+        local _dnsx_each="${DNSX_THREADS:-${DNSX_THREADS_DOH:-64}}"
+        local _workers="${PARALLEL_DOMAINS:-3}"
+        local _dns_inflight=$(( _workers * _dnsx_each ))
+        if (( _dns_inflight > _doh_pool )); then
+            log_warn "DoH proxy undersized: ${_workers} domains × ${_dnsx_each} dnsx threads = ${_dns_inflight} in flight against ${_doh_pool} proxy workers."
+            log_warn "  Surplus queries queue past dnsx's own timeout and are recorded as 'timeout'. Raise --doh-proxy-threads to >= ${_dns_inflight}, or lower DNSX_THREADS_DOH."
+        fi
+    fi
 }
 
 # Resolve domain input (--domains or --domains-file) into a file path.
@@ -1119,8 +1389,25 @@ setup_dirs() {
     # succeed instantly against a proxy that is not running, which is how you
     # get a whole run resolving against a dead port.
     rm -f "${OUTPUT_DIR}/.doh_proxy.port" \
+          "${OUTPUT_DIR}/.doh_extra_port" \
           "${OUTPUT_DIR}/doh_resolvers.txt" \
           "${OUTPUT_DIR}/.sys_resolvers.txt"
+    # Run-level state that ACCUMULATES or is MERGED INTO, and therefore must not
+    # survive into a new run in a reused output directory. Reuse is expected —
+    # the proxy-file reset above exists precisely because it happens.
+    #   stage_truncations.txt  appended per truncation; a stale one makes a
+    #                          clean run report itself INCOMPLETE, and the
+    #                          counts double up across runs.
+    #   httpx_probed.txt       append-only ledger of every host handed to httpx.
+    #                          Stale entries make Phase 3's late pass skip hosts
+    #                          this run never probed — silent coverage loss, the
+    #                          exact failure the ledger was added to prevent.
+    #   httpx_metadata.tsv     written only when a merge produces rows, so a
+    #                          leftover file is merged into rather than replaced
+    #                          and keeps hosts that no longer answer.
+    rm -f "${OUTPUT_DIR}/stage_truncations.txt" \
+          "${OUTPUT_DIR}/httpx_probed.txt" \
+          "${OUTPUT_DIR}/httpx_metadata.tsv"
     chmod -R 777 "$OUTPUT_DIR" 2>/dev/null || true
 }
 
@@ -1147,6 +1434,127 @@ validate_deps() {
 # No -ports flag = much faster, covers the vast majority of web services.
 # No -mc flag = show all responses (equivalent to listing every status code).
 #
+# ── Probe ledger: every hostname handed to httpx, responders or not ──────────
+# Phase 3's late pass exists to probe hosts discovered after the last Phase 1
+# round, so it needs the set of hosts ALREADY PROBED. The only record that
+# existed was httpx_metadata.tsv, which is built from httpx's -o output and so
+# contains RESPONDERS ONLY. A host that was probed and stayed silent therefore
+# looked unprobed and was probed a second time — 7,905 targets on a real run,
+# about 64% of a 47-minute round, for zero new information.
+#
+# Scoped exactly like CANONICAL_DNS_TSV: each Phase 1 domain worker writes its
+# own ledger via METHO_HTTPX_LEDGER, merge_per_domain_dns folds them into the
+# global one, and Phase 3's late probe diffs against that.
+# ── Stage budgets for the host-by-host crawling stages ───────────────────────
+# Absolute epoch deadline from a duration in seconds. 0/empty/non-numeric means
+# unlimited, and is reported as 0 so bounded_parallel skips the check entirely
+# (passing a raw 0 would otherwise read as "the deadline was 1970" and truncate
+# the stage before its first host).
+_stage_deadline() {
+    local secs="${1:-0}"
+    if [[ "$secs" =~ ^[0-9]+$ ]] && (( secs > 0 )); then
+        echo $(( $(date +%s) + secs ))
+    else
+        echo 0
+    fi
+}
+
+# Cap a live-host list for a crawling stage. Echoes "<kept> <total>".
+#
+# CeWL, Katana and SubDomainizer crawl host-by-host with no natural bound, so on
+# a large target they outlast the domain budget and get killed mid-stage — which
+# takes every later stage down with them. The cap keeps a stage proportional to
+# what it contributes. What was dropped is always reported: a silent cap looks
+# exactly like a stage that ran and found nothing, which is the failure mode
+# this pipeline keeps rediscovering.
+#
+# 0 = unlimited (previous behaviour).
+_cap_crawl_hosts() {
+    local input="$1" cap="$2" output="$3" label="${4:-stage}"
+    local total=0 kept=0
+    # `wc -l < file` is space-padded on BSD/macOS, and this value is echoed back
+    # to the caller as "<kept> <total>", so strip the padding here rather than
+    # making every caller parse around it.
+    total=$(wc -l < "$input" 2>/dev/null | tr -d '[:space:]')
+    [[ "$total" =~ ^[0-9]+$ ]] || total=0
+    if (( cap > 0 )) && (( total > cap )); then
+        head -n "$cap" "$input" > "$output" 2>/dev/null || : > "$output"
+        kept=$(wc -l < "$output" 2>/dev/null | tr -d '[:space:]')
+        [[ "$kept" =~ ^[0-9]+$ ]] || kept=0
+        # To STDERR: this function's stdout is captured by the caller as
+        # "<kept> <total>", and log_warn writes to stdout. A log line here
+        # silently becomes part of the returned value — the same defect that
+        # once handed cloud_enum a two-line -nsf argument.
+        log_warn "  ${label}: input capped at ${cap} of ${total} hosts — the remainder is skipped (raise the cap, or set it to 0 for unlimited)" >&2
+    else
+        cp "$input" "$output" 2>/dev/null || cat "$input" > "$output" 2>/dev/null || : > "$output"
+        kept=$total
+    fi
+    echo "${kept:-0} ${total:-0}"
+}
+
+# Wall-clock cap for a scan of <n> targets: base overhead plus a per-target
+# allowance, bounded by a ceiling.
+#
+# Shared by every bounded scan — naabu chunks, nmap -sV and the httpx rounds —
+# so the same "a small target keeps a tight timeout, a large one keeps a real
+# one" rule applies everywhere instead of each stage inventing its own.
+_scaled_scan_cap() { # <n_targets> <base_overhead> <seconds_per_target> <cap>
+    local actual="${1:-0}" base="${2:-300}" per="${3:-2}" cap="${4:-3600}"
+    local t=$(( base + actual * per ))
+    (( t > cap )) && t="$cap"
+    (( t < 1 )) && t=1
+    echo "$t"
+}
+
+_httpx_ledger_path() {
+    echo "${METHO_HTTPX_LEDGER:-${OUTPUT_DIR:-/output}/httpx_probed.txt}"
+}
+
+# ── Record a truncation ──────────────────────────────────────────────────────
+# One writer, one format. Four call sites hand-rolled this printf, which is
+# precisely how the nmap variant ended up with a different field shape from the
+# rest — and the filename is read by two loops that only agree on the format by
+# convention.
+#
+#   _record_truncation <domain|all> <stage> <detail>
+_record_truncation() {
+    mkdir -p "${OUTPUT_DIR:-/output}" 2>/dev/null || true
+    printf '%s\t%s\t%s\n' "${1:-?}" "${2:-stage}" "${3:-}" \
+        >> "${OUTPUT_DIR:-/output}/stage_truncations.txt" 2>/dev/null || true
+}
+
+# Did timeout(1) kill the command? 124 is its own exit status.
+#
+# Recording on 124 rather than on "non-zero" matters. A stage that failed for its
+# own reason is a different finding from one cut off mid-work, and only the
+# latter means everything downstream of it is a lower bound. Treating every
+# non-zero exit as truncation would cry wolf on the tool failures that are
+# routine (a passive source with no token, an empty grep).
+_was_capped() { [[ "${1:-0}" -eq 124 ]]; }
+
+# Append a round's input to the ledger. Called AFTER the round returns: the
+# ledger's job is "do not probe this again", and a round that was killed before
+# it could run its targets should not claim them — re-probing is the safe
+# direction to err in, and it is what happened before this existed.
+httpx_ledger_record() {
+    local input_file="$1"
+    [[ -s "$input_file" ]] || return 0
+    local ledger
+    ledger=$(_httpx_ledger_path)
+    mkdir -p "$(dirname "$ledger")" 2>/dev/null || true
+    cat "$input_file" >> "$ledger" 2>/dev/null || true
+}
+
+# Already-probed hostnames, sorted and deduped. Missing ledger prints nothing.
+httpx_ledger_read() {
+    local ledger
+    ledger=$(_httpx_ledger_path)
+    if [[ -s "$ledger" ]]; then
+        sort -u "$ledger"
+    fi
+}
+
 # HTTPX flags for rich metadata:
 #   -cdn            detect CDN and include cdn field in JSON output
 #   -status-code    include HTTP status code
@@ -1213,7 +1621,14 @@ httpx_probe() {
         log_info "httpx: not on the DoH transport (DNS_MODE=${DNS_MODE}) — probing via the system resolver; IPs may differ from the canonical dataset"
     fi
 
-    cat "$input_file" | httpx \
+    # Bound the round. See HTTPX_TIMEOUT_MAX for why this did not exist before:
+    # Phase 3's late probe has no watchdog above it, so an unbounded httpx there
+    # could hang the whole run.
+    local _probe_cap _httpx_rc=0
+    _probe_cap=$(_scaled_scan_cap "$target_count" "${HTTPX_TIMEOUT_BASE:-60}" \
+        "${HTTPX_SECONDS_PER_TARGET:-1}" "${HTTPX_TIMEOUT_MAX:-3600}")
+
+    cat "$input_file" | timeout "$_probe_cap" httpx \
         ${_httpx_resolver_args[@]+"${_httpx_resolver_args[@]}"} \
         -silent \
         -json \
@@ -1223,10 +1638,20 @@ httpx_probe() {
         -tech-detect \
         -web-server \
         -content-length \
+        -threads "$HTTPX_THREADS" \
         -timeout 10 \
         -retries 2 \
         -rate-limit "$_rl" \
-        -o "$output_json" > /dev/null 2>"$httpx_log" || true
+        -o "$output_json" > /dev/null 2>"$httpx_log" || _httpx_rc=$?
+
+    if _was_capped "$_httpx_rc"; then
+        _record_truncation "${domain:-all}" "httpx" "hit its ${_probe_cap}s cap over ${target_count} targets — results are partial"
+        log_warn "httpx was KILLED at its ${_probe_cap}s cap over ${target_count} targets — results are PARTIAL (whatever flushed is kept)"
+    fi
+
+    # Ledger the round's input (responders AND non-responders) so Phase 3 can
+    # tell "already probed" from "never probed". See httpx_ledger_record.
+    httpx_ledger_record "$input_file"
 
     local count=0
     if [[ -s "$output_json" ]]; then

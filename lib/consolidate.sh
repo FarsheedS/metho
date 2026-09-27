@@ -87,6 +87,15 @@ run_consolidation() {
     local ip_total=0
     [[ -s "${fdir}/final_ip_addresses.txt" ]] && ip_total=$(wc -l < "${fdir}/final_ip_addresses.txt")
 
+    # IPv6 is reported separately rather than appended: this file is the IPv4
+    # scan-target inventory, and mixing families into it would make every
+    # consumer (and the next person reading it) handle two shapes. The AAAA
+    # column used to be collected by the DNS layer and then never surfaced
+    # anywhere, so an IPv6-only asset was invisible past httpx.
+    cat "${OUTPUT_DIR}/phase3/all_ips_v6.txt" 2>/dev/null | sort -u > "${fdir}/final_ip_addresses_v6.txt" || true
+    local ip_total_v6=0
+    [[ -s "${fdir}/final_ip_addresses_v6.txt" ]] && ip_total_v6=$(wc -l < "${fdir}/final_ip_addresses_v6.txt" | tr -d '[:space:]')
+
     # ── IP Classification ───────────────────────────────────────────────────
     if [[ -s "${OUTPUT_DIR}/phase3/ip_classification.tsv" ]]; then
         cp "${OUTPUT_DIR}/phase3/ip_classification.tsv" "${fdir}/final_ip_classification.tsv"
@@ -103,6 +112,11 @@ run_consolidation() {
 
     # ── Nmap Candidates ────────────────────────────────────────────────────
     cat "${OUTPUT_DIR}/phase3/nmap_candidates.txt" 2>/dev/null | sort -u -V > "${fdir}/final_nmap_candidates.txt" || true
+
+    # Ports that accepted a connection but identified no service (`tcpwrapped`).
+    # Kept separate rather than dropped: on one run they were the ONLY record of
+    # 1,765 port/host pairs. They are just not ranked beside a real service.
+    cat "${OUTPUT_DIR}/phase3/nmap_ip_ports_tcpwrapped.txt" 2>/dev/null | sort -u > "${fdir}/final_ip_port_pairs_tcpwrapped.txt" || true
 
     # ── Domain→IP Mapping ──────────────────────────────────────────────────
     cat "${OUTPUT_DIR}/phase3/domain_ip_map.txt" 2>/dev/null | sort -u > "${fdir}/final_domain_ip_map.txt" || true
@@ -132,6 +146,7 @@ ASSETS DISCOVERED:
 - ASNs:               ${asn_total}
 - Network Ranges:     ${network_total}
 - IP Addresses:       ${ip_total}
+- IPv6 Addresses:     ${ip_total_v6:-0} (inventory only - not port-scanned)
 - IP:Port Pairs:      ${port_pair_total}
 
 IP CLASSIFICATION:
@@ -151,7 +166,8 @@ FILES CREATED IN final/:
 - final_asn_list.txt             (ASN numbers)
 - final_asn_summary.txt          (ASNs sorted by IP count)
 - final_network_ranges.txt       (CIDR blocks)
-- final_ip_addresses.txt         (all resolved IPs)
+- final_ip_addresses.txt         (all resolved IPv4 addresses)
+- final_ip_addresses_v6.txt      (all resolved IPv6 addresses - inventory only)
 - final_ip_classification.tsv   (IP classification: CDN/cloud/dedicated/unknown)
 - final_ip_port_pairs.txt        (IP:port from non-CDN scan)
 - final_cdn_ips.txt              (CDN-associated IPs)
