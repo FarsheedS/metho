@@ -31,44 +31,43 @@ _naabu_chunk_hosts() { # <cap> <base_overhead> <seconds_per_host>
     echo "$n"
 }
 
-# Build the nmap -sV port union from naabu's results. Echoes a comma-separated
-# port list (empty when there is nothing corroborated enough to probe).
+# Group hosts by the exact set of ports naabu found open on them, so nmap -sV
+# probes each host ONLY on its own open ports instead of one global union applied
+# to every host. That union re-probed ~98 closed ports per host under -Pn and
+# threw away naabu's per-host narrowing — the whole reason the two stages exist.
 #
-# The union is GLOBAL — one port list applied to every target — so a port that
-# only ever appeared on a single odd host gets probed against the whole estate.
-# On a live run 226 of 247 discovered ports appeared on exactly 2 hosts, all of
-# them GCP front-end artefacts, and they filled the union end to end. Hence the
-# support floor: a port must have been seen open on at least <min_hosts> hosts,
-# unless it is well-known (<1024), where an open port is almost always real and
-# there are few enough of them to keep unconditionally.
-_nmap_port_union() { # <naabu ip:port file> [top_n] [min_hosts] [excluded_out]
-    local f="$1" n="${2:-100}" min="${3:-2}" exf="${4:-}"
-    [[ -s "$f" ]] || { echo ""; return 0; }
-    [[ -n "$exf" ]] && : > "$exf"
-    # One pass that both selects and explains. Ports naabu found open but which
-    # do not make this list are written to <excluded_out> with the host count and
-    # the reason, because the two rules that drop them — the NMAP_MIN_PORT_HOSTS
-    # floor and the NMAP_TOP_PORTS cap — are exactly the kind that silently delete
-    # a real finding. That happened: naabu found 88.134.246.114:8080 open, the
-    # floor kept 8080 out of the union, and the one non-standard service the sweep
-    # discovered was the one port nmap was never pointed at. The list is not the
-    # finding of record — ip_port_pairs still carries every naabu port — but the
-    # decision now leaves a trace instead of being invisible.
-    cut -d: -f2 "$f" | sort | uniq -c | sort -rn \
-        | awk -v n="$n" -v min="$min" -v exf="$exf" '
-            {
-                ok = ($1 >= min || $2 < 1024)
-                why = ""
-                if (!ok) {
-                    why = "below the " min "-host floor (open on " $1 " host(s))"
-                } else if (n > 0 && c >= n) {
-                    ok = 0
-                    why = "beyond the top-" n " cap"
-                }
-                if (ok) { print $2; c++ }
-                else if (exf != "") print $2 "\t" $1 "\t" why > exf
+#   $1 = naabu "ip:port" file
+#   $2 = max ports per host (NMAP_TOP_PORTS; 0 = unlimited). naabu's own top-N
+#        already bounds this, but the guard stays independent of NAABU_TOP_PORTS
+#        and stops a single tarpit host from ballooning its group's -sV cost;
+#        when it trims, it keeps the lowest-numbered ports (well-known first).
+#
+# Emits one line per distinct port-set: "<sorted,csv,ports>\t<space-separated ips>".
+# Pure text transform (split out of run_phase3) so it is unit-testable without
+# nmap; output is sorted for determinism.
+_nmap_portset_groups() { # <naabu ip:port file> [max_ports_per_host]
+    local f="$1" max="${2:-0}"
+    [[ -s "$f" ]] || return 0
+    awk -F: -v max="$max" '
+        !seen[$1 SUBSEP $2]++ {
+            ports[$1] = ports[$1] (ports[$1] ? "," : "") $2
+            if (!($1 in o)) { ord[++k] = $1; o[$1] = 1 }
+        }
+        END {
+            for (h = 1; h <= k; h++) {
+                ip = ord[h]
+                n = split(ports[ip], a, ",")
+                for (i = 1; i <= n; i++)
+                    for (j = i + 1; j <= n; j++)
+                        if (a[j] + 0 < a[i] + 0) { t = a[i]; a[i] = a[j]; a[j] = t }
+                lim = (max > 0 && n > max) ? max : n
+                key = ""
+                for (i = 1; i <= lim; i++) key = key (i > 1 ? "," : "") a[i]
+                group[key] = group[key] (group[key] ? " " : "") ip
             }
-        ' | sort -un | paste -sd, -
+            for (g in group) print g "\t" group[g]
+        }
+    ' "$f" | sort
 }
 
 # Split nmap's greppable output into ports where a service was identified and
@@ -621,79 +620,72 @@ run_phase3() {
         # If naabu found nothing (or is absent), fall back to the fixed port
         # list over all candidates — keeps coverage when Stage 4a failed.
         if command -v nmap &>/dev/null; then
-            local nmap_ports="" nmap_targets="${pdir}/nmap_candidates.txt"
+            # Per-host scanning. naabu (Stage 4a) already found which ports are
+            # open on each host, so -sV probes each host ONLY on ITS OWN ports.
+            # The previous code built a GLOBAL port union and applied all of it to
+            # every host, which under -Pn re-probed ~98 closed ports per host
+            # (e.g. 477 hosts × 99 union ports ≈ 47k probes vs the ~617 naabu
+            # actually found) — that threw away naabu's per-host narrowing, the
+            # whole reason the two stages exist, and made -sV the runaway cost.
+            # Hosts are grouped by identical port-set so nmap keeps its batch
+            # parallelism within each group. Every naabu port is scanned, so
+            # nothing is excluded from -sV; the file is truncated for compat.
+            : > "${pdir}/port_scan_results.txt"
+            : > "${pdir}/nmap_ports_excluded.txt"
+            local _nmap_rc=0 _nmap_cap
             if [[ "$naabu_found" -gt 0 ]]; then
-                # Cap -sV to the top-N most-common open ports (ports open on the
-                # most hosts) to stop the port union from ballooning into a
-                # ~1000-port × N-host scan. naabu's full per-host results are
-                # still merged into ip_port_pairs below, so no port is lost from
-                # the inventory — only version detection is bounded.
-                # Build the -sV port union from CORROBORATED ports only.
-                #
-                # The union is global — one port list applied to every target —
-                # so a port seen on a single odd host gets probed across the
-                # whole estate. NMAP_MIN_PORT_HOSTS is that floor; well-known
-                # ports (<1024) are exempt, because there are few of them and an
-                # open one is almost always real.
-                #
-                # The floor is the SECOND line of defence, not the first. On a
-                # real run 226 of 247 ports appeared on exactly 2 hosts — GCP
-                # front-end artefacts — and a floor of 2 does not exclude those.
-                # What removes them is NMAP_INCLUDE_CLOUD=0 (lib/classify.sh):
-                # every host that answered on more than 5 ports was a Google
-                # Cloud address, so excluding cloud removes the population, and
-                # with it the ports. Raise this floor to 3 only if artefact
-                # ports start surviving that exclusion — it costs real ports on
-                # redundant pairs (two mail servers on 587, say).
-                nmap_ports=$(_nmap_port_union "${pdir}/naabu_ip_ports.txt" \
-                    "${NMAP_TOP_PORTS:-100}" "${NMAP_MIN_PORT_HOSTS:-1}" \
-                    "${pdir}/nmap_ports_excluded.txt")
-                # Report what the floor/cap kept out of -sV. Recorded, not just
-                # logged: these ports ARE in naabu_ip_ports and the final
-                # ip_port_pairs, so they are not lost — but they carry no service
-                # identification, and the operator should be able to see which
-                # ones and why without re-reading this function.
-                if [[ -s "${pdir}/nmap_ports_excluded.txt" ]]; then
-                    local _nmap_exc
-                    _nmap_exc=$(wc -l < "${pdir}/nmap_ports_excluded.txt" | tr -d '[:space:]')
-                    log_info "    ${_nmap_exc} open port(s) excluded from -sV (below the ${NMAP_MIN_PORT_HOSTS:-1}-host floor or beyond the top-${NMAP_TOP_PORTS:-100} cap) — listed in phase3/nmap_ports_excluded.txt"
-                fi
-                # Target list = only hosts with naabu-confirmed open ports
+                local _nmap_target_count _grp_total
                 cut -d: -f1 "${pdir}/naabu_ip_ports.txt" | sort -u > "${pdir}/nmap_target_hosts.txt"
-                if [[ -s "${pdir}/nmap_target_hosts.txt" ]]; then
-                    nmap_targets="${pdir}/nmap_target_hosts.txt"
+                _nmap_target_count=$(wc -l < "${pdir}/nmap_target_hosts.txt" | tr -d '[:space:]')
+                _grp_total=$(_nmap_portset_groups "${pdir}/naabu_ip_ports.txt" "${NMAP_TOP_PORTS:-100}" | wc -l | tr -d '[:space:]')
+
+                # One overall wall-clock budget spent across the per-group calls.
+                # -oG output is appended as each group completes, so a deadline hit
+                # just stops launching more groups; whatever finished is kept.
+                _nmap_cap=$(_scaled_scan_cap "$_nmap_target_count" \
+                    "${NMAP_TIMEOUT_BASE:-60}" "${NMAP_SECONDS_PER_HOST:-30}" "${NMAP_TIMEOUT_MAX:-7200}")
+                local _nmap_deadline=$(( $(_now) + _nmap_cap ))
+                log_info "  Stage 4b: Nmap -sV per host on its own naabu ports — ${_nmap_target_count} host(s) in ${_grp_total} port-set group(s) (cap ${_nmap_cap}s, ≤${NMAP_TOP_PORTS:-100} ports/host)"
+
+                local _grp_done=0 _capped=0 _portset _ips _remain _grp_rc
+                while IFS=$'\t' read -r _portset _ips; do
+                    [[ -z "$_portset" ]] && continue
+                    _remain=$(( _nmap_deadline - $(_now) ))
+                    (( _remain <= 0 )) && { _capped=1; break; }
+                    _grp_rc=0
+                    printf '%s\n' $_ips \
+                        | timeout "$_remain" nmap -Pn -n -iL - \
+                            -p "$_portset" -sV --open --max-retries 2 \
+                            --min-hostgroup 64 --min-parallelism 16 \
+                            -oG - 2>/dev/null >> "${pdir}/port_scan_results.txt" || _grp_rc=$?
+                    if (( _grp_rc == 124 )); then _capped=1; break; fi
+                    (( _grp_rc != 0 )) && log_warn "    nmap group (ports ${_portset}) exited ${_grp_rc} — that group may be incomplete"
+                    _grp_done=$(( _grp_done + 1 ))
+                done < <(_nmap_portset_groups "${pdir}/naabu_ip_ports.txt" "${NMAP_TOP_PORTS:-100}")
+
+                if (( _capped == 1 )); then
+                    log_warn "  Nmap: hit its ${_nmap_cap}s cap after ${_grp_done}/${_grp_total} port-set group(s) — version detection is PARTIAL (completed groups kept)"
+                    _record_truncation "all" "nmap-sv" "killed at ${_nmap_cap}s after ${_grp_done}/${_grp_total} groups"
                 fi
-            fi
-            if [[ -z "$nmap_ports" ]]; then
-                nmap_ports="21,22,23,25,53,80,110,111,135,139,143,443,445,993,995,1433,1521,2049,3306,3389,5432,5900,5985,5986,6379,6443,8080,8443,8888,9090,9200,9443,27017"
-                nmap_targets="${pdir}/nmap_candidates.txt"
-            fi
-
-            local _nmap_target_count _nmap_port_count
-            _nmap_target_count=$(wc -l < "$nmap_targets" | tr -d '[:space:]')
-            _nmap_port_count=$(printf '%s' "$nmap_ports" | tr ',' '\n' | grep -c . || true)
-            log_info "  Stage 4b: Nmap -sV on ${_nmap_target_count} hosts × ${_nmap_port_count} ports (cap: top ${NMAP_TOP_PORTS:-100})"
-
-            # Bound it, and DETECT the bound being hit. nmap -sV costs far more
-            # per host than naabu's SYN sweep, and the fallback path above hands
-            # it every candidate when naabu found nothing — so an unbounded call
-            # can outlast the entire phase and still leave output that reads as
-            # a finished scan. A killed nmap keeps whatever it greppably wrote,
-            # which is worth having, but it has to be reported as partial.
-            local _nmap_cap _nmap_rc
-            _nmap_cap=$(_scaled_scan_cap "$_nmap_target_count" \
-                "${NMAP_TIMEOUT_BASE:-60}" "${NMAP_SECONDS_PER_HOST:-30}" "${NMAP_TIMEOUT_MAX:-3600}")
-            _nmap_rc=0
-            timeout "$_nmap_cap" nmap -Pn -n -iL "$nmap_targets" \
-                -p "$nmap_ports" \
-                -sV --open --max-retries 2 \
-                --min-hostgroup 64 --min-parallelism 16 \
-                -oG "${pdir}/port_scan_results.txt" 2>/dev/null || _nmap_rc=$?
-            if (( _nmap_rc == 124 )); then
-                log_warn "  Nmap: hit its ${_nmap_cap}s cap over ${_nmap_target_count} hosts and was killed — version detection is PARTIAL (completed results kept)"
-                _record_truncation "all" "nmap-sv" "killed at ${_nmap_cap}s over ${_nmap_target_count} hosts"
-            elif (( _nmap_rc != 0 )); then
-                log_warn "  Nmap exited ${_nmap_rc} — results may be incomplete (${pdir}/port_scan_results.txt)"
+            else
+                # naabu found nothing (or is absent): fall back to a fixed port
+                # list over all candidates so coverage survives a failed Stage 4a.
+                local _fb_ports="21,22,23,25,53,80,110,111,135,139,143,443,445,993,995,1433,1521,2049,3306,3389,5432,5900,5985,5986,6379,6443,8080,8443,8888,9090,9200,9443,27017"
+                local _fb_count
+                _fb_count=$(wc -l < "${pdir}/nmap_candidates.txt" | tr -d '[:space:]')
+                _nmap_cap=$(_scaled_scan_cap "$_fb_count" \
+                    "${NMAP_TIMEOUT_BASE:-60}" "${NMAP_SECONDS_PER_HOST:-30}" "${NMAP_TIMEOUT_MAX:-7200}")
+                log_info "  Stage 4b: Nmap -sV fallback on ${_fb_count} candidate(s) × fixed port list (naabu found nothing; cap ${_nmap_cap}s)"
+                timeout "$_nmap_cap" nmap -Pn -n -iL "${pdir}/nmap_candidates.txt" \
+                    -p "$_fb_ports" -sV --open --max-retries 2 \
+                    --min-hostgroup 64 --min-parallelism 16 \
+                    -oG "${pdir}/port_scan_results.txt" 2>/dev/null || _nmap_rc=$?
+                if (( _nmap_rc == 124 )); then
+                    log_warn "  Nmap: hit its ${_nmap_cap}s fallback cap over ${_fb_count} host(s) — version detection is PARTIAL"
+                    _record_truncation "all" "nmap-sv" "fallback killed at ${_nmap_cap}s over ${_fb_count} hosts"
+                elif (( _nmap_rc != 0 )); then
+                    log_warn "  Nmap exited ${_nmap_rc} — results may be incomplete (${pdir}/port_scan_results.txt)"
+                fi
             fi
 
             # Parse nmap's greppable output, splitting identified services from

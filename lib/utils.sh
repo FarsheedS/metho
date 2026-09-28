@@ -1171,35 +1171,21 @@ NAABU_TOTAL_TIMEOUT_MAX="${NAABU_TOTAL_TIMEOUT_MAX:-0}"
 # the rest of the run. Scaled per host like naabu and capped by NMAP_TIMEOUT_MAX.
 NMAP_TIMEOUT_BASE="${NMAP_TIMEOUT_BASE:-60}"
 NMAP_SECONDS_PER_HOST="${NMAP_SECONDS_PER_HOST:-30}"
-NMAP_TIMEOUT_MAX="${NMAP_TIMEOUT_MAX:-3600}"
-# How many hosts a port must have been seen open on before nmap -sV spends time
-# on it. The -sV port list is global (one list for every target), so a port seen
-# once gets probed across the whole estate; on a real run 226 of 247 discovered
-# ports came from GCP front-end artefacts on 2 hosts each. Well-known ports
-# (<1024) bypass this floor. 1 = no floor (previous behaviour).
-#
-# Default lowered from 2 to 1, because the floor was dropping real findings. On
-# the run above naabu found 88.134.246.114:8080 open — the only host in the
-# estate with 8080 open — and the floor kept 8080 out of the -sV union, so it
-# was never fingerprinted; the scan went out with -p 53,80,110,443,2000,5060 and
-# the one non-standard service the sweep discovered was the one port it did not
-# look at.
-#
-# The floor was written when NAABU_TOP_PORTS was 1000, where an uncorroborated
-# port really could drag the union toward 1000 ports and re-scan every host
-# against all of them. At the current top-100 the union is bounded by 100 no
-# matter what, and NMAP_TIMEOUT_MAX bounds the wall clock, so the noise argument
-# no longer pays for the missed findings. Excluded ports are now logged rather
-# than dropped silently, so raising this back is an informed choice.
-NMAP_MIN_PORT_HOSTS="${NMAP_MIN_PORT_HOSTS:-1}"
+# nmap -sV wall-clock ceiling. Raised 3600 -> 7200: on a large DoH run Stage 4b
+# shares the phase with the throughput-scaled DNS passes, and -sV on hundreds of
+# hosts can want more than an hour even now that each host is probed only on its
+# own naabu ports. Scaled per host like naabu; 0 = unlimited.
+NMAP_TIMEOUT_MAX="${NMAP_TIMEOUT_MAX:-7200}"
 
-# Cap on how many ports nmap -sV service-detects in Stage 4b. naabu already
-# records EVERY open port (they are merged into the final ip_port_pairs), so
-# this only bounds which ports get version detection. Without a cap, the union
-# of open ports across hundreds of hosts approaches the full top-1000 set and
-# nmap re-scans every host against all of them — the single biggest time sink
-# in Phase 3. The cap keeps the N ports open on the MOST hosts (highest signal).
-# 0 = no cap (scan the full union). Override with --nmap-top-ports.
+# Per-host cap on how many ports nmap -sV service-detects in Stage 4b. Stage 4b
+# now scans each host ONLY on the ports naabu found open on it (see
+# _nmap_portset_groups), so there is no global union to bound; this is a safety
+# guard against a single tarpit host whose naabu result lists an implausible
+# number of ports. naabu's own NAABU_TOP_PORTS usually bounds this already, but
+# the guard stays independent of it. When it trims, it keeps the lowest-numbered
+# ports (well-known first). naabu still records EVERY open port in the final
+# ip_port_pairs, so trimming only affects version detection. 0 = no cap.
+# Override with --nmap-top-ports.
 NMAP_TOP_PORTS="${NMAP_TOP_PORTS:-100}"
 
 # Numeric-argument guard: rejects non-integer values up-front so a typo like

@@ -837,24 +837,26 @@ t "empty is not a cap kill"    "0" "$(_was_capped '' && echo 1 || echo 0)"
 # The union is global, so a port seen on one odd host is probed across the whole
 # estate. On a live run 226 of 247 ports appeared on exactly 2 hosts — all GCP
 # front-end artefacts — and they filled the union end to end.
-NPU="$(mktemp)"
+# ── _nmap_portset_groups: scan each host on ITS OWN naabu ports ──────────────
+# Regression for the union that re-scanned every host on all discovered ports,
+# making naabu's per-host narrowing pointless. Hosts with the same open-port set
+# share one group; ports are numerically sorted; NMAP_TOP_PORTS caps per host.
+NPG="$(mktemp)"
 {
-  for i in 1 2 3 4 5; do echo "10.0.0.$i:443"; done   # well-known, broad
-  echo "10.0.0.1:8080"; echo "10.0.0.2:8080"          # high port, 2 hosts
-  echo "10.0.0.1:3306"; echo "10.0.0.2:3306"; echo "10.0.0.3:3306"  # high port, 3 hosts
-  echo "10.0.0.1:49160"                                # high port, 1 host only
-  for i in 1 2 3 4 5 6; do echo "10.0.0.$i:1023"; done # well-known-ish, broad
-} > "$NPU"
-_has_port() { # _has_port <csv> <port>
-    [[ ",${1:-}," == *",${2:-},"* ]] && echo 1 || echo 0
-}
-t "union keeps a broad well-known port"  "1" "$(_has_port "$(_nmap_port_union "$NPU" 100 2)" 443)"
-t "union drops a 1-host high port"        "0" "$(_has_port "$(_nmap_port_union "$NPU" 100 2)" 49160)"
-t "union keeps a 3-host high port"        "1" "$(_has_port "$(_nmap_port_union "$NPU" 100 2)" 3306)"
-t "union drops a 2-host high port at floor 3" "0" "$(_has_port "$(_nmap_port_union "$NPU" 100 3)" 8080)"
-t "union keeps it at floor 2"             "1" "$(_has_port "$(_nmap_port_union "$NPU" 100 2)" 8080)"
-t "union honours the top-N cap"           "1" "$([[ $(_nmap_port_union "$NPU" 1 2 | tr ',' '\n' | grep -c .) -eq 1 ]] && echo 1 || echo 0)"
-t "union of an empty file is empty"       ""  "$(_nmap_port_union "$NPU.nonexistent" 100 2)"
+  echo "10.0.0.1:443"; echo "10.0.0.1:80"     # host 1: {80,443}
+  echo "10.0.0.2:80"; echo "10.0.0.2:443"     # host 2: {80,443}  (same set as host 1)
+  echo "10.0.0.3:53"                          # host 3: {53}
+} > "$NPG"
+t "hosts with the same port-set share one group" "80,443	10.0.0.1 10.0.0.2" "$(_nmap_portset_groups "$NPG" 0 | grep '^80,443')"
+t "a distinct port-set is its own group"         "53	10.0.0.3"            "$(_nmap_portset_groups "$NPG" 0 | grep '^53')"
+t "ports are numerically sorted, not lexical"    "1" "$([[ $(_nmap_portset_groups "$NPG" 0 | grep -c '^80,443') -eq 1 ]] && echo 1 || echo 0)"
+t "empty naabu file yields no groups"            ""  "$(_nmap_portset_groups "$NPG.nonexistent" 0)"
+# Per-host cap keeps the lowest-numbered ports (well-known first).
+NPG2="$(mktemp)"
+printf '10.0.0.9:443\n10.0.0.9:22\n10.0.0.9:8080\n' > "$NPG2"
+t "per-host cap keeps the lowest-numbered ports" "22,443	10.0.0.9" "$(_nmap_portset_groups "$NPG2" 2)"
+t "no cap keeps every port for the host"         "22,443,8080	10.0.0.9" "$(_nmap_portset_groups "$NPG2" 0)"
+rm -f "$NPG" "$NPG2"
 
 # ── Every documented knob must be reachable from the environment ────────────
 # A plain `VAR=default` assignment ignores the environment, so a knob documented
@@ -867,7 +869,7 @@ for _kv in CRAWL_STAGE_TIMEOUT=999 HTTPX_THREADS_MAX=999 WAYMORE_TIMEOUT=999 \
            DNSGEN_MAX_OUTPUT_BYTES=999 NAABU_RATE=999 NAABU_RETRIES=999 \
            NAABU_TIMEOUT=999 NAABU_TOP_PORTS=999 NAABU_TIMEOUT_MAX=999 \
            NAABU_SECONDS_PER_HOST=999 NAABU_TOTAL_TIMEOUT_MAX=999 \
-           NMAP_MIN_PORT_HOSTS=999 NMAP_TIMEOUT_MAX=999 NMAP_INCLUDE_CLOUD=1 ; do
+           NMAP_TIMEOUT_MAX=999 NMAP_INCLUDE_CLOUD=1 ; do
     _k="${_kv%%=*}"; _v="${_kv#*=}"
     _got="$(env "$_k=$_v" bash -c "source '${SCRIPT_DIR}/lib/utils.sh' >/dev/null 2>&1; printf '%s' \"\${${_k}}\"")"
     t "knob ${_k} is settable from the environment" "$_v" "$_got"
