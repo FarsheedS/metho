@@ -147,6 +147,19 @@ _tag_root_slices() {
             while ((getline r < roots_file) > 0) if (r != "") want[r] = 1
             close(roots_file)
 
+            # cloud_enum searches by KEYWORD — the label before the first dot of
+            # each root — so the buckets it finds (vodafone-prod.s3.amazonaws.com,
+            # 0-vodafone.awsapps.com) carry the keyword, not that root domain
+            # suffix, and in_scope_of (a suffix match) never attributes them to a
+            # root. Map each keyword back to the root(s) that produced it so those
+            # assets reach the per-root cloud_assets file. Keywords under 3 chars
+            # are skipped to avoid spurious substring hits.
+            for (rr in want) {
+                kw = rr; sub(/\..*$/, "", kw)
+                if (length(kw) >= 3)
+                    kwroots[kw] = (kwroots[kw] == "" ? rr : kwroots[kw] ";" rr)
+            }
+
             # ── canonical dataset: subdomains, records, sources, IPs, CNAMEs ──
             while ((getline line < dns_tsv) > 0) {
                 n = split(line, f, "\t")
@@ -246,6 +259,17 @@ _tag_root_slices() {
                     sub(/^\.+/, "", v)
                     if (v == "") continue
                     for (r in want) if (in_scope_of(v, r)) print r, v > (work "/cloud.tsv")
+                    # cloud_enum keyword attribution: a bucket like
+                    # 0-vodafone.awsapps.com is not a .vodafone.com host but does
+                    # belong to vodafone, found via the "vodafone" keyword. Match
+                    # the keyword as a delimited token so "vf" cannot match "vfxyz".
+                    for (ckw in kwroots) {
+                        if (match(v, "(^|[^a-z0-9])" ckw "([^a-z0-9]|$)")) {
+                            kn = split(kwroots[ckw], krs, ";")
+                            for (ki = 1; ki <= kn; ki++)
+                                print krs[ki], v > (work "/cloud.tsv")
+                        }
+                    }
                 }
                 close(cloud)
             }
@@ -275,7 +299,11 @@ _place_root_slices() {
         filter_cloud_domains "${work}/.cname_uniq" "${work}/.cname_cloud" || true
         if [[ -s "${work}/.cname_cloud" ]]; then
             # Re-tag: emit (root, normalized-target) for every CNAME whose
-            # normalized form is a cloud endpoint.
+            # normalized form is a cloud endpoint. Dedup on the FULL (root,target)
+            # pair with a plain `sort -u`: an earlier `sort -u -k1,1` keyed only on
+            # column 1 (the root), so it kept ONE row per root and collapsed a
+            # root's entire cloud-CNAME set to a single asset (605 -> 1 on a real
+            # single-root run). _split_tagged re-sorts by root for streaming.
             awk -F'\t' -v OFS='\t' '
                 NR == FNR { keep[$1] = 1; next }
                 {
@@ -285,7 +313,7 @@ _place_root_slices() {
                     sub(/^\.+/, "", v)
                     if (v in keep) print $1, v
                 }
-            ' "${work}/.cname_cloud" "${work}/cname.tsv" | sort -u -t$'\t' -k1,1 \
+            ' "${work}/.cname_cloud" "${work}/cname.tsv" | sort -u \
                 > "${work}/cnamecloud.tsv"
         fi
         rm -f "${work}/.cname_uniq" "${work}/.cname_cloud"

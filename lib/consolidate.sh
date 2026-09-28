@@ -142,8 +142,26 @@ run_consolidation() {
     local waymore_total=0
     [[ -s "${fdir}/final_waymore_urls.txt" ]] && waymore_total=$(wc -l < "${fdir}/final_waymore_urls.txt")
 
-    # ── Cloud Assets (from Phase 2) ─────────────────────────────────────────
-    cat "${OUTPUT_DIR}/phase2/final_cloud_assets.txt" 2>/dev/null | sort -u > "${fdir}/final_cloud_assets.txt" || true
+    # ── Cloud Assets (Phase 2 aggregate ∪ FINAL canonical CNAME targets) ────
+    # Phase 2 builds its aggregate mid-run, before Phase 3 resolves more hosts
+    # (PTR, timeout recoveries), so its snapshot misses cloud CNAME targets that
+    # only appear in canonical later — which results.sh then picks up per-root,
+    # breaking "per-root ⊆ aggregate". Re-derive the CNAME-cloud set here from the
+    # FINAL canonical and union it in, so the aggregate stays a true superset of
+    # every per-root slice. Same source column ($6) and helpers results.sh uses.
+    {
+        cat "${OUTPUT_DIR}/phase2/final_cloud_assets.txt" 2>/dev/null
+        if [[ -s "${OUTPUT_DIR}/canonical_dns.tsv" ]]; then
+            awk -F'\t' '$1 != "hostname" && $6 != "" { n = split($6, a, ";"); for (i = 1; i <= n; i++) print a[i] }' \
+                "${OUTPUT_DIR}/canonical_dns.tsv" 2>/dev/null \
+                | _cloud_asset_normalize 2>/dev/null > "${fdir}/.cc_raw" || true
+            if [[ -s "${fdir}/.cc_raw" ]]; then
+                filter_cloud_domains "${fdir}/.cc_raw" "${fdir}/.cc_cloud" 2>/dev/null || true
+                cat "${fdir}/.cc_cloud" 2>/dev/null || true
+            fi
+            rm -f "${fdir}/.cc_raw" "${fdir}/.cc_cloud"
+        fi
+    } | _cloud_asset_normalize 2>/dev/null | sort -u > "${fdir}/final_cloud_assets.txt" || true
     local cloud_total=0
     [[ -s "${fdir}/final_cloud_assets.txt" ]] && cloud_total=$(wc -l < "${fdir}/final_cloud_assets.txt")
 

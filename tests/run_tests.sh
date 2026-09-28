@@ -32,6 +32,7 @@ source "${SCRIPT_DIR}/lib/phase3.sh"
 # a fixture output directory can pin.
 source "${SCRIPT_DIR}/lib/phase2.sh"
 source "${SCRIPT_DIR}/lib/consolidate.sh"
+source "${SCRIPT_DIR}/lib/results.sh"
 
 PASS=0 FAIL=0
 t() { # t <name> <expected> <actual>
@@ -1086,6 +1087,27 @@ t "cloud: scheme stripped" "1" "$(printf '%s\n' "$_can_out" | grep -cx 'bynder-s
 t "cloud: path and query stripped" "1" "$(printf '%s\n' "$_can_out" | grep -cx 'fonts.googleapis.com')"
 t "cloud: wildcard dropped, not de-starred" "0" "$(printf '%s\n' "$_can_out" | grep -cx 'amazonaws.com')"
 t "cloud: target lowercased" "1" "$(printf '%s\n' "$_can_out" | grep -cx 'upper.case.amazonaws.com')"
+
+# ── per-root cloud_assets: CNAME-derived + cloud_enum keyword attribution ─────
+# Regression for results/<root>/cloud_assets.txt = 1 while the aggregate had
+# 1,157: (a) the CNAME re-tag deduped by ROOT only (sort -u -k1,1), collapsing a
+# root's entire cloud-CNAME set to a single row; (b) cloud_enum keyword buckets
+# (0-vodafone.awsapps.com) never attributed to their root. This runs the real
+# generate_per_root_results on a tiny synthetic estate and checks both.
+_PRC_SAVE_OUT="${OUTPUT_DIR:-}"; _PRC_SAVE_ROOTS="${ROOT_DOMAINS_FILE:-}"
+PRC="$(mktemp -d)"; mkdir -p "$PRC/phase2"
+printf 'hostname\troot_domain\tdiscovery_sources\tA\tAAAA\tCNAME\tresolution_status\n' > "$PRC/canonical_dns.tsv"
+printf 'a.example.com\texample.com\tsubfaster\t\t\tfoo.elb.amazonaws.com\tcname_only\n' >> "$PRC/canonical_dns.tsv"
+printf 'b.example.com\texample.com\tsubfaster\t\t\tbar.elb.amazonaws.com\tcname_only\n' >> "$PRC/canonical_dns.tsv"
+printf 'example-prod.s3.amazonaws.com\n' > "$PRC/phase2/final_cloud_assets.txt"
+printf 'example.com\n' > "$PRC/.prc_roots.txt"
+OUTPUT_DIR="$PRC"; ROOT_DOMAINS_FILE="$PRC/.prc_roots.txt"
+generate_per_root_results >/dev/null 2>&1
+_PRC_OUT="$(sort -u "$PRC/results/example.com/cloud_assets.txt" 2>/dev/null)"
+OUTPUT_DIR="$_PRC_SAVE_OUT"; ROOT_DOMAINS_FILE="$_PRC_SAVE_ROOTS"
+t "per-root keeps BOTH cname-derived cloud targets (no -k1,1 collapse)" "2" "$(printf '%s\n' "$_PRC_OUT" | grep -cE 'foo\.elb\.amazonaws\.com|bar\.elb\.amazonaws\.com')"
+t "per-root folds in a cloud_enum keyword bucket" "1" "$(printf '%s\n' "$_PRC_OUT" | grep -cx 'example-prod.s3.amazonaws.com')"
+rm -rf "$PRC"
 
 # ── _cap_crawl_hosts: the cap must rank, not take the alphabet ────────────────
 # `head -n` over an alphabetically sorted live list spent a 300-host crawl budget
