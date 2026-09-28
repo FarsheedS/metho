@@ -27,6 +27,11 @@ source "${SCRIPT_DIR}/lib/classify.sh"
 # calls into phase3 fails as "command not found" and — because the call is
 # redirected — looks like an assertion failure rather than a missing source.
 source "${SCRIPT_DIR}/lib/phase3.sh"
+# phase2.sh and consolidate.sh hold the cloud-asset normalization path and the
+# final/ consolidation globs, both of which had defects that only a test against
+# a fixture output directory can pin.
+source "${SCRIPT_DIR}/lib/phase2.sh"
+source "${SCRIPT_DIR}/lib/consolidate.sh"
 
 PASS=0 FAIL=0
 t() { # t <name> <expected> <actual>
@@ -987,6 +992,178 @@ UNDERSIZED="$( ( DOMAINS="example.com"; DNS_MODE=doh; PARALLEL_DOMAINS=3
                   DNSX_THREADS="" DNSX_THREADS_DOH=64 DOH_PROXY_THREADS=128
                   validate_args 2>/dev/null ) | grep -c 'DoH proxy undersized' )"
 t "an undersized DoH proxy is reported" "1" "$UNDERSIZED"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Audit-closure regressions
+#
+# Each of these pins a defect found auditing a real run (mydigipay.com +
+# vodafone.com, 2026-09-27). They are grouped so a future reader can see which
+# behaviour was wrong and why it is now asserted, rather than treating them as
+# arbitrary invariants.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── extract_domains: double-encoded percent fragments ─────────────────────────
+# `%252F` decoded once leaves a literal `2F` glued to the next hostname, so a
+# URL list produced 37 fictional hosts named 2Fapi.portal.vodafone.com etc. The
+# fix expands %25 before stripping %XX; the trap is that a naive fix is to
+# filter tokens starting with two hex digits, which would delete the real
+# hosts 2fa.id.aws.cps.vodafone.com and 6u2fa.k8s.… found in the same run.
+_pct_in="$(mktemp)"; _pct_out="$(mktemp)"
+cat > "$_pct_in" <<'PCTEOF'
+https://ciamsso.sit1.ciam.vodafone.com/x?cb=https%253A%252F%252Fapi.portal.vodafone.com%252Fsaml2
+https://2fa.id.aws.cps.vodafone.com/a
+https://6u2fa.k8s.eu-central-1.aws.cps.vodafone.com/b
+https://plain.example.com/ok
+PCTEOF
+extract_domains "$_pct_in" "$_pct_out"
+# The assertion is deliberately about the SPECIFIC fake, not about a `2F` prefix.
+# Asserting "no host starts with 2f" would be wrong, and would have to be made
+# pass by deleting the real 2fa.id.aws.cps.vodafone.com — which is the mistake
+# this regression exists to prevent. `2f` is a legal start to a label.
+t "double-encoded %252F does not invent 2Fapi.portal…" "0" \
+    "$(_count_in "$_pct_out" '^2[Ff]api.portal.vodafone.com$')"
+t "the real host behind %252F is recovered" "1" "$(_count_in "$_pct_out" '^api.portal.vodafone.com$')"
+t "a real host beginning 2f survives" "1" "$(_count_in "$_pct_out" '^2fa.id.aws.cps.vodafone.com$')"
+t "a real host containing 2fa survives" "1" "$(_count_in "$_pct_out" '^6u2fa.k8s.eu-central-1.aws.cps.vodafone.com$')"
+t "an ordinary URL is unaffected" "1" "$(_count_in "$_pct_out" '^plain.example.com$')"
+
+# ── _cloud_asset_normalize: one shape for three sources ───────────────────────
+# dnsx emits bare hostnames, katana emits URLs, cloud_enum emitted JSON-quoted
+# URLs. Unnormalized, results.sh stripped `"http://…"` down to `"http:`, failed
+# the in-scope test, and silently dropped all 40 cloud_enum assets from every
+# per-root file while leaving them in the aggregate.
+_can_in="$(mktemp)"
+cat > "$_can_in" <<'CANEOF'
+"http://admin-vodafone.s3.amazonaws.com/"
+https://bynder-static.s3.amazonaws.com
+https://*.amazonaws.com
+https://fonts.googleapis.com/icon?family=Material+Icons
+UPPER.Case.Amazonaws.com
+CANEOF
+_can_out="$(_cloud_asset_normalize < "$_can_in")"
+t "cloud: JSON quotes stripped" "1" "$(printf '%s\n' "$_can_out" | grep -cx 'admin-vodafone.s3.amazonaws.com')"
+t "cloud: scheme stripped" "1" "$(printf '%s\n' "$_can_out" | grep -cx 'bynder-static.s3.amazonaws.com')"
+t "cloud: path and query stripped" "1" "$(printf '%s\n' "$_can_out" | grep -cx 'fonts.googleapis.com')"
+t "cloud: wildcard dropped, not de-starred" "0" "$(printf '%s\n' "$_can_out" | grep -cx 'amazonaws.com')"
+t "cloud: target lowercased" "1" "$(printf '%s\n' "$_can_out" | grep -cx 'upper.case.amazonaws.com')"
+
+# ── _cap_crawl_hosts: the cap must rank, not take the alphabet ────────────────
+# `head -n` over an alphabetically sorted live list spent a 300-host crawl budget
+# on adm.*/adminauth.*: 208 canonical-redirect stubs and 11 real pages, against
+# 577 hosts answering 200 in the corpus.
+_ck_dir="$(mktemp -d)"
+printf 'http://aaa.example.com\nhttp://bbb.example.com\nhttp://ccc.example.com\n' > "${_ck_dir}/in.txt"
+{
+    printf 'hostname\tcdn\ttechnologies\twebserver\tcontent_length\tstatus_code\ttitle\turl\n'
+    printf 'aaa.example.com\t\thtml\tnginx\t100\t301\t-\thttp://aaa.example.com\n'
+    printf 'bbb.example.com\t\thtml\tnginx\t900\t200\t-\thttp://bbb.example.com\n'
+    printf 'ccc.example.com\t\thtml\tnginx\t500\t403\t-\thttp://ccc.example.com\n'
+} > "${_ck_dir}/httpx_metadata.tsv"
+_ck_counts="$(cd "$_ck_dir" && _cap_crawl_hosts in.txt 2 out.txt "Test" httpx_metadata.tsv)"
+t "crawl cap returns kept and total" "2 3" "$_ck_counts"
+t "crawl cap ranks 200 above 403 and 301" "bbb.example.com" \
+    "$(head -1 "${_ck_dir}/out.txt" | sed 's|http://||')"
+t "crawl cap ranks 403 above 301" "ccc.example.com" \
+    "$(tail -1 "${_ck_dir}/out.txt" | sed 's|http://||')"
+_ck_nometa="$(cd "$_ck_dir" && _cap_crawl_hosts in.txt 2 out2.txt "Test" nonexistent.tsv)"
+t "crawl cap still caps without metadata" "2 3" "$_ck_nometa"
+t "crawl cap falls back to input order" "aaa.example.com" \
+    "$(head -1 "${_ck_dir}/out2.txt" | sed 's|http://||')"
+t "no cap means no reordering" "3 3" \
+    "$(cd "$_ck_dir" && _cap_crawl_hosts in.txt 0 out3.txt "Test" httpx_metadata.tsv)"
+t "uncapped output preserves input order" "aaa.example.com" \
+    "$(head -1 "${_ck_dir}/out3.txt" | sed 's|http://||')"
+
+# ── _bogon_merge_global: the merged audit log must exist ──────────────────────
+# The per-domain pass logs the ranges it strips; the merged pass used to have no
+# such file, so it grepped a missing path and reported "No 198.18.0.0/15 present"
+# over 1,067 hosts whose per-domain log contained 126 matching rows.
+_bg_dir="$(mktemp -d)"
+printf 'h1\t10.0.0.1\t10.0.0.0/8\n'                > "${_bg_dir}/d1.tsv.bogon"
+printf 'h2\t198.18.0.5\t198.18.0.0/15 RFC2544\n'    > "${_bg_dir}/d2.tsv.bogon"
+: > "${_bg_dir}/global.tsv"
+_bogon_merge_global "${_bg_dir}/global.tsv" "${_bg_dir}/d1.tsv" "${_bg_dir}/d2.tsv"
+t "bogon merge unions per-domain logs" "2" "$(_lines "${_bg_dir}/global.tsv.bogon")"
+t "bogon merge keeps the 198.18 evidence" "1" "$(_count_in "${_bg_dir}/global.tsv.bogon" '198[.]18[.]')"
+# A domain with no reserved records writes no log; that must not fabricate one.
+# The file is still created (empty), which is how the verdict tells "no such
+# range" apart from "we have no evidence at all".
+: > "${_bg_dir}/global2.tsv"
+_bogon_merge_global "${_bg_dir}/global2.tsv" "${_bg_dir}/missing.tsv"
+t "bogon merge of nothing yields an empty file" "0" "$(_lines "${_bg_dir}/global2.tsv.bogon")"
+t "bogon merge always creates the file" "1" "$([[ -e "${_bg_dir}/global2.tsv.bogon" ]] && echo 1 || echo 0)"
+
+# ── _takeover_classify: verdicts ──────────────────────────────────────────────
+# Separated from canonical_dns_takeover_check so the verdict logic is testable
+# without making the suite resolve real DNS names.
+_tk_dir="$(mktemp -d)"
+printf 'alive.example.net\n'  > "${_tk_dir}/alive.txt"
+printf 'dead.example.net\n'   > "${_tk_dir}/dead.txt"
+cat > "${_tk_dir}/pairs.tsv" <<'TKEOF'
+a.example.com	example.com	alive.example.net	crt.name
+b.example.com	example.com	dead.example.net	waymore
+c.example.com	example.com	unknown.example.org	katana
+d.example.com	example.com	DEAD.EXAMPLE.NET	subfaster
+e.example.com	example.com	https://alive.example.net/path	root
+f.example.com	example.com		root
+TKEOF
+_tk_out="$(_takeover_classify "${_tk_dir}/pairs.tsv" "${_tk_dir}/alive.txt" "${_tk_dir}/dead.txt")"
+t "takeover: resolving target is alive" "alive" \
+    "$(printf '%s\n' "$_tk_out" | awk -F'\t' '$1 == "a.example.com" { print $4 }')"
+t "takeover: NXDOMAIN target is dangling" "dangling" \
+    "$(printf '%s\n' "$_tk_out" | awk -F'\t' '$1 == "b.example.com" { print $4 }')"
+t "takeover: unanswerable target is unresolved" "unresolved" \
+    "$(printf '%s\n' "$_tk_out" | awk -F'\t' '$1 == "c.example.com" { print $4 }')"
+t "takeover: target case is normalized" "dangling" \
+    "$(printf '%s\n' "$_tk_out" | awk -F'\t' '$1 == "d.example.com" { print $4 }')"
+t "takeover: target printed lowercased" "dead.example.net" \
+    "$(printf '%s\n' "$_tk_out" | awk -F'\t' '$1 == "d.example.com" { print $3 }')"
+t "takeover: URL-shaped target is normalized" "alive" \
+    "$(printf '%s\n' "$_tk_out" | awk -F'\t' '$1 == "e.example.com" { print $4 }')"
+t "takeover: a pair with no target is dropped" "0" \
+    "$(printf '%s\n' "$_tk_out" | grep -c '^f.example.com' || true)"
+
+# ── setup_dirs: clear state that accumulates across runs ──────────────────────
+# cloud_enum appends to cloud_enum_results.json and Phase 2 re-parses it in full
+# whenever it is non-empty, so a re-run into a reused output directory inherited
+# the previous run's buckets — and could report a full result set while this
+# run's cloud_enum was killed having found nothing.
+_sd_dir="$(mktemp -d)"
+mkdir -p "${_sd_dir}/phase2"
+printf '{"msg":"Protected S3 Bucket","target":"http://stale.s3.amazonaws.com/"}\n' \
+    > "${_sd_dir}/phase2/cloud_enum_results.json"
+( OUTPUT_DIR="$_sd_dir"; setup_dirs > /dev/null 2>&1 ) || true
+t "setup_dirs clears stale cloud_enum findings" "0" \
+    "$([[ -e "${_sd_dir}/phase2/cloud_enum_results.json" ]] && echo 1 || echo 0)"
+
+# ── run_consolidation: final/ is scoped to this run's roots ───────────────────
+# Every final/ glob was a bare `phase1/*`, so a stale phase1/<other-root>/ from a
+# reused output directory imported a previous run's hosts into four deliverables
+# even though the canonical merge had correctly excluded them.
+_cs_dir="$(mktemp -d)"
+mkdir -p "${_cs_dir}/phase1/this.example" "${_cs_dir}/phase1/stale.example" "${_cs_dir}/phase3" "${_cs_dir}/phase2"
+printf 'this.example\n' > "${_cs_dir}/root_domains.txt"
+printf 'http://a.this.example\n' > "${_cs_dir}/phase1/this.example/live_subdomains_final.txt"
+printf 'http://a.stale.example\n' > "${_cs_dir}/phase1/stale.example/live_subdomains_final.txt"
+printf 'http://a.this.example/old\n' > "${_cs_dir}/phase1/this.example/waymore_urls.txt"
+printf 'http://a.stale.example/old\n' > "${_cs_dir}/phase1/stale.example/waymore_urls.txt"
+printf 'hostname\troot_domain\tdiscovery_sources\tA\tAAAA\tCNAME\tresolution_status\n' > "${_cs_dir}/canonical_dns.tsv"
+printf 'a.this.example\tthis.example\tptr-reverse\t1.2.3.4\t\t\tresolved\n' >> "${_cs_dir}/canonical_dns.tsv"
+printf 'new.this.example\tthis.example\tdnsx-cloud\t\t\t\tcname_only\n'   >> "${_cs_dir}/canonical_dns.tsv"
+( OUTPUT_DIR="$_cs_dir" METHO_TAKEOVER_CHECK=0 ROOT_DOMAINS_FILE="$_cs_dir/root_domains.txt" \
+      run_consolidation > /dev/null 2>&1 ) || true
+t "final/ excludes a stale phase1 root from live servers" "0" \
+    "$(_count_in "${_cs_dir}/final/final_live_web_servers.txt" 'stale[.]example')"
+t "final/ excludes a stale phase1 root from waymore URLs" "0" \
+    "$(_count_in "${_cs_dir}/final/final_waymore_urls.txt" 'stale[.]example')"
+t "final/ keeps this run's live servers" "1" \
+    "$(_count_in "${_cs_dir}/final/final_live_web_servers.txt" 'this[.]example')"
+# final_all_domains comes from canonical now, so a host only Phase 2 or Phase 3
+# discovered is present — the raw Phase-1 inventory would have missed it.
+t "final_all_domains includes a dnsx-cloud discovery" "1" \
+    "$(_count_in "${_cs_dir}/final/final_all_domains.txt" '^new.this.example$')"
+t "final_all_domains includes a ptr-reverse discovery" "1" \
+    "$(_count_in "${_cs_dir}/final/final_all_domains.txt" '^a.this.example$')"
 
 echo ""
 echo "RESULT: $PASS passed, $FAIL failed"

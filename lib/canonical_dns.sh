@@ -708,7 +708,15 @@ canonical_dns_resolve_pending() {
         # wording asserted the VPN case whenever the range was present and sent
         # the operator to hunt a VPN problem that was not there — the same
         # defect as the unconditional text it replaced, just narrower.
-        if grep -qE '(^|[[:space:]])198\.1[89]\.' "${_bogon_log}" 2>/dev/null; then
+        # The verdict is read from the audit file, so an ABSENT file is not
+        # evidence of absence — it is absence of evidence. Saying otherwise is
+        # how one run reported "present" from its per-domain pass and "not
+        # present" from every merged pass, over the same 1,067 hosts, while the
+        # merged .bogon was simply never written. Gate on the file existing
+        # first; a genuinely empty-but-present file still means "no such range".
+        if [[ ! -s "${_bogon_log}" ]]; then
+            log_info "  Reserved-address detail is unavailable here (${_bogon_log} is empty) — the ${bogon} host(s) are still held out of scanning, but the address/range breakdown cannot be reported from this dataset. Per-domain logs under phase1/<domain>/ carry the evidence."
+        elif grep -qE '(^|[[:space:]])198\.1[89]\.' "${_bogon_log}" 2>/dev/null; then
             if [[ "${DNS_TRANSPORT_LABEL:-${DNS_MODE}}" == "doh" ]]; then
                 log_info "  198.18.0.0/15 (RFC 2544) is present, but every answer came from DoH — the local resolver is bypassed, so treat these as genuine published records, not a fake-IP VPN."
             else
@@ -950,6 +958,201 @@ canonical_dns_extract_probeable() {
 
 
 
+# ── Classify CNAME pairs against the resolved target sets ────────────────────
+#   _takeover_classify <pairs.tsv> <alive.txt> <dead.txt>
+#
+# Pure: no network, no globals — the verdict logic is separated out so it can be
+# unit-tested directly, since the expensive half of the check (resolution) is not
+# something the test suite should exercise against real DNS.
+#
+# pairs.tsv rows are <hostname> <root_domain> <cname_target> [discovery_sources].
+# Emits the same shape with a verdict inserted before the sources column.
+_takeover_classify() {
+    awk -F'\t' -v OFS='\t' -v alive="$2" -v dead="$3" '
+        BEGIN {
+            while ((getline l < alive) > 0) if (l != "") a[l] = 1
+            close(alive)
+            while ((getline l < dead) > 0) if (l != "") d[l] = 1
+            close(dead)
+        }
+        NF < 3 { next }
+        {
+            t = tolower($3)
+            sub(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "", t)
+            sub(/[\/:;?].*$/, "", t)
+            sub(/^\.+/, "", t)
+            if (t == "") next
+            if (t in d)       v = "dangling"
+            else if (t in a)  v = "alive"
+            else              v = "unresolved"
+            print $1, $2, t, v, $4
+        }
+    ' "$1"
+}
+
+# ── Dangling-CNAME (subdomain takeover) check ────────────────────────────────
+#   canonical_dns_takeover_check
+#
+# The pipeline already computes the signal and then does nothing with it. A host
+# whose only DNS answer is a CNAME (`resolution_status == cname_only`) is held out
+# of the probe set because it has no address to dial — correct — but that is also
+# the exact shape of a takeover candidate, and on a real run there were 1,166 of
+# them, several pointing at other organisations' infrastructure
+# (admin-lloydsemm.vodafone.com → cust015-padc-lb.vmshosting.co.uk,
+# adminauth.officespaces.iot.vodafone.com → adminauth.vbofficespaces.com).
+#
+# The check itself is the CNAME chain resolution nobody was running: resolve each
+# target and see whether it still exists.
+#
+#   target confirmed NXDOMAIN        → `dangling`    the chain points at a name
+#                                                     that does not exist; anyone
+#                                                     who can register it inherits
+#                                                     the traffic
+#   target resolves with an address  → `alive`       not a candidate
+#   target answers nothing at all    → `unresolved`  weaker: could be a resolver
+#                                                     view difference or a target
+#                                                     that is NXDOMAIN only on
+#                                                     some paths. Ranked below
+#                                                     `dangling`, above nothing.
+#
+# Reuses _dnsx_resolve_to and the rcode pass, so the DoH transport, per-query
+# timeouts, retry count and concurrency are the same ones the rest of the run
+# used — a takeover verdict decided through a different resolver than the dataset
+# would disagree with the dataset for no reason.
+#
+# Bounded two ways, and says so: METHO_TAKEOVER_MAX_TARGETS caps how many targets
+# are resolved, and the rcode pass is capped like every other dnsx batch. Either
+# bound being hit is recorded as a truncation, per the pipeline's contract that an
+# absent stage_truncations.txt is what "complete" means.
+#
+# METHO_TAKEOVER_CHECK=0 disables it.
+canonical_dns_takeover_check() {
+    [[ "${METHO_TAKEOVER_CHECK:-1}" == "0" ]] && return 0
+    local tsv="${CANONICAL_DNS_TSV:-${OUTPUT_DIR}/canonical_dns.tsv}"
+    local fdir="${OUTPUT_DIR}/final"
+    local out="${fdir}/final_takeover_candidates.txt"
+    local work="${OUTPUT_DIR}/phase3/.takeover"
+    mkdir -p "$fdir" "$work" 2>/dev/null || true
+
+    local pairs="${work}/pairs.tsv"
+    awk -F'\t' -v OFS='\t' '
+        $1 == "hostname" && $2 == "root_domain" { next }
+        $7 == "cname_only" && $6 != "" {
+            n = split($6, a, ";")
+            for (i = 1; i <= n; i++) if (a[i] != "") print $1, $2, a[i], $3
+        }
+    ' "$tsv" 2>/dev/null > "$pairs" || true
+
+    local pair_count=0
+    [[ -s "$pairs" ]] && pair_count=$(wc -l < "$pairs")
+    if (( pair_count == 0 )); then
+        log_info "Takeover check: no cname_only hosts — nothing to test"
+        printf 'hostname\troot_domain\tcname_target\tverdict\tdiscovery_sources\n' > "$out"
+        rm -rf "$work"
+        return 0
+    fi
+    if ! command -v dnsx &>/dev/null; then
+        log_warn "Takeover check: dnsx unavailable — skipping ${pair_count} cname_only pair(s)"
+        printf 'hostname\troot_domain\tcname_target\tverdict\tdiscovery_sources\n' > "$out"
+        rm -rf "$work"
+        return 0
+    fi
+
+    # Distinct targets are what cost queries; the same ELB is typically pointed at
+    # by dozens of hosts (51 hosts shared one k8s ingress on the run above).
+    cut -f3 "$pairs" | _cloud_asset_normalize | sort -u > "${work}/targets.txt"
+    local target_count=0
+    [[ -s "${work}/targets.txt" ]] && target_count=$(wc -l < "${work}/targets.txt")
+
+    local max_targets="${METHO_TAKEOVER_MAX_TARGETS:-5000}"
+    if (( target_count > max_targets )); then
+        head -n "$max_targets" "${work}/targets.txt" > "${work}/targets.capped"
+        mv "${work}/targets.capped" "${work}/targets.txt"
+        _record_truncation "all" "takeover-check" "${target_count} distinct CNAME targets exceed METHO_TAKEOVER_MAX_TARGETS=${max_targets} — ${max_targets} tested"
+        log_warn "Takeover check: ${target_count} distinct targets exceed the ${max_targets} cap — testing the first ${max_targets} (raise METHO_TAKEOVER_MAX_TARGETS)"
+        target_count=$max_targets
+    fi
+
+    log_info "Takeover check: resolving ${target_count} distinct CNAME target(s) behind ${pair_count} cname_only host(s)"
+
+    local cap="${DNSX_TIMEOUT}"
+    local scaled=$(( target_count / 50 ))
+    (( scaled > cap )) && cap=$scaled
+    (( cap > 3600 )) && cap=3600
+
+    : > "${work}/resolve.json"
+    _dnsx_resolve_to "${work}/targets.txt" "${work}/resolve.json" \
+        "${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt}" "$cap"
+
+    # Targets that answered with an address are alive. dnsx only emits what it
+    # resolves, so "absent from this list" means "gave us nothing".
+    jq -r 'select(((.a // []) | length > 0) or ((.aaaa // []) | length > 0))
+           | .host | ascii_downcase' "${work}/resolve.json" 2>/dev/null \
+        | sort -u > "${work}/alive.txt" || : > "${work}/alive.txt"
+
+    # Everything else gets the rcode pass, which separates a positively dead name
+    # from one we merely could not ask about. Only a confirmed NXDOMAIN is called
+    # dangling, matching the settlement policy used everywhere else.
+    comm -23 "${work}/targets.txt" "${work}/alive.txt" > "${work}/unknown.txt" 2>/dev/null || true
+    : > "${work}/dead.txt"
+    if [[ -s "${work}/unknown.txt" ]]; then
+        local n_cap="${DNSX_TIMEOUT}"
+        local n_unknown
+        n_unknown=$(wc -l < "${work}/unknown.txt" | tr -d '[:space:]')
+        local n_scaled=$(( n_unknown / 50 ))
+        (( n_scaled > n_cap )) && n_cap=$n_scaled
+        (( n_cap > 3600 )) && n_cap=3600
+        cat "${work}/unknown.txt" | timeout "$n_cap" dnsx \
+            -silent -rcode nxdomain -json \
+            -retry "${DNSX_RETRY}" \
+            -r "${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt}" \
+            -timeout "$(_dnsx_query_timeout)" \
+            -t "$(_dnsx_threads)" \
+            2>/dev/null \
+            | jq -r '(.host | ascii_downcase)' 2>/dev/null \
+            | sort -u > "${work}/dead.txt" || : > "${work}/dead.txt"
+    fi
+
+    # Verdict per (host, target) pair, then a per-host roll-up so the file reads
+    # "this host is dangling" rather than making the operator join targets back.
+    printf 'hostname\troot_domain\tcname_target\tverdict\tdiscovery_sources\n' > "$out"
+    _takeover_classify "$pairs" "${work}/alive.txt" "${work}/dead.txt" | sort -u >> "$out"
+
+    local n_dangling=0 n_alive=0 n_unres=0
+    n_dangling=$(awk -F'\t' '$4 == "dangling"' "$out" | wc -l | tr -d '[:space:]')
+    n_alive=$(awk -F'\t' '$4 == "alive"' "$out" | wc -l | tr -d '[:space:]')
+    n_unres=$(awk -F'\t' '$4 == "unresolved"' "$out" | wc -l | tr -d '[:space:]')
+
+    if (( n_dangling > 0 )); then
+        log_warn "Takeover check: ${n_dangling} DANGLING CNAME pair(s) — the target does not exist. See final/final_takeover_candidates.txt"
+    fi
+    log_success "Takeover check: ${n_dangling} dangling, ${n_unres} unresolved, ${n_alive} alive (from ${pair_count} cname_only host(s))"
+    rm -rf "$work"
+    return 0
+}
+
+# ── Merge the per-domain reserved-address audit logs ─────────────────────────
+#   _bogon_merge_global <global_tsv> <per-domain tsv>...
+#
+# Unions every <per-domain-tsv>.bogon into <global_tsv>.bogon, reset once so a
+# reused output directory cannot accumulate a previous run's evidence. Missing
+# per-domain logs are normal (a domain with no reserved records never writes
+# one) and are skipped silently; if NO domain produced one the global file is
+# created empty, which the caller distinguishes from "no evidence available".
+_bogon_merge_global() {
+    local global_tsv="$1"; shift
+    local out="${global_tsv}.bogon"
+    : > "$out" 2>/dev/null || true
+    local f
+    for f in "$@"; do
+        [[ -s "${f}.bogon" ]] && cat "${f}.bogon" >> "$out" 2>/dev/null
+    done
+    if [[ -s "$out" ]]; then
+        sort -u "$out" -o "$out" 2>/dev/null || true
+    fi
+    return 0
+}
+
 # ── Merge per-domain canonical DNS TSVs into the global TSV ───────────────────
 # After parallel Phase 1 processing, each domain has its own canonical_dns.tsv
 # and httpx_metadata.tsv in phase1/<domain>/. This function merges them into the
@@ -1041,6 +1244,28 @@ merge_per_domain_dns() {
                 }
             }
         ' "${per_domain_tsvs[@]}" >> "$global_tsv"
+
+        # ── Merge the reserved-address audit logs ───────────────────────────
+        # The per-domain pass STRIPS reserved addresses as it resolves, so by the
+        # time the global TSV is assembled from those rows there is nothing left
+        # in it to audit: every bogon row has empty A/AAAA by construction. The
+        # evidence lives only in each domain's canonical_dns.tsv.bogon.
+        #
+        # The global file was never built from them, which produced a run that
+        # contradicted itself in the same log. The per-domain pass printed
+        # "198.18.0.0/15 (RFC 2544) is present" (126 matching rows in
+        # phase1/vodafone.com/canonical_dns.tsv.bogon), and every merged pass
+        # afterwards printed "No 198.18.0.0/15 present" — because the verdict is
+        # decided by grepping ${tsv}.bogon, the file did not exist, and grep on a
+        # missing file reports absence rather than ignorance. The bogon COUNT was
+        # always right (it is read from TSV status), so only the verdict and the
+        # trail were wrong — but the verdict is what tells an operator whether
+        # 1,067 excluded hosts are a fake-IP VPN artefact or genuine published
+        # private records, and it was answering from no evidence at all.
+        #
+        # Concatenated here rather than re-derived, so the merged file is exactly
+        # the per-domain evidence and cannot drift from it.
+        _bogon_merge_global "$global_tsv" "${per_domain_tsvs[@]}"
 
         local entry_count=0
         [[ -s "$global_tsv" ]] && entry_count=$(awk -F'\t' '$1 != "hostname"' "$global_tsv" | wc -l)

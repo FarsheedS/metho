@@ -214,9 +214,25 @@ run_phase2() {
                 # ALL findings (we saw 116 findings → "0 assets"). Read every
                 # line as a raw string and parse defensively so non-JSON
                 # banner lines are skipped instead of aborting the parse.
-                jq -R 'fromjson? // empty | select(.msg != null) | .target' \
+                #
+                # `-r` is load-bearing, not cosmetic. Without it jq emits each
+                # .target as a JSON STRING, quotes included, so the asset list
+                # held `"http://admin-vodafone.s3.amazonaws.com/"` while every
+                # other source in this file contributes a bare hostname. Nothing
+                # downstream coped: results.sh strips a scheme with a regex that
+                # does not match a leading quote, so the row reduced to `"http:`,
+                # failed the in-scope test, and all 40 cloud_enum assets were
+                # dropped from every results/<root>/cloud_assets.txt while sitting
+                # in the aggregate — the exact "present in one deliverable, absent
+                # from the other" split this pipeline keeps producing.
+                #
+                # Normalized through the same normalize_hostname the canonical
+                # layer uses (strip scheme/port/path, lowercase) so the three
+                # sources are actually comparable under `sort -u` below.
+                jq -Rr 'fromjson? // empty | select(.msg != null) | .target' \
                     "${pdir}/cloud_enum_results.json" 2>/dev/null | \
-                    sort -u > "${pdir}/cloud_enum_assets.txt" || true
+                    _cloud_asset_normalize | sort -u \
+                    > "${pdir}/cloud_enum_assets.txt" || true
 
                 # Extract any newly discovered hostnames from cloud_enum and add
                 # to the canonical dataset — but only in-scope ones. cloud_enum
@@ -263,12 +279,15 @@ run_phase2() {
     local p1_katana_urls="${pdir}/.katana_urls.tmp"
     : > "$p1_katana_urls"
 
-    for ddir in "${OUTPUT_DIR}"/phase1/*/; do
+    # Scoped to this run's roots, like the canonical merge: a stale
+    # phase1/<other-root>/ from a reused output directory would otherwise
+    # contribute its crawl URLs straight into this run's cloud-asset list.
+    while IFS= read -r ddir; do
         [[ -d "$ddir" ]] || continue
         if [[ -s "${ddir}katana/discovered_urls.txt" ]]; then
             cat "${ddir}katana/discovered_urls.txt" >> "$p1_katana_urls"
         fi
-    done
+    done < <(_root_domain_dirs)
 
     if [[ -s "$p1_katana_urls" ]]; then
         sort -u "$p1_katana_urls" -o "$p1_katana_urls"
@@ -292,11 +311,38 @@ run_phase2() {
     # ── Stage 4: Consolidate Cloud Assets ───────────────────────────────────
     log_info "Consolidating cloud assets"
 
+    # Every source is normalized to a bare hostname and then unioned, so the
+    # aggregate is one shape and `sort -u` dedupes across sources rather than
+    # merely across formats.
+    #
+    # The CNAME column of the canonical dataset is a FOURTH source, and adding it
+    # is the fix for the aggregate disagreeing with its own per-root slices. The
+    # three phase-2 sources are what the pipeline *discovers*; the CNAME column is
+    # what the estate actually *points at*, which is a strictly larger set — 1,296
+    # rows of canonical_dns.tsv carry a cloud CNAME target. results.sh already
+    # read that column to build results/<root>/cloud_assets.txt, so on a real run
+    # the per-root files totalled 1,344 entries while this aggregate claimed 849,
+    # and 544 real endpoints (*.elb.amazonaws.com, *.vpce.amazonaws.com,
+    # *.cloudapp.net) existed in one deliverable and not the other. Unioning the
+    # derivations makes the aggregate the superset and the slice consistent.
+    local _cloud_cnames="${pdir}/.canonical_cloud_cnames.tmp"
+    : > "$_cloud_cnames"
+    if [[ -s "${OUTPUT_DIR}/canonical_dns.tsv" ]]; then
+        awk -F'\t' '$1 != "hostname" && $6 != "" { n = split($6, a, ";"); for (i = 1; i <= n; i++) print a[i] }' \
+            "${OUTPUT_DIR}/canonical_dns.tsv" 2>/dev/null \
+            | _cloud_asset_normalize > "${_cloud_cnames}.raw" 2>/dev/null || true
+        [[ -s "${_cloud_cnames}.raw" ]] && \
+            filter_cloud_domains "${_cloud_cnames}.raw" "$_cloud_cnames" 2>/dev/null || true
+        rm -f "${_cloud_cnames}.raw"
+    fi
+
     cat \
         "${pdir}/dnsx_cloud_domains.txt" \
         "${pdir}/cloud_enum_assets.txt" \
         "${pdir}/katana_cloud_assets.txt" \
-        2>/dev/null | sort -u > "${pdir}/final_cloud_assets.txt" || true
+        "$_cloud_cnames" \
+        2>/dev/null | _cloud_asset_normalize | sort -u > "${pdir}/final_cloud_assets.txt" || true
+    rm -f "$_cloud_cnames"
 
     if [[ -s "${pdir}/final_cloud_assets.txt" ]]; then
         log_success "Total unique cloud assets: $(wc -l < "${pdir}/final_cloud_assets.txt")"

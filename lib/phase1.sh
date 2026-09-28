@@ -24,7 +24,7 @@ run_phase1() {
     # complete, merge_per_domain_dns combines them into the global TSV that
     # Phase 2 and Phase 3 consume.
     _process_domain_wrapper() {
-        local _d="$1" _cap="${DOMAIN_TIMEOUT:-5400}"
+        local _d="$1" _cap="${DOMAIN_TIMEOUT:-7200}"
         if [[ "$_cap" -le 0 ]]; then
             process_domain "$_d" "$pdir"
             return 0
@@ -248,7 +248,8 @@ process_domain() {
                 [[ "$_gh_probe_code" != "200" ]] && log_warn "GitHub token pre-flight returned HTTP ${_gh_probe_code} (not 200) — running anyway"
                 log_info "Running GitHub-subdomains..."
                 local _gh_rc=0
-                with_passive_proxy timeout "${GITHUB_SUBDOMAINS_TIMEOUT:-300}" github-subdomains \
+                # Fallbacks here must match the declaration in lib/utils.sh.
+                with_passive_proxy timeout "${GITHUB_SUBDOMAINS_TIMEOUT:-600}" github-subdomains \
                     -d "$domain" -t "$gh_token" -o github_subdomains.txt \
                     < /dev/null 2>/dev/null || _gh_rc=$?
                 # A capped passive source is a partial subdomain list, and the
@@ -256,8 +257,8 @@ process_domain() {
                 # historically relied on the token being valid; a slow API is
                 # the other way this source silently shrinks.)
                 if _was_capped "$_gh_rc"; then
-                    _record_truncation "$domain" "github-subdomains" "hit its ${GITHUB_SUBDOMAINS_TIMEOUT:-300}s cap — source coverage is partial"
-                    log_warn "GitHub-subdomains was KILLED at its ${GITHUB_SUBDOMAINS_TIMEOUT:-300}s cap — the count below is a LOWER BOUND"
+                    _record_truncation "$domain" "github-subdomains" "hit its ${GITHUB_SUBDOMAINS_TIMEOUT:-600}s cap — source coverage is partial"
+                    log_warn "GitHub-subdomains was KILLED at its ${GITHUB_SUBDOMAINS_TIMEOUT:-600}s cap — the count below is a LOWER BOUND"
                 fi
                 local gh_count=0
                 [[ -s github_subdomains.txt ]] && gh_count=$(wc -l < github_subdomains.txt)
@@ -465,12 +466,12 @@ process_domain() {
         # delivered nothing.
         local _cewl_in="wordlists/.cewl_input.txt"
         local _cewl_counts
-        _cewl_counts=$(_cap_crawl_hosts live_subdomains_round1.txt "${CEWL_MAX_HOSTS:-150}" "$_cewl_in" "CeWL")
+        _cewl_counts=$(_cap_crawl_hosts live_subdomains_round1.txt "${CEWL_MAX_HOSTS:-300}" "$_cewl_in" "CeWL")
         local _cewl_kept="${_cewl_counts%% *}" _cewl_all="${_cewl_counts##* }"
 
-        log_info "CeWL: crawling ${_cewl_kept} of ${_cewl_all} hosts (depth ${CEWL_DEPTH:-2}, mem cap ${CEWL_MEM_LIMIT_MB:-1024}MB, ${PARALLEL_HOSTS:-5} in parallel, stage budget ${CRAWL_STAGE_TIMEOUT:-1200}s)..."
+        log_info "CeWL: crawling ${_cewl_kept} of ${_cewl_all} hosts (depth ${CEWL_DEPTH:-2}, mem cap ${CEWL_MEM_LIMIT_MB:-1024}MB, ${PARALLEL_HOSTS:-5} in parallel, stage budget ${CRAWL_STAGE_TIMEOUT:-1800}s)..."
         METHO_STAGE_LABEL="CeWL" \
-        METHO_STAGE_DEADLINE="$(_stage_deadline "${CRAWL_STAGE_TIMEOUT:-1200}")" \
+        METHO_STAGE_DEADLINE="$(_stage_deadline "${CRAWL_STAGE_TIMEOUT:-1800}")" \
             bounded_parallel "${PARALLEL_HOSTS:-5}" "$_cewl_in" _cewl_one_host
         rm -f "$_cewl_in"
 
@@ -661,9 +662,13 @@ WORDBASE
         : > dnsgen_results.txt
     elif command -v dnsgen &>/dev/null; then
         # Build input from all subdomains discovered so far (passive + brute).
-        # Keep only valid hostname characters — passive sources (esp. waymore
-        # URL parsing) leak debris like "2Fapp.example.com" (URL-encoding
-        # fragments) that dnsgen would treat as real labels.
+        # Keep only valid hostname characters. This is a CHARSET guard, not a
+        # defence against URL-encoding debris: "2Fapp.example.com" is perfectly
+        # charset-valid, so this filter passes it, and a run did feed 37 such
+        # names to dnsgen as seeds. The fix for those belongs upstream in
+        # extract_domains (percent-decoding, including the double-encoded
+        # %252F case) — a regex here cannot tell "2F" junk from a real hostname
+        # like "2fa.id.aws.cps.vodafone.com", which was in the same run.
         cat all_subdomains_round1.txt shuffledns_results.txt 2>/dev/null \
             | grep -E '^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$' \
             | sort -u > dnsgen_input.txt || true
@@ -683,6 +688,18 @@ WORDBASE
         #       (resolved hosts prioritized: they reveal live naming
         #       patterns) and bound the candidate volume.
         # 0 disables the skip (a threshold of 0 would otherwise skip always)
+        #
+        # The two levers are ORDERED, not independent, and the lower one decides.
+        # At the shipped defaults the skip fires at 100 while the cap only
+        # applies above 500, so the cap branch below is unreachable — any input
+        # large enough to need capping has already been skipped. It is retained
+        # because it does fire in the two configurations where the cap is the
+        # binding rule: DNSGEN_SKIP_THRESHOLD raised above DNSGEN_MAX_INPUT, and
+        # DNSGEN_SKIP_THRESHOLD=0 (mapped to a huge number above, i.e. "never
+        # skip"). What protects a SMALL domain is neither of these — it is
+        # DNSGEN_MAX_OUTPUT_BYTES, because the explosion is per input (52 inputs
+        # produced 40,362 candidates) and truncating the seed list cannot bound
+        # it.
         local _dnsgen_skip="${DNSGEN_SKIP_THRESHOLD:-100}"
         [[ "$_dnsgen_skip" -eq 0 ]] && _dnsgen_skip=$((1<<62))
         local _dnsgen_max="${DNSGEN_MAX_INPUT:-500}"
@@ -720,9 +737,10 @@ WORDBASE
             # number mutations and port suffixes — a near-no-op for domains
             # without digits/ports in their subdomains (verified in E2E
             # testing: fast mode → 0 permutations).
-            # Volume is controlled by DNSGEN_MAX_INPUT (500) upstream and
-            # this byte cap downstream (head -c cuts mid-generation, so a
-            # runaway generator can't outlast DNSGEN_TIMEOUT either).
+            # Volume is controlled by this byte cap (head -c cuts
+            # mid-generation, so a runaway generator can't outlast
+            # DNSGEN_TIMEOUT either). It, not DNSGEN_MAX_INPUT upstream, is the
+            # binding limit on a sub-threshold domain — see the lever note above.
             # Filter to strict hostnames: dnsgen v2 logs (rich) go to
             # STDOUT, not stderr — the "Generated N variations" INFO line
             # and spinner escapes would otherwise land in the permutations
@@ -926,9 +944,9 @@ WORDBASE
         _ka_counts=$(_cap_crawl_hosts live_subdomains_round2.txt "${CRAWL_MAX_HOSTS:-300}" "$_ka_in" "Katana")
         _ka_kept="${_ka_counts%% *}"; _ka_all="${_ka_counts##* }"
 
-        log_info "Katana: crawling ${_ka_kept} of ${_ka_all} hosts (katana cap ${KATANA_CRAWL_DURATION:-9m}, hard timeout ${KATANA_TIMEOUT:-600}s, ${PARALLEL_HOSTS:-5} in parallel, stage budget ${CRAWL_STAGE_TIMEOUT:-1200}s)..."
+        log_info "Katana: crawling ${_ka_kept} of ${_ka_all} hosts (katana cap ${KATANA_CRAWL_DURATION:-9m}, hard timeout ${KATANA_TIMEOUT:-600}s, ${PARALLEL_HOSTS:-5} in parallel, stage budget ${CRAWL_STAGE_TIMEOUT:-1800}s)..."
         METHO_STAGE_LABEL="Katana" \
-        METHO_STAGE_DEADLINE="$(_stage_deadline "${CRAWL_STAGE_TIMEOUT:-1200}")" \
+        METHO_STAGE_DEADLINE="$(_stage_deadline "${CRAWL_STAGE_TIMEOUT:-1800}")" \
             bounded_parallel "${PARALLEL_HOSTS:-5}" "$_ka_in" _katana_one_host
         rm -f "$_ka_in"
 
@@ -1014,9 +1032,9 @@ WORDBASE
         _sd_counts=$(_cap_crawl_hosts live_subdomains_round2.txt "${CRAWL_MAX_HOSTS:-300}" "$_sd_in" "SubDomainizer")
         _sd_kept="${_sd_counts%% *}"; _sd_all="${_sd_counts##* }"
 
-        log_info "Subdomainizer: scanning ${_sd_kept} of ${_sd_all} hosts (${PARALLEL_HOSTS:-5} in parallel, stage budget ${CRAWL_STAGE_TIMEOUT:-1200}s)..."
+        log_info "Subdomainizer: scanning ${_sd_kept} of ${_sd_all} hosts (${PARALLEL_HOSTS:-5} in parallel, stage budget ${CRAWL_STAGE_TIMEOUT:-1800}s)..."
         METHO_STAGE_LABEL="SubDomainizer" \
-        METHO_STAGE_DEADLINE="$(_stage_deadline "${CRAWL_STAGE_TIMEOUT:-1200}")" \
+        METHO_STAGE_DEADLINE="$(_stage_deadline "${CRAWL_STAGE_TIMEOUT:-1800}")" \
             bounded_parallel "${PARALLEL_HOSTS:-5}" "$_sd_in" _subdomainizer_one_host
         rm -f "$_sd_in"
 

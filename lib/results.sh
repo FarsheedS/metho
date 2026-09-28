@@ -239,10 +239,13 @@ _tag_root_slices() {
             if (cloud != "") {
                 while ((getline line < cloud) > 0) {
                     if (line == "") continue
-                    v = line
+                    v = tolower(line)
+                    gsub(/^[ \t]*"|"[ \t]*$/, "", v)              # strip JSON quotes
                     sub(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "", v)   # strip scheme
-                    sub(/[/:?].*$/, "", v)                        # strip port/path
-                    for (r in want) if (in_scope_of(v, r)) print r, line > (work "/cloud.tsv")
+                    sub(/[\/:;?].*$/, "", v)                       # strip port/path
+                    sub(/^\.+/, "", v)
+                    if (v == "") continue
+                    for (r in want) if (in_scope_of(v, r)) print r, v > (work "/cloud.tsv")
                 }
                 close(cloud)
             }
@@ -256,14 +259,34 @@ _place_root_slices() {
     # CNAME targets that point at cloud infrastructure are cloud assets too.
     # Filter them once, globally, then tag — the provider regex is the same for
     # every root, so there is no reason to run it per root.
+    #
+    # The target is NORMALIZED on the way through, which it was not. The CNAME
+    # column is raw resolver output, so it preserves whatever case each record was
+    # published in, and the same target commonly appears twice in one cell under
+    # two cases (`af-stage-elb-….amazonaws.com;AF-STAGE-ELB-….amazonaws.com`).
+    # Unnormalized, one asset became several rows here while the global aggregate
+    # held a single lowercased copy — 33 entries existed in results/<root>/ and
+    # not in final/, which is precisely the two-deliverables-disagree symptom this
+    # change set is closing. Normalizing both sides makes the per-root file a
+    # genuine subset of the aggregate and kills the case-duplicate rows.
     if [[ -s "${work}/cname.tsv" ]]; then
-        cut -f2 "${work}/cname.tsv" | sort -u > "${work}/.cname_uniq"
+        cut -f2 "${work}/cname.tsv" | sort -u | _cloud_asset_normalize \
+            | sort -u > "${work}/.cname_uniq"
         filter_cloud_domains "${work}/.cname_uniq" "${work}/.cname_cloud" || true
         if [[ -s "${work}/.cname_cloud" ]]; then
+            # Re-tag: emit (root, normalized-target) for every CNAME whose
+            # normalized form is a cloud endpoint.
             awk -F'\t' -v OFS='\t' '
                 NR == FNR { keep[$1] = 1; next }
-                ($2 in keep) { print $1, $2 }
-            ' "${work}/.cname_cloud" "${work}/cname.tsv" | sort -t$'\t' -k1,1 > "${work}/cnamecloud.tsv"
+                {
+                    v = tolower($2)
+                    sub(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "", v)
+                    sub(/[\/:;?].*$/, "", v)
+                    sub(/^\.+/, "", v)
+                    if (v in keep) print $1, v
+                }
+            ' "${work}/.cname_cloud" "${work}/cname.tsv" | sort -u -t$'\t' -k1,1 \
+                > "${work}/cnamecloud.tsv"
         fi
         rm -f "${work}/.cname_uniq" "${work}/.cname_cloud"
     fi
