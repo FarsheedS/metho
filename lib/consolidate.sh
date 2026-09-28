@@ -8,8 +8,37 @@ run_consolidation() {
 
     log_info "═══ CONSOLIDATING ALL RESULTS ═══"
 
-    # ── All Domains (all subdomains from Phase 1) ───────────────────────────
-    cat "${OUTPUT_DIR}"/phase1/*/all_subdomains_final.txt 2>/dev/null | sort -u > "${fdir}/final_all_domains.txt" || true
+    # Every glob below used to be a bare `phase1/*`. The canonical DNS merge
+    # scopes itself to this run's roots (_root_domain_dirs), so a reused output
+    # directory correctly kept a previous run's hosts out of canonical_dns.tsv —
+    # but these four files did not, and quietly imported the whole of a stale
+    # phase1/<other-root>/ into final_all_domains.txt, final_live_web_servers.txt,
+    # final_httpx_metadata.json and final_waymore_urls.txt. Same filter, one
+    # definition: collect the in-scope directories once.
+    local -a _p1_dirs=()
+    local _d
+    while IFS= read -r _d; do
+        [[ -n "$_d" ]] && _p1_dirs+=("$_d")
+    done < <(_root_domain_dirs | sort)
+
+    # ── All Domains (every hostname in the canonical dataset) ───────────────
+    # Sourced from canonical_dns.tsv, not from the raw per-domain inventories.
+    # The raw concatenation is Phase 1 ONLY: it misses everything Phase 2 and
+    # Phase 3 add to the dataset (on a real run, 44 hostnames from dnsx-cloud and
+    # 13 from ptr-reverse) and it is not case-normalized, so 51 of its rows were
+    # the same hosts as canonical under different capitalization — a set
+    # comparison against results/<root>/subdomains.txt produced 147 phantom
+    # differences. It also meant this file disagreed with its own README line
+    # ("Every subdomain across all root domains") and with the number
+    # RECON_SUMMARY.txt reported.
+    #
+    # canonical_dns.tsv is the dataset every other deliverable already treats as
+    # authoritative, so deriving from it makes the two agree by construction.
+    if [[ -s "${OUTPUT_DIR}/canonical_dns.tsv" ]]; then
+        awk -F'\t' '$1 != "hostname" && $1 != "" { print $1 }' \
+            "${OUTPUT_DIR}/canonical_dns.tsv" 2>/dev/null | sort -u \
+            > "${fdir}/final_all_domains.txt" || true
+    fi
     local domain_total=0
     [[ -s "${fdir}/final_all_domains.txt" ]] && domain_total=$(wc -l < "${fdir}/final_all_domains.txt")
 
@@ -17,9 +46,13 @@ run_consolidation() {
     # Phase 1's per-domain results plus Phase 3's late-window probe — hosts
     # that only resolved after Phase 1 finished looking, and which would
     # otherwise carry DNS records but never appear as live servers.
-    cat "${OUTPUT_DIR}"/phase1/*/live_subdomains_final.txt \
-        "${OUTPUT_DIR}/phase3/live_hosts_late.txt" \
-        2>/dev/null | sort -u > "${fdir}/final_live_web_servers.txt" || true
+    local -a _live_srcs=()
+    for _d in "${_p1_dirs[@]}"; do
+        _live_srcs+=("${_d%/}/live_subdomains_final.txt")
+    done
+    _live_srcs+=("${OUTPUT_DIR}/phase3/live_hosts_late.txt")
+    cat "${_live_srcs[@]}" 2>/dev/null | sort -u \
+        > "${fdir}/final_live_web_servers.txt" || true
     local live_total=0
     [[ -s "${fdir}/final_live_web_servers.txt" ]] && live_total=$(wc -l < "${fdir}/final_live_web_servers.txt")
 
@@ -28,7 +61,29 @@ run_consolidation() {
     # fields). A host probed in multiple rounds can have sparser records (e.g.
     # a redirect captured early); scoring by populated-field count and taking
     # the max per URL avoids keeping a thin record over a rich one.
-    if cat "${OUTPUT_DIR}"/phase1/*/httpx_results_final.json 2>/dev/null | \
+    #
+    # Every round is read, not just the last. This file previously globbed only
+    # httpx_results_final.json, so a host whose ONLY record came from round 1 or
+    # round 2 — because round 3 was a delta and never re-probed it — was absent
+    # from the metadata file while still present in httpx_metadata.tsv and in
+    # final_live_web_servers.txt. Phase 3's late-window probe is included for the
+    # same reason: those hosts are in the live-server list but their metadata was
+    # in no consolidated file at all.
+    local -a _httpx_jsons=()
+    local _hd
+    for _hd in "${_p1_dirs[@]}"; do
+        local _j
+        for _j in "${_hd}"httpx_results_round1.json "${_hd}"httpx_results_round2.json \
+                  "${_hd}"httpx_results_final.json "${_hd}"httpx_results_late.json; do
+            [[ -s "$_j" ]] && _httpx_jsons+=("$_j")
+        done
+    done
+    [[ -s "${OUTPUT_DIR}/phase3/httpx_results_late.json" ]] && \
+        _httpx_jsons+=("${OUTPUT_DIR}/phase3/httpx_results_late.json")
+
+    if (( ${#_httpx_jsons[@]} == 0 )); then
+        : > "${fdir}/final_httpx_metadata.json" 2>/dev/null || true
+    elif cat "${_httpx_jsons[@]}" 2>/dev/null | \
         jq -s -r 'map(select(.url != null))
                   | group_by(.url)
                   | map( (map(. as $r | {rec:$r, score: ([$r | to_entries[] | select(.value != null)] | length)})
@@ -38,7 +93,7 @@ run_consolidation() {
         :
     else
         # Fallback: if jq/parse hiccups, keep the plain concat (no data loss).
-        cat "${OUTPUT_DIR}"/phase1/*/httpx_results_final.json 2>/dev/null \
+        cat "${_httpx_jsons[@]}" 2>/dev/null \
             > "${fdir}/final_httpx_metadata.json" || true
     fi
 
@@ -48,14 +103,42 @@ run_consolidation() {
         log_info "Canonical DNS dataset: $(awk -F'\t' '$1 != "hostname"' "${fdir}/canonical_dns.tsv" | wc -l) entries"
     fi
 
+    # ── Subdomain-takeover candidates ───────────────────────────────────────
+    # Runs here, on the merged dataset, because cname_only hosts from every root
+    # have to be in one place before their targets can be de-duplicated — 51 of
+    # them pointed at a single k8s ingress on the run this was written against.
+    # Writes final/final_takeover_candidates.txt.
+    canonical_dns_takeover_check
+    local takeover_dangling=0 takeover_total=0
+    if [[ -s "${fdir}/final_takeover_candidates.txt" ]]; then
+        takeover_total=$(awk -F'\t' '$1 != "hostname"' "${fdir}/final_takeover_candidates.txt" | wc -l | tr -d '[:space:]')
+        takeover_dangling=$(awk -F'\t' '$4 == "dangling"' "${fdir}/final_takeover_candidates.txt" | wc -l | tr -d '[:space:]')
+    fi
+
     # ── HTTPX Metadata TSV (per-host CDN/tech/webserver companion) ──────────
     if [[ -s "${OUTPUT_DIR}/httpx_metadata.tsv" ]]; then
         cp "${OUTPUT_DIR}/httpx_metadata.tsv" "${fdir}/httpx_metadata.tsv"
     fi
 
+    # ── Reserved-address audit trail ────────────────────────────────────────
+    # The addresses behind every `bogon` host, with the range each one matched.
+    # Copied into final/ because the log line that reports the exclusion points
+    # at the dataset, and the dataset is not where anyone looks for a deliverable
+    # — the audit is the only way to tell an RFC1918 leak from a CGNAT name from
+    # a fake-IP VPN artefact, and working that out by hand costs a re-resolve per
+    # host. Absent when no host resolved into reserved space.
+    if [[ -s "${OUTPUT_DIR}/canonical_dns.tsv.bogon" ]]; then
+        cp "${OUTPUT_DIR}/canonical_dns.tsv.bogon" "${fdir}/canonical_dns.tsv.bogon"
+    fi
+
     # ── Waymore URLs ─────────────────────────────────────────────────────────
-    # Merge all per-domain waymore URL outputs into one file
-    cat "${OUTPUT_DIR}"/phase1/*/waymore_urls.txt 2>/dev/null | sort -u > "${fdir}/final_waymore_urls.txt" || true
+    # Merge all per-domain waymore URL outputs into one file, scoped to this
+    # run's roots like every other glob here.
+    local -a _waymore_srcs=()
+    for _d in "${_p1_dirs[@]}"; do
+        _waymore_srcs+=("${_d%/}/waymore_urls.txt")
+    done
+    cat "${_waymore_srcs[@]}" 2>/dev/null | sort -u > "${fdir}/final_waymore_urls.txt" || true
     local waymore_total=0
     [[ -s "${fdir}/final_waymore_urls.txt" ]] && waymore_total=$(wc -l < "${fdir}/final_waymore_urls.txt")
 
@@ -148,6 +231,7 @@ ASSETS DISCOVERED:
 - IP Addresses:       ${ip_total}
 - IPv6 Addresses:     ${ip_total_v6:-0} (inventory only - not port-scanned)
 - IP:Port Pairs:      ${port_pair_total}
+- Takeover Pairs:     ${takeover_total} (${takeover_dangling} dangling — target does not exist)
 
 IP CLASSIFICATION:
 - CDN IPs:            ${cdn_count}
@@ -174,6 +258,8 @@ FILES CREATED IN final/:
 - final_non_cdn_ips.txt          (non-CDN IPs)
 - final_nmap_candidates.txt      (IPs targeted for port scanning)
 - final_domain_ip_map.txt        (domain→IP mapping)
+- final_takeover_candidates.txt  (cname_only hosts + CNAME target resolution verdict)
+- canonical_dns.tsv.bogon        (reserved addresses stripped, with matched ranges — absent if none)
 
 LOG FILE:
 - recon.log                      (timestamped log of all stages)

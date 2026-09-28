@@ -885,8 +885,15 @@ DNSX_TIMEOUT="${DNSX_TIMEOUT:-600}"
 
 AUTO=false
 SKIP_PHASES=()
-THREADS=50
-RATE_LIMIT=100
+# Every knob below is `${VAR:-default}` rather than a plain assignment, so it is
+# settable from the environment as well as from its CLI flag. It was not: these
+# were plain assignments, so `CEWL_MAX_HOSTS=0 metho` was silently ignored while
+# `--cewl-max-hosts 0` worked, which made the documented "set from the
+# environment" path unreachable for exactly the knobs an unattended run wants to
+# pin. parse_args runs after this file is sourced, so a flag still wins over the
+# environment, which is the intended order.
+THREADS="${THREADS:-50}"
+RATE_LIMIT="${RATE_LIMIT:-100}"
 # httpx concurrency PER PROCESS. Never passed before this existed, so httpx ran
 # at its built-in default of 50 threads.
 #
@@ -918,25 +925,25 @@ HTTPX_TIMEOUT_MAX="${HTTPX_TIMEOUT_MAX:-3600}"
 # has to be raisable — a plain assignment here silently ignored the environment
 # and made that advice impossible to follow without editing this file.
 HTTPX_THREADS_MAX="${HTTPX_THREADS_MAX:-200}"
-CHECKPOINT_TIMEOUT=30
+CHECKPOINT_TIMEOUT="${CHECKPOINT_TIMEOUT:-30}"
 OUTPUT_DIR="/output"
-CLOUD_ENUM_KEYWORDS=""
-PORT_SCAN=true
+CLOUD_ENUM_KEYWORDS="${CLOUD_ENUM_KEYWORDS:-}"
+PORT_SCAN="${PORT_SCAN:-true}"
 # Hard off-switch for dnsgen permutation brute force (Stage 4b). Independent of
 # DNSGEN_SKIP_THRESHOLD: when true, permutation is skipped for every domain
 # regardless of size. Recommended for large multi-domain sweeps where the
 # permutation multiplier would dominate runtime for little yield.
-SKIP_PERMUTATION=false
+SKIP_PERMUTATION="${SKIP_PERMUTATION:-false}"
 # How many live hosts to crawl in parallel within a per-host tool (CeWL,
 # Katana, SubDomainizer). These stages spend the vast majority of wall-clock
 # time crawling hosts one-by-one; a small bounded pool cuts that ~Nx with no
 # data loss.
-PARALLEL_HOSTS=5
+PARALLEL_HOSTS="${PARALLEL_HOSTS:-5}"
 # How many root domains to process in parallel during Phase 1. Each domain
 # gets its own canonical_dns.tsv and httpx_metadata.tsv; after all complete,
 # merge_per_domain_dns combines them into the global TSV. I/O-bound workloads
 # (DNS, HTTP) tolerate higher concurrency than CPU-bound ones.
-PARALLEL_DOMAINS=3
+PARALLEL_DOMAINS="${PARALLEL_DOMAINS:-3}"
 # How many hosts the wordlist-building and crawl stages may touch per domain
 # (CeWL at Stage 4a; Katana and SubDomainizer at Stage 6).
 #
@@ -949,19 +956,55 @@ PARALLEL_DOMAINS=3
 # The marginal value falls off a cliff well before the whole live set — the
 # wordlist from host #600 is noise — so capping the input keeps these stages
 # proportional to what they actually contribute. 0 = unlimited.
-CEWL_MAX_HOSTS=150
-CRAWL_MAX_HOSTS=300
+#
+# Raised from 150 to match CRAWL_MAX_HOSTS, because the cost per host is small
+# (a 4,087-host target spent 1m18s in CeWL on 150 hosts) and a wordlist built
+# from 300 hosts beats one from 150. What actually limits the yield is not the
+# count but WHICH hosts are picked — see _rank_crawl_candidates, which now
+# orders the input so these slots are spent on hosts that serve real content.
+CEWL_MAX_HOSTS="${CEWL_MAX_HOSTS:-300}"
+CRAWL_MAX_HOSTS="${CRAWL_MAX_HOSTS:-300}"
 # Wall-clock cap (seconds) for each crawl stage, independent of DOMAIN_TIMEOUT.
 # A host-count cap alone is not enough: per-host caps of 600s (CeWL/Katana)
 # multiply by the host count and can still outlast the domain budget.
 # 0 = unlimited.
-CRAWL_STAGE_TIMEOUT="${CRAWL_STAGE_TIMEOUT:-1200}"
+#
+# Raised from 1200 to 1800 on measured yield. On a 28,993-hostname run this
+# budget was reached with Katana at 159/300 hosts and SubDomainizer at only
+# 63/300 — and SubDomainizer was the single best hostname source of the whole
+# run: 443 net-new names in those 63 hosts, ~22/min, against ~14/min for
+# github-subdomains and ~13/min for waymore. Katana is the cheap one to extend
+# (~7.5s/host); SubDomainizer costs ~19s/host, so it is the term that sets the
+# cost of this change. Both are now also fed a ranked host list, so the extra
+# 600s buys hosts that serve content rather than canonical-redirect stubs.
+CRAWL_STAGE_TIMEOUT="${CRAWL_STAGE_TIMEOUT:-1800}"
+# Wall-clock cap (seconds) for the github-subdomains stage. It has no host input
+# — it is one code-search crawl — so it gets a flat cap rather than sharing the
+# crawl budget.
+#
+# Raised from 300 to 600: on the run above it was killed at 300s having
+# contributed 68 net-new hostnames (~14/min) and was still finding them, which
+# makes it the cheapest recovery on the board — 5 more minutes for a source that
+# had not finished. Declared here rather than inline at its call site so it is
+# visible in --help-adjacent listings and the run banner alongside the other
+# budgets.
+GITHUB_SUBDOMAINS_TIMEOUT="${GITHUB_SUBDOMAINS_TIMEOUT:-600}"
 # Per-domain wall-clock cap (seconds) for Phase 1. A single pathological domain
 # (huge permutation set, or DNS grinding through per-query timeouts) must never
 # gate the whole parallel pool. A watchdog TERMs then KILLs that domain's worker
 # once it outlives the cap; already-written partial results are kept. 0 =
-# unlimited. Default 5400s (90m) is generous — it only catches genuine hangs.
-DOMAIN_TIMEOUT=5400
+# unlimited.
+#
+# Raised from 5400 (90m) to 7200 (2h). Hitting this is the single worst outcome
+# in the pipeline: the domain is killed mid-stage and EVERY later stage for it —
+# Katana, SubDomainizer, Stage 7 consolidation, and its HTTPX round — never runs
+# at all. The motivating run had a 28,993-hostname domain finish Phase 1 in
+# 65m19s, i.e. only 25 minutes of headroom even before the crawl budget above was
+# lengthened; with it, the same domain would land near 82m, inside the old cap by
+# eight minutes. A cap that close to real work is a data-loss trap rather than a
+# hang guard, which is all it is meant to be. Single-target runs do not share a
+# parallel pool, so the original anti-gating argument for 5400s does not apply.
+DOMAIN_TIMEOUT="${DOMAIN_TIMEOUT:-7200}"
 # Probe hosts whose every address is reserved/private (status `bogon`).
 #
 # Those hosts are unreachable from the internet but NOT necessarily unreachable
@@ -985,7 +1028,7 @@ ASN_CONFIG_FILE=""
 # subdomains from the -oU URL list, not response bodies. Mode U keeps full
 # subdomain-discovery coverage while skipping the slow response-body
 # downloads that the pipeline never reads back (the -oR dir is unused).
-WAYMORE_MODE="U"
+WAYMORE_MODE="${WAYMORE_MODE:-U}"
 # Per-domain wall-clock cap for waymore. Mode U (URLs only) is much faster
 # than mode B (which downloads archived response bodies), so 600s is a sane
 # default; override with WAYMORE_TIMEOUT for very large domains.
@@ -1003,6 +1046,16 @@ CLOUD_ENUM_TIMEOUT="${CLOUD_ENUM_TIMEOUT:-900}"
 # permutation yield drops to near zero anyway (passive sources saturate
 # coverage — reconftw uses the same 500 threshold). Resolved hostnames
 # are prioritized. Set to 0 to disable the cap.
+#
+# This does NOT bound a small domain, and the arithmetic is worth stating
+# because it reads like it should. The skip test below fires at 100, so at the
+# shipped defaults any input set large enough to trip this cap has already been
+# skipped outright — the two thresholds are not independent, they are ordered,
+# and the lower one wins. The cap can therefore only ever fire when an operator
+# raises DNSGEN_SKIP_THRESHOLD above it. Bounding a sub-threshold domain is
+# DNSGEN_MAX_OUTPUT_BYTES' job instead, since the explosion happens per input
+# (a 52-input domain produced 40,362 candidates) and truncating the seed list
+# would not have moved that number.
 DNSGEN_MAX_INPUT="${DNSGEN_MAX_INPUT:-500}"
 
 # Skip dnsgen entirely when a domain has more than this many discovered
@@ -1016,10 +1069,19 @@ DNSGEN_MAX_INPUT="${DNSGEN_MAX_INPUT:-500}"
 # or set to 0 to never skip (permute every domain — not recommended at scale).
 DNSGEN_SKIP_THRESHOLD="${DNSGEN_SKIP_THRESHOLD:-100}"
 
-# Hard cap on dnsgen output size in bytes (default 25MB ≈ ~350K
-# candidates). Safety net against permutation explosion before the
-# resolution stage.
-DNSGEN_MAX_OUTPUT_BYTES="${DNSGEN_MAX_OUTPUT_BYTES:-26214400}"
+# Hard cap on dnsgen output size in bytes. Safety net against permutation
+# explosion before the resolution stage.
+#
+# Lowered from 25MB to 512KB, because 25MB never bound anything and is not what
+# protects a sub-threshold domain. Below DNSGEN_SKIP_THRESHOLD the skip cannot
+# fire, and DNSGEN_MAX_INPUT cannot either (see its note above), so the byte
+# ceiling is the ONLY thing standing between a small target and an unbounded
+# candidate set. Measured: 52 inputs produced 40,362 candidates in 1,207,527
+# bytes — ~30 bytes each — against a ceiling 20x larger, so nothing trimmed it
+# and the stage spent ~6 minutes resolving 40k names for zero hostnames. 512KB
+# ≈ 17K candidates: still ~330x the input count, so a genuine permutation hit is
+# not lost, but a pathological blow-up is bounded.
+DNSGEN_MAX_OUTPUT_BYTES="${DNSGEN_MAX_OUTPUT_BYTES:-524288}"
 
 # Naabu packets-per-second cap for the top-1000 SYN sweep. 1000 pps is
 # reconftw's NAABU_RATE default: fast enough that 1000 hosts × 1000 ports
@@ -1078,7 +1140,21 @@ NMAP_TIMEOUT_MAX="${NMAP_TIMEOUT_MAX:-3600}"
 # once gets probed across the whole estate; on a real run 226 of 247 discovered
 # ports came from GCP front-end artefacts on 2 hosts each. Well-known ports
 # (<1024) bypass this floor. 1 = no floor (previous behaviour).
-NMAP_MIN_PORT_HOSTS="${NMAP_MIN_PORT_HOSTS:-2}"
+#
+# Default lowered from 2 to 1, because the floor was dropping real findings. On
+# the run above naabu found 88.134.246.114:8080 open — the only host in the
+# estate with 8080 open — and the floor kept 8080 out of the -sV union, so it
+# was never fingerprinted; the scan went out with -p 53,80,110,443,2000,5060 and
+# the one non-standard service the sweep discovered was the one port it did not
+# look at.
+#
+# The floor was written when NAABU_TOP_PORTS was 1000, where an uncorroborated
+# port really could drag the union toward 1000 ports and re-scan every host
+# against all of them. At the current top-100 the union is bounded by 100 no
+# matter what, and NMAP_TIMEOUT_MAX bounds the wall clock, so the noise argument
+# no longer pays for the missed findings. Excluded ports are now logged rather
+# than dropped silently, so raising this back is an informed choice.
+NMAP_MIN_PORT_HOSTS="${NMAP_MIN_PORT_HOSTS:-1}"
 
 # Cap on how many ports nmap -sV service-detects in Stage 4b. naabu already
 # records EVERY open port (they are merged into the final ip_port_pairs), so
@@ -1087,7 +1163,7 @@ NMAP_MIN_PORT_HOSTS="${NMAP_MIN_PORT_HOSTS:-2}"
 # nmap re-scans every host against all of them — the single biggest time sink
 # in Phase 3. The cap keeps the N ports open on the MOST hosts (highest signal).
 # 0 = no cap (scan the full union). Override with --nmap-top-ports.
-NMAP_TOP_PORTS=100
+NMAP_TOP_PORTS="${NMAP_TOP_PORTS:-100}"
 
 # Numeric-argument guard: rejects non-integer values up-front so a typo like
 # `--threads abc` fails immediately with a clear message instead of deep inside
@@ -1175,14 +1251,14 @@ parse_args() {
                 echo "                            flight (default: 128). Size it to at least"
                 echo "                            parallel-domains × DNSX_THREADS_DOH, or queries queue past"
                 echo "                            dnsx's own timeout and are recorded as 'timeout'"
-                echo "  --domain-timeout N        Per-domain wall-clock cap in seconds (default: 5400; 0=off)"
+                echo "  --domain-timeout N        Per-domain wall-clock cap in seconds (default: 7200; 0=off)"
                 echo "  --rate-limit N            Requests/second (default: 100)"
                 echo "  --httpx-threads N         httpx threads per process (default: 150, hard maximum"
                 echo "                            ${HTTPX_THREADS_MAX}). This, not --rate-limit, is what bounds"
                 echo "                            probe throughput. Values above the maximum are clamped"
                 echo "                            and reported, not honoured silently."
                 echo "  --cewl-max-hosts N        Max live hosts CeWL may crawl for the brute-force"
-                echo "                            wordlist (default: 150; 0=unlimited)"
+                echo "                            wordlist (default: 300; 0=unlimited)"
                 echo "  --crawl-max-hosts N       Max live hosts Katana/SubDomainizer may crawl"
                 echo "                            (default: 300; 0=unlimited)"
                 echo "  --nmap-top-ports N        Cap nmap -sV to the N most-common open ports (default: 100; 0=no cap)"
@@ -1405,9 +1481,17 @@ setup_dirs() {
     #   httpx_metadata.tsv     written only when a merge produces rows, so a
     #                          leftover file is merged into rather than replaced
     #                          and keeps hosts that no longer answer.
+    #   cloud_enum_results.json  APPENDED to by cloud_enum as it scans, and
+    #                          re-parsed in full whenever it is non-empty, so a
+    #                          re-run into a reused directory reads the previous
+    #                          run's buckets as if this run had found them. It
+    #                          also defeats the 900s cap: the stage can be killed
+    #                          with nothing found and still report a full result
+    #                          set, from a run whose targets may be unrelated.
     rm -f "${OUTPUT_DIR}/stage_truncations.txt" \
           "${OUTPUT_DIR}/httpx_probed.txt" \
-          "${OUTPUT_DIR}/httpx_metadata.tsv"
+          "${OUTPUT_DIR}/httpx_metadata.tsv" \
+          "${OUTPUT_DIR}/phase2/cloud_enum_results.json"
     chmod -R 777 "$OUTPUT_DIR" 2>/dev/null || true
 }
 
@@ -1459,6 +1543,73 @@ _stage_deadline() {
     fi
 }
 
+# Order a live-host list by how much a crawl is likely to get out of each host,
+# so a host-count cap spends its slots on the hosts that have something to give.
+#
+# The cap alone was not enough. `head -n` over the live list picked whatever came
+# first, and that list is sorted alphabetically, so a 300-slot budget went to
+# adm.*, adminauth.*, adms.* … — the alphabet, not the target. Measured on a
+# 4,174-host run: the 300 hosts actually crawled were 208 canonical-redirect
+# stubs (301) and 11 real pages (200), while the corpus held 577 hosts answering
+# 200. CeWL then built a 168-word wordlist out of redirect stubs and the whole
+# crawl budget bought 445 net-new hostnames.
+#
+# Ranking is free — it reorders the same list rather than lengthening it — and it
+# is deliberately crude, because the alternative is crawling a host before
+# knowing anything about it:
+#
+#   tier 0  200               real content: the only status a crawler can read
+#   tier 1  401/403           auth surfaces; error pages still leak paths,
+#                             framework hints and redirect_uri parameters
+#   tier 2  3xx               redirect stubs — a crawl mostly re-follows them
+#   tier 3  everything else  5xx, 000, no response
+#   tier 4  no metadata       never answered httpx; nothing to rank on
+#
+# Within a tier: hosts not behind a CDN first (their content is the origin's,
+# not an edge error page), then larger content_length, then input order so the
+# result is deterministic.
+#
+# Falls back to the input order — unchanged — when there is no usable metadata,
+# and says so, because a silent fallback here is indistinguishable from the
+# ranking having run and simply not helped.
+_rank_crawl_candidates() { # <input_urls> <metadata_tsv> <output>
+    local input="$1" meta="$2" output="$3"
+    if [[ ! -s "$meta" ]] || (( $(wc -l < "$meta" 2>/dev/null || echo 0) < 2 )); then
+        log_info "  crawl ranking: no httpx metadata at ${meta} — using input order" >&2
+        cp "$input" "$output" 2>/dev/null || cat "$input" > "$output" 2>/dev/null || : > "$output"
+        return 0
+    fi
+    awk -F'\t' '
+        function tier(s) {
+            if (s == "200") return 0
+            if (s == "401" || s == "403") return 1
+            if (s ~ /^3[0-9][0-9]$/) return 2
+            return 3
+        }
+        NR == FNR {
+            if (FNR == 1 && $1 == "hostname") next
+            h = tolower($1)
+            st[h]  = $6
+            cdn[h] = ($2 == "true") ? 1 : 0
+            cl[h]  = ($5 + 0)
+            known[h] = 1
+            next
+        }
+        {
+            h = tolower($0)
+            sub(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "", h)
+            sub(/[\/:?].*$/, "", h)
+            t = (h in known) ? tier(st[h]) : 4
+            c = (h in known) ? cdn[h] : 1
+            printf "%d\t%d\t%d\t%d\t%s\n", t, c, (h in known) ? -cl[h] : 0, FNR, $0
+        }
+    ' "$meta" "$input" 2>/dev/null \
+        | sort -t"$(printf '\t')" -k1,1n -k2,2n -k3,3n -k4,4n 2>/dev/null \
+        | cut -f5- > "$output" 2>/dev/null || cp "$input" "$output" 2>/dev/null || :
+    [[ -s "$output" ]] || cp "$input" "$output" 2>/dev/null || : > "$output"
+    return 0
+}
+
 # Cap a live-host list for a crawling stage. Echoes "<kept> <total>".
 #
 # CeWL, Katana and SubDomainizer crawl host-by-host with no natural bound, so on
@@ -1468,24 +1619,45 @@ _stage_deadline() {
 # exactly like a stage that ran and found nothing, which is the failure mode
 # this pipeline keeps rediscovering.
 #
+# The list is RANKED before it is truncated (see _rank_crawl_candidates), so the
+# slots go to hosts with content rather than to whichever hostname sorted first.
+# Ranking is skipped when nothing is dropped, so an uncapped run keeps the exact
+# input order its tools have always seen.
+#
+# Optional 5th argument: the httpx metadata TSV to rank against. Defaults to
+# httpx_metadata.tsv, which is what the Phase 1 callers have in their cwd.
+#
 # 0 = unlimited (previous behaviour).
 _cap_crawl_hosts() {
     local input="$1" cap="$2" output="$3" label="${4:-stage}"
-    local total=0 kept=0
+    local meta="${5:-httpx_metadata.tsv}"
+    local total=0 kept=0 ranked=0
     # `wc -l < file` is space-padded on BSD/macOS, and this value is echoed back
     # to the caller as "<kept> <total>", so strip the padding here rather than
     # making every caller parse around it.
     total=$(wc -l < "$input" 2>/dev/null | tr -d '[:space:]')
     [[ "$total" =~ ^[0-9]+$ ]] || total=0
     if (( cap > 0 )) && (( total > cap )); then
-        head -n "$cap" "$input" > "$output" 2>/dev/null || : > "$output"
+        local _ordered="${output}.ranked"
+        _rank_crawl_candidates "$input" "$meta" "$_ordered" 2>/dev/null
+        if [[ -s "$_ordered" ]]; then
+            head -n "$cap" "$_ordered" > "$output" 2>/dev/null || : > "$output"
+            ranked=1
+        else
+            head -n "$cap" "$input" > "$output" 2>/dev/null || : > "$output"
+        fi
+        rm -f "$_ordered" 2>/dev/null || true
         kept=$(wc -l < "$output" 2>/dev/null | tr -d '[:space:]')
         [[ "$kept" =~ ^[0-9]+$ ]] || kept=0
         # To STDERR: this function's stdout is captured by the caller as
         # "<kept> <total>", and log_warn writes to stdout. A log line here
         # silently becomes part of the returned value — the same defect that
         # once handed cloud_enum a two-line -nsf argument.
-        log_warn "  ${label}: input capped at ${cap} of ${total} hosts — the remainder is skipped (raise the cap, or set it to 0 for unlimited)" >&2
+        if (( ranked )); then
+            log_warn "  ${label}: input capped at ${cap} of ${total} hosts — kept the ${cap} highest-ranked (200 > auth > redirect > other); raise the cap or set it to 0 for unlimited" >&2
+        else
+            log_warn "  ${label}: input capped at ${cap} of ${total} hosts — the remainder is skipped (raise the cap, or set it to 0 for unlimited)" >&2
+        fi
     else
         cp "$input" "$output" 2>/dev/null || cat "$input" > "$output" 2>/dev/null || : > "$output"
         kept=$total
@@ -1678,11 +1850,30 @@ extract_domains() {
     # tokens. Without it, set -e + pipefail would abort the ENTIRE pipeline
     # run at Stage 5 with no error message (verified in testing).
     #
-    # Strip percent-encoded fragments first: URLs like
+    # Strip percent-encoded fragments: URLs like
     # https://x.example.com/redirect?to=%2Fapp.example.com would otherwise
     # yield bogus "2Fapp.example.com" tokens (the %2F path separator
     # merges with the following hostname chars).
-    sed -E 's/%[0-9A-Fa-f]{2}/ /g' "$input_file" 2>/dev/null \
+    #
+    # `%25` must be expanded BEFORE the general `%XX` strip, and the pair run
+    # twice, because the input is frequently DOUBLE-encoded. A single pass at
+    # `%XX` turns `%252F` into a literal `2F` glued to the next hostname and
+    # stops — there is no `%` left to match, so it can never recover the second
+    # level. That is exactly what happened: waymore URL lists carry OAuth
+    # callbacks with `redirect_uri=https%253A%252F%252Fapi.portal.vodafone.com`,
+    # and a run produced 37 hostnames like `2Fapi.portal.vodafone.com` and
+    # `2Fciamsso.ciam.vodafone.com` — plausible-looking, charset-valid, entirely
+    # fictional. They reached the hostname inventory, the canonical dataset and
+    # the dnsgen seed list. Order matters: `%25` → `%` first, then `%XX` → space,
+    # twice, resolves three levels of encoding.
+    #
+    # Note what is deliberately NOT done here: filtering tokens that merely start
+    # with two hex digits. Real hostnames do — `2fa.id.aws.cps.vodafone.com` and
+    # `6u2fa.k8s.eu-central-1.aws.cps.vodafone.com` were both in the same run's
+    # output — so a prefix filter would delete real hosts to hide fake ones.
+    # Decoding correctly is the whole fix.
+    sed -E 's/%25/%/g; s/%[0-9A-Fa-f]{2}/ /g; s/%25/%/g; s/%[0-9A-Fa-f]{2}/ /g' \
+        "$input_file" 2>/dev/null \
         | grep -oE '([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}' \
         | sort -u > "$output_file" || true
 }
@@ -1717,4 +1908,30 @@ filter_cloud_domains() {
     local output_file="$2"
     grep -iE '(amazonaws|cloudfront|elasticbeanstalk|azurewebsites|azure-api|blob\.core\.windows|cloudapp|googleapis|appspot|cloudfunctions|storage\.googleapis|web\.app|cloudflarestorage|workers\.dev|digitaloceanspaces|digitalocean\.app|ondigitalocean\.app|herokuapp|vercel\.app|netlify\.app|fly\.dev|railway\.app|onrender\.com|backblazeb2|linodeobjects|oraclecloud|supabase\.co|supabase\.in)' \
         "$input_file" | sort -u > "$output_file" 2>/dev/null || true
+}
+
+# ── Normalize a cloud-asset row to a bare hostname ───────────────────────────
+# The three cloud-asset sources do not agree on shape and nothing reconciled
+# them: dnsx contributes bare hostnames, katana contributes full URLs with
+# scheme, and cloud_enum contributed JSON-quoted URLs. `sort -u` over the union
+# was the only "normalization", so the aggregate file held three formats at once
+# and every consumer had to guess. results.sh guessed with a scheme-stripping
+# regex, which produced `"http:` from a quoted row, failed the in-scope test, and
+# silently discarded all 40 cloud_enum assets from every per-root file.
+#
+# Normalizing here means the aggregate and every slice of it are composable, and
+# `sort -u` finally dedupes across sources instead of across formats.
+#
+# Wildcards are DROPPED, not de-starred: `https://*.amazonaws.com` scraped out of
+# crawled JavaScript is a pattern reference, not a discovered endpoint, and
+# reducing it to `amazonaws.com` would inject a provider root into the asset
+# inventory.
+_cloud_asset_normalize() {
+    sed -E 's/^[[:space:]]*"//; s/"[[:space:]]*$//; s/^[[:space:]]+//; s/[[:space:]]+$//' \
+        | grep -vE '^\*\.' \
+        | sed -E 's|^[a-zA-Z][a-zA-Z0-9+.-]*://||' \
+        | sed -E 's|[/:;?].*$||' \
+        | sed -E 's/^\.+//; s/\.+$//' \
+        | tr '[:upper:]' '[:lower:]' \
+        | grep -E '^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$' || true
 }

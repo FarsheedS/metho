@@ -41,18 +41,34 @@ _naabu_chunk_hosts() { # <cap> <base_overhead> <seconds_per_host>
 # support floor: a port must have been seen open on at least <min_hosts> hosts,
 # unless it is well-known (<1024), where an open port is almost always real and
 # there are few enough of them to keep unconditionally.
-_nmap_port_union() { # <naabu ip:port file> [top_n] [min_hosts]
-    local f="$1" n="${2:-100}" min="${3:-2}"
+_nmap_port_union() { # <naabu ip:port file> [top_n] [min_hosts] [excluded_out]
+    local f="$1" n="${2:-100}" min="${3:-2}" exf="${4:-}"
     [[ -s "$f" ]] || { echo ""; return 0; }
-    if (( n > 0 )); then
-        cut -d: -f2 "$f" | sort | uniq -c | sort -rn \
-            | awk -v n="$n" -v min="$min" '($1 >= min || $2 < 1024) && c < n { print $2; c++ }' \
-            | sort -un | paste -sd, -
-    else
-        cut -d: -f2 "$f" | sort | uniq -c | sort -rn \
-            | awk -v min="$min" '($1 >= min || $2 < 1024) { print $2 }' \
-            | sort -un | paste -sd, -
-    fi
+    [[ -n "$exf" ]] && : > "$exf"
+    # One pass that both selects and explains. Ports naabu found open but which
+    # do not make this list are written to <excluded_out> with the host count and
+    # the reason, because the two rules that drop them — the NMAP_MIN_PORT_HOSTS
+    # floor and the NMAP_TOP_PORTS cap — are exactly the kind that silently delete
+    # a real finding. That happened: naabu found 88.134.246.114:8080 open, the
+    # floor kept 8080 out of the union, and the one non-standard service the sweep
+    # discovered was the one port nmap was never pointed at. The list is not the
+    # finding of record — ip_port_pairs still carries every naabu port — but the
+    # decision now leaves a trace instead of being invisible.
+    cut -d: -f2 "$f" | sort | uniq -c | sort -rn \
+        | awk -v n="$n" -v min="$min" -v exf="$exf" '
+            {
+                ok = ($1 >= min || $2 < 1024)
+                why = ""
+                if (!ok) {
+                    why = "below the " min "-host floor (open on " $1 " host(s))"
+                } else if (n > 0 && c >= n) {
+                    ok = 0
+                    why = "beyond the top-" n " cap"
+                }
+                if (ok) { print $2; c++ }
+                else if (exf != "") print $2 "\t" $1 "\t" why > exf
+            }
+        ' | sort -un | paste -sd, -
 }
 
 # Split nmap's greppable output into ports where a service was identified and
@@ -459,9 +475,15 @@ run_phase3() {
             # which is the one thing the rate limit exists to prevent.
             local _naabu_rate="${NAABU_RATE:-1000}"
             local _naabu_ports="${NAABU_TOP_PORTS:-100}"
-            local _per_host="${NAABU_SECONDS_PER_HOST:-2}"
+            # These fallbacks must match the declarations in lib/utils.sh. They
+            # read `${VAR:-2}` and `${VAR:-3600}` against declarations of 1 and
+            # 1200 — the utils.sh values always win today, so the drift was
+            # latent, but it silently halves the naabu chunk size (and doubles
+            # the chunk count the moment the declaration is removed or reordered)
+            # and lets one hung chunk cost an hour instead of twenty minutes.
+            local _per_host="${NAABU_SECONDS_PER_HOST:-1}"
             local _base="${NAABU_TIMEOUT_BASE:-300}"
-            local _cap="${NAABU_TIMEOUT_MAX:-3600}"
+            local _cap="${NAABU_TIMEOUT_MAX:-1200}"
 
             # Largest chunk that still fits the per-run cap.
             local _chunk_hosts
@@ -622,7 +644,18 @@ run_phase3() {
                 # ports start surviving that exclusion — it costs real ports on
                 # redundant pairs (two mail servers on 587, say).
                 nmap_ports=$(_nmap_port_union "${pdir}/naabu_ip_ports.txt" \
-                    "${NMAP_TOP_PORTS:-100}" "${NMAP_MIN_PORT_HOSTS:-2}")
+                    "${NMAP_TOP_PORTS:-100}" "${NMAP_MIN_PORT_HOSTS:-1}" \
+                    "${pdir}/nmap_ports_excluded.txt")
+                # Report what the floor/cap kept out of -sV. Recorded, not just
+                # logged: these ports ARE in naabu_ip_ports and the final
+                # ip_port_pairs, so they are not lost — but they carry no service
+                # identification, and the operator should be able to see which
+                # ones and why without re-reading this function.
+                if [[ -s "${pdir}/nmap_ports_excluded.txt" ]]; then
+                    local _nmap_exc
+                    _nmap_exc=$(wc -l < "${pdir}/nmap_ports_excluded.txt" | tr -d '[:space:]')
+                    log_info "    ${_nmap_exc} open port(s) excluded from -sV (below the ${NMAP_MIN_PORT_HOSTS:-1}-host floor or beyond the top-${NMAP_TOP_PORTS:-100} cap) — listed in phase3/nmap_ports_excluded.txt"
+                fi
                 # Target list = only hosts with naabu-confirmed open ports
                 cut -d: -f1 "${pdir}/naabu_ip_ports.txt" | sort -u > "${pdir}/nmap_target_hosts.txt"
                 if [[ -s "${pdir}/nmap_target_hosts.txt" ]]; then

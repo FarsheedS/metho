@@ -5,7 +5,26 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # arm64, built on a native arm64 runner.
+    #
+    # This workflow produces the tarball that gets `docker load`ed on an Apple
+    # silicon Mac. Built on ubuntu-latest (amd64) it produced an amd64 image,
+    # which Docker Desktop then ran under x86 emulation — every Go tool in the
+    # image (subfaster, httpx, dnsx, naabu, katana, github-subdomains) and every
+    # Ruby/Python helper paid translation cost for the whole run.
+    #
+    # Nothing in the Dockerfile had to change to fix that: there is no --platform
+    # pinning, no TARGETARCH/GOARCH, and no prebuilt binary — every tool is
+    # `go install`ed, so the architecture simply follows the build host. The only
+    # lever is where the build runs.
+    #
+    # The tradeoff, stated plainly: this yields an ARM-ONLY image, so the artifact
+    # no longer runs on an amd64 host without emulation. That is the right default
+    # while the consumer is one arm64 Mac; if the image is ever needed on an amd64
+    # box (a Linux VPS, say), this job should become a two-leg matrix on
+    # `ubuntu-latest` + `ubuntu-24.04-arm` with per-arch artifact names, rather
+    # than switching back.
+    runs-on: ubuntu-24.04-arm
 
     steps:
       - name: Checkout
@@ -13,6 +32,20 @@ jobs:
 
       - name: Build Docker image
         run: docker build -t metho .
+
+      - name: Verify build architecture
+        run: |
+          # The whole point of this workflow is the architecture, and a silent
+          # regression to amd64 (a runner label change, a future --platform flag
+          # added to the build) would be invisible until a run felt slow. Assert
+          # it here, where the cost of finding out is a failed job rather than a
+          # wasted reconnaissance sweep.
+          ARCH=$(docker run --rm --entrypoint sh metho -c 'uname -m')
+          echo "Image architecture: ${ARCH}"
+          case "$ARCH" in
+            aarch64|arm64) ;;
+            *) echo "::error::expected an arm64 image, got ${ARCH}" >&2; exit 1 ;;
+          esac
 
       - name: Verify runtime binaries
         run: |

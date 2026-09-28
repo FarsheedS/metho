@@ -57,12 +57,24 @@ log_info "Threads:    ${THREADS}"
 log_info "Rate limit: ${RATE_LIMIT}/s"
 log_info "Parallel hosts (per-tool): ${PARALLEL_HOSTS}"
 log_info "Parallel domains (Phase 1): ${PARALLEL_DOMAINS}"
-log_info "Port scan:  ${PORT_SCAN} (nmap -sV cap: top ${NMAP_TOP_PORTS} ports)"
+if [[ "$PORT_SCAN" == true ]]; then
+    log_info "Port scan:  true (naabu top ${NAABU_TOP_PORTS}, nmap -sV cap: top ${NMAP_TOP_PORTS} ports)"
+else
+    # Don't advertise an nmap cap that will never be applied — with port
+    # scanning off, Phase 3 still runs classification and the ASN lookup, but
+    # Stages 4a/4b never start.
+    log_info "Port scan:  false (--no-port-scan — classification still runs)"
+fi
 if [[ "$SKIP_PERMUTATION" == true ]]; then
     log_info "Permutation: DISABLED (--skip-permutation)"
 else
     log_info "Permutation: dnsgen enabled (skip if > ${DNSGEN_SKIP_THRESHOLD} subdomains)"
 fi
+# Stage budgets, surfaced because they are what truncates a run's coverage and
+# the two that moved most (crawl, github-subdomains) were previously either
+# declared inline at their call site or absent from this banner entirely.
+log_info "Budgets:    domain ${DOMAIN_TIMEOUT}s, crawl ${CRAWL_STAGE_TIMEOUT}s, github ${GITHUB_SUBDOMAINS_TIMEOUT}s, cloud_enum ${CLOUD_ENUM_TIMEOUT}s"
+log_info "Crawl caps: CeWL ${CEWL_MAX_HOSTS:-300}, Katana/SubDomainizer ${CRAWL_MAX_HOSTS:-300} hosts (0=unlimited)"
 [[ -n "$SUBFASTER_PROVIDER_CONFIG" ]] && log_info "Subfaster config: ${SUBFASTER_PROVIDER_CONFIG}"
 [[ -n "$PASSIVE_PROXY" ]] && log_info "Passive proxy: ${PASSIVE_PROXY} (crt.name, GitHub, subfaster, waymore only — scanning stays direct)"
 [[ -n "$ASN_CONFIG_FILE" ]] && log_info "ASN config: ${ASN_CONFIG_FILE}"

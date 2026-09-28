@@ -130,6 +130,8 @@ Re-discovery does **not** re-open a settled row. CT logs are historical, so the 
 
 When addresses are stripped, the hostname, the address and the matched range are written to `canonical_dns.tsv.bogon` next to the dataset, **appended across every resolution pass and reset once per dataset**. A bogon count with no evidence behind it cannot be audited: the earlier version erased the address *and* left no trace, so determining whether a "bogon" was an RFC1918 leak, a CGNAT name or a fake-IP VPN artefact meant re-resolving the hosts by hand. The log was then truncated on every pass (both by an `rm -f` and by awk's `>` redirect, which truncates on the first write of each invocation), so it only ever held the last pass's strips — on a real run the global file listed 11 hosts against 514 bogon rows, and the same run contradicted itself, reporting "198.18.0.0/15 IS present — fake-IP VPN" in one pass and "No 198.18.0.0/15 present" in the next, because the evidence had been erased in between.
 
+The per-domain logs are **concatenated into the merged dataset's audit file** once `merge_per_domain_dns` has run, because the per-domain pass strips the addresses as it resolves — by the time the global TSV is assembled from those rows every bogon row has an empty address column, so the merged layer had nothing of its own to audit and every merged pass after Phase 1 reported "No 198.18.0.0/15 present" over a dataset whose per-domain log contained 126 matching rows. The verdict is now also gated on the file existing: absence of evidence is reported as absence of evidence, not as absence of the range. The merged audit file is copied into `final/` so the evidence travels with the deliverables.
+
 Note the far more common cause is a public DNS record that legitimately points into RFC1918/CGNAT — internal names leaked into Certificate Transparency logs — which no resolver setting will change. `198.18.0.0/15` (RFC 2544) *can* be a fake-IP VPN signature, but its presence alone proves nothing: a VPN can only substitute an answer it is on the path of, so the warning names a VPN only when the range is present **and** the answers came through the system resolver rather than DoH. Verified on a real run — 56 internal-looking names returned `198.18.x` addresses from a public DoH endpoint, i.e. genuine published records for a carrier-internal range, not injection.
 
 Phases 2 and 3 never re-resolve the entire corpus — only newly discovered hosts are resolved through dnsx, and the results are merged incrementally.
@@ -231,9 +233,15 @@ Options:
                             Values above the maximum are clamped and reported, never
                             honoured silently.
   --cewl-max-hosts N        Max live hosts CeWL may crawl for the brute-force wordlist
-                            (default: 150; 0 = unlimited)
-  --crawl-max-hosts N       Max live hosts Katana/SubDomainizer may crawl
                             (default: 300; 0 = unlimited)
+  --crawl-max-hosts N       Max live hosts Katana/SubDomainizer may crawl
+                            (default: 300; 0 = unlimited). The input is ranked
+                            before it is capped, so the slots go to hosts that
+                            serve content rather than to whichever hostname
+                            sorted first — see "Crawl ranking" below.
+  --domain-timeout N        Per-domain wall-clock cap in seconds (default: 7200;
+                            0 = off). Being killed by it drops every later stage
+                            for that domain, so set it well above expectation.
   --probe-reserved          ALSO HTTP-probe hosts whose only addresses are
                             reserved/private (status 'bogon'). Unreachable from the
                             internet, but reachable if your network routes into the
@@ -374,9 +382,9 @@ three shared resources need to be sized against each other.
 | `--httpx-threads` | `150` (max `200`) | httpx threads **per process**. The real throughput bound: throughput ≈ threads ÷ mean latency, so 50 threads against a corpus full of dead hosts measured 4.34 targets/s while the rate limit sat unused |
 | `HTTPX_TIMEOUT_MAX` / `HTTPX_SECONDS_PER_TARGET` | `3600`s / `1` | Wall-clock ceiling for an httpx round, scaled per target. httpx was the last stage with **no cap at all**: Phase 1 bounds it indirectly through the per-domain watchdog, but Phase 3's late probe runs with no watchdog above it, so an unbounded round there could hang the whole run. A killed round keeps what it flushed and is recorded as partial |
 | `--rate-limit` | `100`/s | **Aggregate** against the targets. Phase 1 divides it by the number of workers actually started, so 3 workers each use 33/s, not 100/s. Only binds once `--httpx-threads` is high enough to reach it |
-| `--cewl-max-hosts` / `--crawl-max-hosts` | `150` / `300` | How many live hosts the wordlist and crawl stages may touch per domain. Uncapped they are linear in the live-host count and outlast the domain budget |
-| `CRAWL_STAGE_TIMEOUT` | `1200`s | Wall-clock cap per crawl stage, independent of `--domain-timeout` |
-| `NAABU_TIMEOUT_MAX` / `NAABU_TOTAL_TIMEOUT_MAX` | `3600`s / `4×` that | Per-chunk and whole-sweep ceilings. naabu's cost is linear in the candidate count, so Phase 3 sweeps the candidate list **in chunks** sized to fit the per-run cap rather than truncating one big run: 6,501 candidates need ~13,300s at the defaults, against a 3,600s cap |
+| `--cewl-max-hosts` / `--crawl-max-hosts` | `300` / `300` | How many live hosts the wordlist and crawl stages may touch per domain. Uncapped they are linear in the live-host count and outlast the domain budget. **Which** hosts they touch now matters as much as how many: the input is ranked before it is capped (see `crawl ranking` below), because a plain `head -n` over an alphabetically sorted live list spent a 300-host budget on `adm.*`/`adminauth.*` — 208 canonical-redirect stubs against 11 real pages |
+| `CRAWL_STAGE_TIMEOUT` | `1800`s | Wall-clock cap per crawl stage, independent of `--domain-timeout`. Raised from 1,200s: at that value a 28,993-hostname run was cut off with SubDomainizer only 63 hosts into its 300, and SubDomainizer was the best hostname source of the run (443 net-new names in those 63, ~22/min versus ~14/min for `github-subdomains`) |
+| `NAABU_TIMEOUT_MAX` / `NAABU_TOTAL_TIMEOUT_MAX` | `1200`s / `4×` that | Per-chunk and whole-sweep ceilings. naabu's cost is linear in the candidate count, so Phase 3 sweeps the candidate list **in chunks** sized to fit the per-run cap rather than truncating one big run: 6,501 candidates need ~6,800s at the defaults, against a 4,800s sweep budget — so a target that size sweeps in chunks and records the remainder rather than silently truncating |
 | `NMAP_TIMEOUT_MAX` / `NMAP_SECONDS_PER_HOST` | `3600`s / `30` | Wall-clock ceiling for the `nmap -sV` pass, which had **no timeout at all**. Matters most on the fallback path (naabu found nothing, so every candidate goes to `-sV`). A killed nmap keeps what it wrote and is recorded as partial |
 | `DNSX_THREADS_DOH` | `64` | dnsx threads *per worker*. All workers share one DoH proxy, so in-flight = `parallel-domains × 64` |
 | `DOH_PROXY_THREADS` | `128` | Requests the proxy serves at once. Must be ≥ the in-flight figure above, or queries queue past `DNSX_QUERY_TIMEOUT_DOH` and get recorded as `timeout`. Startup now warns when `parallel-domains × DNSX_THREADS_DOH` exceeds it |
@@ -404,9 +412,16 @@ docker run --rm -it \
 - Watch `results/doh_proxy.log`: `dropped=0` and an error count near zero is
   what a correctly sized pool looks like. A growing `dropped` count means
   `DOH_PROXY_THREADS` is too low.
-- `--domain-timeout` (default `5400`) caps any single pathological domain so it
+- `--domain-timeout` (default `7200`) caps any single pathological domain so it
   cannot gate the pool; a 70-domain sweep will hit this on the largest targets
-  and keep going.
+  and keep going. Note that being killed by it is the worst outcome short of a
+  crash: the domain dies wherever it happened to be, so **every later stage for
+  that domain never runs** — Katana, SubDomainizer, Stage 7 and its httpx round
+  are not merely truncated, they are absent. It is a hang guard, not a schedule,
+  so set it well above what you expect a domain to need. It was raised from
+  5,400s for exactly that reason: a 28,993-hostname domain finished Phase 1 in
+  65m19s, leaving only 25 minutes of headroom, and the crawl-budget increase
+  would have taken it to ~82m — inside the old cap by eight minutes.
 - Port scanning is one global phase. The candidate list is swept in **chunks**
   sized to fit `NAABU_TIMEOUT_MAX`, so a large target is covered rather than
   truncated; the knob that bounds the whole sweep is
@@ -433,11 +448,12 @@ Some tools can stall on misbehaving hosts. Each one has a configurable wall-cloc
 | `CEWL_DEPTH` | `2` | CeWL spider depth on first pass (retries at depth 1 on failure) |
 | `CEWL_MEM_LIMIT_MB` | `1024` | CeWL per-process address-space cap (MB) |
 | `WAYMORE_TIMEOUT` | `600` | Waymore historical recon (per root domain) |
-| `GITHUB_SUBDOMAINS_TIMEOUT` | `300` | GitHub-subdomains code search (per root domain) |
+| `GITHUB_SUBDOMAINS_TIMEOUT` | `600` | GitHub-subdomains code search (per root domain). Raised from 300s because it was killed while still yielding — 68 net-new hostnames, ~14/min |
 | `DNSGEN_TIMEOUT` | `120` | dnsgen permutation generation |
-| `DNSGEN_MAX_INPUT` | `500` | Max subdomains fed to dnsgen (resolved hosts prioritized; 0 disables) |
+| `DNSGEN_MAX_INPUT` | `500` | Max subdomains fed to dnsgen (resolved hosts prioritized; 0 disables). **Ordered against `DNSGEN_SKIP_THRESHOLD` below, and the lower one wins** — at the defaults any set large enough to trip this cap has already been skipped outright, so the cap only fires if you raise the skip threshold above it or set the skip to `0` |
 | `DNSGEN_SKIP_THRESHOLD` | `100` | Domains with more discovered subs than this skip dnsgen entirely (large targets: ~0 yield, hours of DNS; 0 disables) |
-| `DNSGEN_MAX_OUTPUT_BYTES` | `26214400` | Hard cap on dnsgen permutation output size (25MB) |
+| `DNSGEN_MAX_OUTPUT_BYTES` | `524288` | Hard cap on dnsgen permutation output size (512KB). This, not `DNSGEN_MAX_INPUT`, is what bounds a small domain: the explosion is per input (52 inputs produced 40,362 candidates in 1.2MB), so truncating the seed list cannot limit it. The previous 25MB ceiling never bound anything |
+
 | `NAABU_TIMEOUT` | `0` (derived) | Naabu fast port scan, per chunk. `0` derives the cap from the chunk's host count (`NAABU_TIMEOUT_BASE + hosts × NAABU_SECONDS_PER_HOST`, max `NAABU_TIMEOUT_MAX`); any positive value pins it |
 | `NAABU_TIMEOUT_BASE` | `300` | Fixed part of the derived naabu cap |
 | `NAABU_SECONDS_PER_HOST` | `1` | Per-host part of the derived naabu cap. Conservative on purpose — it sets the chunk size, where under-estimating is unsafe. Recalibrate if `NAABU_TOP_PORTS`/`NAABU_RATE` change: the realistic cost is `ports ÷ rate × (1 + retries)` |
@@ -448,7 +464,7 @@ Some tools can stall on misbehaving hosts. Each one has a configurable wall-cloc
 | `NAABU_RATE` | `1000` | Naabu packets/sec cap (noise/IPS throttle) |
 | `NAABU_RETRIES` | `2` | Naabu SYN retransmit count |
 | `NMAP_INCLUDE_CLOUD` | `0` | Whether cloud-classified IPs are port-scanned. Off by default: on a real run every host answering on more than 5 ports was a Google Cloud address, and they contributed 226 of the 247 ports found — GCP front-end artefacts that dominated the sweep and filled the `-sV` port union. Dropping cloud halves the candidate list; it does NOT reduce the HTTP surface (httpx results are unchanged). Set to `1` when the target self-hosts on cloud VMs |
-| `NMAP_MIN_PORT_HOSTS` | `2` | How many hosts a port must have been seen open on before `-sV` spends time on it. The `-sV` port list is global, so a port seen on one odd host gets probed across the whole estate. Well-known ports (`<1024`) bypass the floor. `1` disables it |
+| `NMAP_MIN_PORT_HOSTS` | `1` | How many hosts a port must have been seen open on before `-sV` spends time on it. The `-sV` port list is global, so a port seen on one odd host gets probed across the whole estate. Well-known ports (`<1024`) bypass the floor. Lowered from `2` because the floor was deleting real findings: naabu found `:8080` open on exactly one host, the floor kept 8080 out of the `-sV` union, and the one non-standard service the sweep discovered was the one port nmap was never pointed at. The noise argument for the floor was written when `NAABU_TOP_PORTS` was 1,000; at top-100 the union is bounded regardless. Ports the floor and the top-N cap exclude are now listed in `phase3/nmap_ports_excluded.txt` rather than dropped silently |
 | `NMAP_TIMEOUT_MAX` / `NMAP_SECONDS_PER_HOST` | `3600`s / `30` | Wall-clock ceiling for the `nmap -sV` pass, scaled per host |
 | `NMAP_TOP_PORTS` | `100` | Cap on how many ports `-sV` service-detects (see `--nmap-top-ports`) |
 | `METHO_PROBE_RESERVED` | `0` | Whether `bogon` hosts (every address reserved/private) are HTTP-probed. Off by default: on a network that does not route into that space each costs an httpx timeout, and the address may reach something unrelated to the target. On a real run 549 hosts were in this bucket and **2 were live** — internal OpenSearch clusters answering 200 from `100.64.x`. HTTP only: `bogon` hosts are never port-scanned either way |
@@ -558,7 +574,9 @@ results/
     ├── final_cdn_ips.txt                  # CDN IPs
     ├── final_non_cdn_ips.txt              # Non-CDN IPs
     ├── final_nmap_candidates.txt          # IPs targeted for port scanning
-    └── final_domain_ip_map.txt            # Domain→IP mapping
+    ├── final_domain_ip_map.txt            # Domain→IP mapping
+    ├── canonical_dns.tsv.bogon           # Reserved addresses stripped, with matched ranges
+    └── final_takeover_candidates.txt      # cname_only hosts + CNAME-target verdicts
 ```
 
 ### The `final/` Directory
@@ -567,10 +585,20 @@ This is the one you care about. It contains deduplicated, consolidated lists rea
 
 Key files:
 - **`canonical_dns.tsv`** — The single source of truth for hostname→DNS mappings. Every hostname discovered by any tool is tracked here with its resolution status and discovery sources.
+- **`final_all_domains.txt`** — Every hostname in `canonical_dns.tsv`, and nothing else. It is derived from that dataset rather than from the raw Phase 1 inventories, so it includes hosts that only Phase 2 (`dnsx-cloud`) or Phase 3 (`ptr-reverse`) contributed, and it is case-normalized so a set comparison against `results/<root>/subdomains.txt` is meaningful.
 - **`final_ip_classification.tsv`** — Deterministic IP classification with CDN/cloud/dedicated/unknown labels, associated hostnames, root domains, ASN, and ASN org.
 - **`final_nmap_candidates.txt`** — IPs that were actually port-scanned (excludes CDN IPs, and cloud IPs by default — see `NMAP_INCLUDE_CLOUD`).
-- **`final_httpx_metadata.json`** — Full HTTPx output with CDN detection, tech fingerprinting, web server, and content length for every live host.
+- **`final_httpx_metadata.json`** — Full HTTPx output with CDN detection, tech fingerprinting, web server, and content length for every live host. Consolidated across **all** probe rounds, not just the last.
 - **`final_waymore_urls.txt`** — All historical URLs discovered by Waymore across all root domains.
+- **`final_takeover_candidates.txt`** — Subdomain-takeover candidates. One row per `cname_only` host (a host whose only DNS answer is a CNAME), with the CNAME target and a verdict:
+
+  | verdict | meaning |
+  |---|---|
+  | `dangling` | the CNAME target is **confirmed NXDOMAIN** — the chain points at a name that does not exist, so whoever registers it inherits the traffic |
+  | `unresolved` | the target answered nothing and could not be confirmed dead — weaker, because it may be a resolver view difference |
+  | `alive` | the target resolves — not a candidate |
+
+  Targets are resolved through the same DoH transport, timeouts and retry policy as the rest of the run, so a verdict cannot disagree with the dataset for resolver reasons. Bounded by `METHO_TAKEOVER_MAX_TARGETS` (default `5000` distinct targets), and hitting that bound is recorded as a truncation. `METHO_TAKEOVER_CHECK=0` disables the check. It reports the signal — `dangling` means the name is free, which is where a takeover is *possible*, not where one is *proven*; confirm with a service-fingerprint tool before reporting.
 
 ### The `results/` Directory — Per-Root-Domain Final Results
 
@@ -613,6 +641,40 @@ How it works:
   root-seeded apexes keep the `root` source.
 - All per-root outputs are deduplicated.
 
+### Crawl ranking — the cap picks the hosts, not the alphabet
+
+`--cewl-max-hosts` and `--crawl-max-hosts` bound how many live hosts the wordlist
+and crawl stages touch. For a long time the bound was also the *selection rule*: a
+plain `head -n` over the live-host list, which is sorted alphabetically. A 300-host
+budget therefore went to `adm.*`, `adminauth.*`, `adms.*`, … Measured on a
+4,174-host target, that set was **208 canonical-redirect stubs (301) and 11 real
+pages (200)**, while the corpus held **577** hosts answering 200. CeWL built a
+168-word wordlist out of redirect stubs and the stage spent its budget accordingly.
+
+The list is now ranked before it is capped, at no extra wall-clock cost:
+
+| tier | status | why |
+|---|---|---|
+| 0 | `200` | real content — the only status a crawler can actually read |
+| 1 | `401` / `403` | auth surfaces; error pages still leak paths, framework hints and `redirect_uri` parameters |
+| 2 | `3xx` | redirect stubs; a crawl mostly re-follows them |
+| 3 | everything else | `5xx`, `000`, no response |
+| 4 | no httpx metadata | never answered, so there is nothing to rank on |
+
+Within a tier: hosts not behind a CDN first (their content is the origin's, not an
+edge error page), then larger `content_length`, then input order so the result is
+deterministic. Ranking is skipped when nothing is dropped, so an uncapped run keeps
+the exact input order its tools have always seen, and if the metadata file is
+missing or empty the function falls back to the old order and says so — a silent
+fallback would be indistinguishable from ranking having run and simply not helped.
+
+The cap message reports which happened, so a truncated crawl is never ambiguous:
+
+```
+  [!] Katana: input capped at 300 of 4174 hosts — kept the 300 highest-ranked
+      (200 > auth > redirect > other); raise the cap or set it to 0 for unlimited
+```
+
 ### RECON_SUMMARY.txt
 
 A human-readable summary printed at the end of every run:
@@ -633,6 +695,7 @@ ASSETS DISCOVERED:
 - Network Ranges:     28
 - IP Addresses:       456
 - IP:Port Pairs:      1,102
+- Takeover Pairs:     17 (3 dangling — target does not exist)
 
 IP CLASSIFICATION:
 - CDN IPs:            187
@@ -750,6 +813,32 @@ docker build -t metho .
 The build uses a multi-stage Dockerfile:
 - **Builder stage** (`debian:13-slim`): Compiles the Go binaries (subfaster, httpx, katana, dnsx, naabu, github-subdomains — all pinned to exact release versions), and clones the git-hosted tools (CeWL, SubDomainizer, cloud_enum, dnsgen). Go compiler, git, and build-essential stay in this stage.
 - **Runtime stage** (`debian:13-slim`): Copies the compiled binaries and cloned tools, installs runtime interpreters/packages, and installs the Ruby gems CeWL needs (native gems must compile against the runtime's libc, so they are built here — their build deps are purged in the same layer). No compilers, Go SDK, or git in the final image.
+
+### Architecture
+
+**Build on the architecture you will run on.** Nothing in the Dockerfile pins
+one: there is no `--platform`, no `TARGETARCH`/`GOARCH`, and no prebuilt binary —
+every tool is `go install`ed — so the image simply inherits the build host's
+architecture. A plain `docker build` on an Apple-silicon Mac therefore produces a
+native arm64 image, which is what you want.
+
+The failure mode this avoids is quiet rather than loud. An amd64 image loaded on
+an arm64 Mac runs perfectly well under Docker's x86 emulation, and every stage
+just takes longer — subfaster, httpx, dnsx, naabu, katana, github-subdomains and
+every Ruby/Python helper pay translation cost for the whole run. Nothing warns you.
+If a run feels slower than the numbers in this README suggest, check first:
+
+```bash
+docker run --rm --entrypoint sh metho -c 'uname -m'   # aarch64 = native, x86_64 = emulated
+```
+
+`.github/workflows/build-local.yml` (`build-docker-artifacts`) builds the tarball
+that gets `docker load`ed onto the Mac, and runs on `ubuntu-24.04-arm` so that
+artifact is arm64-native; it asserts the architecture before uploading, because a
+silent regression there costs a whole reconnaissance sweep before anyone notices.
+**The artifact is arm-only** — if you ever need to run metho on an amd64 host,
+build it there (or turn that job into a two-leg `ubuntu-latest` + `ubuntu-24.04-arm`
+matrix with per-arch artifact names) rather than switching the runner back.
 
 ---
 
