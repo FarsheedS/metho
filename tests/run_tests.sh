@@ -150,9 +150,47 @@ t "bounded_parallel ignores long-lived siblings" "COMPLETED" "${BP_OUT:-TIMED_OU
 # ── _dnsx_threads is transport-aware and honours an explicit pin ──
 _DNS_MODE_SAVE2="$DNS_MODE"; _DNSX_T_SAVE="${DNSX_THREADS:-}"
 DNS_MODE="udp"; DNSX_THREADS=""; t "udp dnsx threads default" "100" "$(_dnsx_threads)"
-DNS_MODE="doh"; DNSX_THREADS=""; t "doh dnsx threads default" "64"  "$(_dnsx_threads)"
+DNS_MODE="doh"; DNSX_THREADS=""; t "doh dnsx threads default" "128"  "$(_dnsx_threads)"
 DNS_MODE="doh"; DNSX_THREADS="7"; t "explicit dnsx threads wins" "7" "$(_dnsx_threads)"
 DNS_MODE="$_DNS_MODE_SAVE2"; DNSX_THREADS="$_DNSX_T_SAVE"
+
+# ── _dnsx_scaled_cap: floor for small batches, throughput-scaled for large ──
+# Regression for the "DNSx runs over and over" audit finding: a fixed 600s cap
+# could not finish ~25K hosts at DoH's ~16 q/s, leaving the pile for the next
+# stage to re-grind. The cap now scales with batch size (default /15 q/s),
+# bounded below by DNSX_TIMEOUT and above by DNSX_CAP_CEILING.
+_DTS_SAVE="${DNSX_TIMEOUT:-}"; _DPS_SAVE="${DNSX_CAP_QUERIES_PER_SEC:-}"; _DCC_SAVE="${DNSX_CAP_CEILING:-}"
+DNSX_TIMEOUT=600; DNSX_CAP_QUERIES_PER_SEC=15; DNSX_CAP_CEILING=5400
+t "small batch keeps the floor"        "600"  "$(_dnsx_scaled_cap 300)"
+t "batch at the floor boundary"        "600"  "$(_dnsx_scaled_cap 9000)"
+t "large batch scales past the floor"  "2000" "$(_dnsx_scaled_cap 30000)"
+t "pathological batch hits the ceiling" "5400" "$(_dnsx_scaled_cap 200000)"
+DNSX_TIMEOUT="$_DTS_SAVE"; DNSX_CAP_QUERIES_PER_SEC="$_DPS_SAVE"; DNSX_CAP_CEILING="$_DCC_SAVE"
+
+# ── httpx probe is transport-aware (widen on DoH, keep UDP unchanged) ──
+# Regression for the live-server undercount: httpx resolves through the DoH
+# proxy, so a UDP-tuned 10s timeout and the full thread fan-out lost live hosts.
+_HXT_SAVE="${HTTPX_THREADS:-}"; _HXTD_SAVE="${HTTPX_TIMEOUT_DOH:-}"; _HXTH_SAVE="${HTTPX_THREADS_DOH:-}"; _HXTO_SAVE="${HTTPX_TIMEOUT:-}"
+HTTPX_THREADS=150; HTTPX_TIMEOUT=10; HTTPX_TIMEOUT_DOH=25; HTTPX_THREADS_DOH=50
+t "httpx timeout: UDP keeps the tight budget" "10" "$(_httpx_probe_timeout 0)"
+t "httpx timeout: DoH gets the wide budget"   "25" "$(_httpx_probe_timeout 1)"
+t "httpx threads: UDP keeps the full pool"    "150" "$(_httpx_probe_threads 0)"
+t "httpx threads: DoH caps to the proxy share" "50" "$(_httpx_probe_threads 1)"
+HTTPX_THREADS=30
+t "httpx threads: DoH never raises a lower pin" "30" "$(_httpx_probe_threads 1)"
+HTTPX_THREADS="$_HXT_SAVE"; HTTPX_TIMEOUT_DOH="$_HXTD_SAVE"; HTTPX_THREADS_DOH="$_HXTH_SAVE"; HTTPX_TIMEOUT="$_HXTO_SAVE"
+
+# ── _cymru_origin_join: multi-origin ASN must not be glued into a phantom ──
+# Regression for AS1516943515 (=15169+43515): Team Cymru's DNS service returns
+# space-separated origin ASNs; the parser must keep the first, not concatenate.
+COJ="$(mktemp -d)"
+printf 'x.origin.asn.cymru.com\t35.214.147.179\n' > "$COJ/map"
+printf 'x.origin.asn.cymru.com\t15169 43515 | 35.214.128.0/17 | US | arin | 2012-01-01\n' > "$COJ/answers"
+t "multi-origin ASN keeps the first, not glued" "35.214.147.179	15169	35.214.128.0/17	US	arin	2012-01-01" "$(_cymru_origin_join "$COJ/map" "$COJ/answers")"
+printf 'y.origin.asn.cymru.com\t8.8.8.8\n' > "$COJ/map"
+printf 'y.origin.asn.cymru.com\t15169 | 8.8.8.0/24 | US | arin | 2000-01-01\n' > "$COJ/answers"
+t "single-origin ASN is preserved" "8.8.8.8	15169	8.8.8.0/24	US	arin	2000-01-01" "$(_cymru_origin_join "$COJ/map" "$COJ/answers")"
+rm -rf "$COJ"
 
 # ── _dnsx_query_timeout is transport-aware ──
 _DNS_MODE_SAVE="$DNS_MODE"

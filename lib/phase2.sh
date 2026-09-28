@@ -60,16 +60,23 @@ run_phase2() {
             # report and new hostnames into the dataset, so a silent partial run
             # understates both.
             local _p2_rc=0
+            # Same throughput-scaled cap as the Phase 1 resolver. This pass
+            # issues four record-type queries per host (cname/mx/ns/txt), so the
+            # cap is sized to 4× the host count — a flat 600s cap killed it
+            # before it flushed a single line on any root with more than ~2.4K
+            # resolved hosts (10 minutes spent for a zero-byte file).
+            local _p2_cap
+            _p2_cap=$(_dnsx_scaled_cap "$(( $(wc -l < "$canonical_hosts") * 4 ))")
             cat "$canonical_hosts" \
-                | timeout "${DNSX_TIMEOUT}" dnsx -cname -mx -ns -txt \
+                | timeout "${_p2_cap}" dnsx -cname -mx -ns -txt \
                     -json -retry "${DNSX_RETRY}" \
                     -r "${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt}" \
                     -timeout "$(_dnsx_query_timeout)" \
                     -t "$(_dnsx_threads)" \
                     > "${pdir}/dnsx_output.json" 2>>"$dnsx_log" || _p2_rc=$?
             if _was_capped "$_p2_rc"; then
-                _record_truncation "all" "dnsx-cloud-records" "hit its ${DNSX_TIMEOUT}s cap — cloud records are partial"
-                log_warn "DNSx cloud-record pass was KILLED at its ${DNSX_TIMEOUT}s cap — records are PARTIAL"
+                _record_truncation "all" "dnsx-cloud-records" "hit its ${_p2_cap}s cap — cloud records are partial"
+                log_warn "DNSx cloud-record pass was KILLED at its ${_p2_cap}s cap — records are PARTIAL"
             elif (( _p2_rc != 0 )); then
                 log_warn "DNSx exited non-zero (${_p2_rc}) — see ${dnsx_log}"
             fi

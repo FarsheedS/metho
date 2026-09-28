@@ -51,6 +51,59 @@ _cymru_whois_lookup() {
 # This rides the pipeline's normal resolver path, so it still works on networks
 # that block outbound TCP/43 — which is precisely the failure that broke
 # classification in the observed run.
+# Join Cymru origin TXT answers back to the IPs that produced them.
+#   $1 = map file    "name<TAB>ip"
+#   $2 = answers file "name<TAB>txt"   (txt = "AS | prefix | CC | registry | alloc")
+# Emits one row per IP: "ip AS prefix cc reg alloc" (TSV).
+#
+# Team Cymru's DNS service answers with EVERY BGP prefix that covers the address
+# (both 192.0.2.0/21 and the more-specific /24), where whois returns exactly
+# one; downstream aggregates count IPs per prefix, so we keep one row per IP —
+# the most specific prefix, matching whois. Split out of _cymru_dns_lookup as a
+# pure text transform so it can be unit-tested without real DNS.
+_cymru_origin_join() {
+    awk -F'\t' -v OFS='\t' '
+        NR == FNR { ip[$1] = $2; next }
+        {
+            name = $1; txt = $2
+            if (!(name in ip)) next
+            n = split(txt, f, "|")
+            if (n < 5) next
+            for (i = 1; i <= n; i++) { gsub(/^[ \t]+|[ \t]+$/, "", f[i]) }
+            # Team Cymru DNS can return MULTIPLE origin ASNs for one prefix,
+            # space-separated in this field ("15169 43515"); whois returns one.
+            # Keep the first (primary) origin — a bare non-digit strip would
+            # splice them into a phantom ASN like AS1516943515 with no
+            # registered name, which then misses the cloud/CDN lists and gets
+            # port-scanned.
+            asn = f[1]; sub(/[ \t].*$/, "", asn); gsub(/[^0-9]/, "", asn)
+            if (asn == "") next
+            addr = ip[name]
+            # Compare the CIDR LENGTH numerically. Comparing the prefix string
+            # by length ties on /21 vs /24, and silently keeps whichever came
+            # first out of the resolver.
+            spl = split(f[2], pf, "/")
+            bits = (spl > 1) ? pf[2] + 0 : 0
+            if (!(addr in best) || bits > best_bits[addr]) {
+                best_bits[addr] = bits
+                best[addr] = asn
+                best_prefix[addr] = f[2]
+                best_cc[addr] = f[3]
+                best_reg[addr] = f[4]
+                best_alloc[addr] = f[5]
+            }
+            if (!(addr in emitted)) { emitted[addr] = 1; order[++k] = addr }
+        }
+        END {
+            for (i = 1; i <= k; i++) {
+                a = order[i]
+                if (a in best)
+                    print a, best[a], best_prefix[a], best_cc[a], best_reg[a], best_alloc[a]
+            }
+        }
+    ' "$1" "$2"
+}
+
 _cymru_dns_lookup() {
     local ips_file="$1" out_file="$2"
     local work="${out_file}.dns"
@@ -78,48 +131,10 @@ _cymru_dns_lookup() {
     jq -r '(.host | sub("[.]$"; "")) as $h | (.txt // [])[] | [$h, .] | @tsv' \
         "${work}.json" 2>/dev/null > "${work}.answers" || : > "${work}.answers"
 
-    # origin answer -> "IP | AS | prefix | CC | registry | allocated"
-    #
-    # Team Cymru's DNS service answers with EVERY BGP prefix that covers the
-    # address (both 192.0.2.0/21 and the more-specific 192.0.2.0/24, for
-    # instance), where the whois service returns exactly one. Downstream
-    # aggregates count IPs per prefix, so a naive pass-through double-counts
-    # every such address in asn_raw.txt / asn_summary.txt. Keep one row per IP
-    # — the most specific prefix, which is what whois reports.
-    awk -F'\t' -v OFS='\t' '
-        NR == FNR { ip[$1] = $2; next }
-        {
-            name = $1; txt = $2
-            if (!(name in ip)) next
-            n = split(txt, f, "|")
-            if (n < 5) next
-            for (i = 1; i <= n; i++) { gsub(/^[ \t]+|[ \t]+$/, "", f[i]) }
-            asn = f[1]; gsub(/[^0-9]/, "", asn)
-            if (asn == "") next
-            addr = ip[name]
-            # Compare the CIDR LENGTH numerically. Comparing the prefix string
-            # by length ties on /21 vs /24, and silently keeps whichever came
-            # first out of the resolver.
-            spl = split(f[2], pf, "/")
-            bits = (spl > 1) ? pf[2] + 0 : 0
-            if (!(addr in best) || bits > best_bits[addr]) {
-                best_bits[addr] = bits
-                best[addr] = asn
-                best_prefix[addr] = f[2]
-                best_cc[addr] = f[3]
-                best_reg[addr] = f[4]
-                best_alloc[addr] = f[5]
-            }
-            if (!(addr in emitted)) { emitted[addr] = 1; order[++k] = addr }
-        }
-        END {
-            for (i = 1; i <= k; i++) {
-                a = order[i]
-                if (a in best)
-                    print a, best[a], best_prefix[a], best_cc[a], best_reg[a], best_alloc[a]
-            }
-        }
-    ' "${work}.map" "${work}.answers" > "${work}.origin"
+    # origin answer -> "IP | AS | prefix | CC | registry | allocated".
+    # Pure text join, split into _cymru_origin_join so the multi-origin ASN
+    # parsing can be unit-tested without touching real DNS.
+    _cymru_origin_join "${work}.map" "${work}.answers" > "${work}.origin"
 
     if [[ ! -s "${work}.origin" ]]; then
         rm -f "${work}".*

@@ -259,10 +259,43 @@ _dnsx_threads() {
         return
     fi
     if [[ "${DNS_MODE}" == "doh" ]]; then
-        echo "${DNSX_THREADS_DOH:-64}"
+        # 128 matches the DoH proxy's own worker pool (DOH_PROXY_THREADS:-128).
+        # At 64 a single-root run kept only 64 queries in flight against a
+        # 128-thread proxy — the proxy ran at 50% and DNS throughput was halved.
+        # With PARALLEL_DOMAINS>1 the aggregate (workers × this) can exceed the
+        # proxy pool; the startup banner already warns and says to lower this or
+        # raise --doh-proxy-threads when that happens.
+        echo "${DNSX_THREADS_DOH:-128}"
     else
         echo "${DNSX_THREADS_UDP:-100}"
     fi
+}
+
+# ── Wall-clock cap for one dnsx pass ────────────────────────────────────────────
+# _dnsx_scaled_cap <query_count>
+#
+# Scales the cap to the batch size and the transport's MEASURED throughput.
+# A fixed 600s cap could not finish ~25K hosts at DoH's ~16 q/s, so ~20K
+# survived as "timeout" into the next stage, which queried them again — the
+# single biggest reason DNSx resolution "runs over and over" on large roots.
+#
+# The divisor is "queries cleared per second". DoH through the local proxy
+# measures ~16 q/s on this deployment (native arm64, 8 public endpoints), so
+# the /15 default gives a batch enough wall-clock to FINISH in one pass with
+# light headroom (and ~2× once DNSX_THREADS_DOH drives the full proxy pool).
+# The floor is DNSX_TIMEOUT (default 600) so small roots are untouched; the
+# ceiling bounds a pathological corpus. timeout(1) returns the moment dnsx
+# exits, so an over-generous cap costs nothing when a pass finishes early.
+# Both knobs are env-overridable, per the settings-block convention.
+_dnsx_scaled_cap() {
+    local count="$1"
+    local cap="${DNSX_TIMEOUT}"
+    local _per_sec="${DNSX_CAP_QUERIES_PER_SEC:-15}"
+    local _ceiling="${DNSX_CAP_CEILING:-5400}"
+    local scaled=$(( count / _per_sec ))
+    (( scaled > cap )) && cap=$scaled
+    (( cap > _ceiling )) && cap=$_ceiling
+    echo "$cap"
 }
 
 # ── Resolve pending hostnames via DNSx ─────────────────────────────────────────
@@ -279,10 +312,12 @@ _dnsx_threads() {
 # without re-grinding the whole corpus on every delta round.
 #
 # Robustness:
-#   * Effective dnsx wall-clock cap scales with the batch size
-#     (max(DNSX_TIMEOUT, pending/50), capped at 3600s) — a fixed 600s cap on a
-#     300K-host batch killed dnsx mid-run and permanently mislabeled every
-#     unprocessed host as "timeout" (never retried: only "pending" re-resolves).
+#   * Effective dnsx wall-clock cap scales with the batch size and the
+#     transport's measured throughput (see _dnsx_scaled_cap: floor DNSX_TIMEOUT,
+#     ~DNSX_CAP_QUERIES_PER_SEC per second, ceiling DNSX_CAP_CEILING). A fixed
+#     600s cap on a large batch killed dnsx mid-run, permanently mislabeled every
+#     unprocessed host as "timeout" (never retried: only "pending" re-resolves),
+#     and left the pile for the next stage to re-grind — pass after pass.
 #   * Transport escalation: when a batch's ANSWER rate collapses, the whole
 #     batch is retried through the other transport (system resolver or the
 #     built-in UDP pool) before any result is recorded. The previous
@@ -336,13 +371,12 @@ canonical_dns_resolve_pending() {
         return 1
     fi
 
-    # Scale the wall-clock cap with batch size: a fixed 600s cap killed dnsx
-    # mid-batch on large corpora and permanently mislabeled unprocessed hosts
-    # as "timeout". 1s per 50 hosts ≈ 2.5× headroom at ~2000 q/s, capped at 1h.
-    local eff_timeout="${DNSX_TIMEOUT}"
-    local _scaled=$(( pending_count / 50 ))
-    (( _scaled > eff_timeout )) && eff_timeout=$_scaled
-    (( eff_timeout > 3600 )) && eff_timeout=3600
+    # Scale the wall-clock cap to the batch size and the transport's measured
+    # throughput (see _dnsx_scaled_cap). A fixed 600s cap killed dnsx mid-batch
+    # on large corpora, mislabeled every unprocessed host as "timeout", and left
+    # the pile for the next stage to re-grind pass after pass.
+    local eff_timeout
+    eff_timeout=$(_dnsx_scaled_cap "$pending_count")
 
     # Make sure the transport is still alive before a batch depends on it: a
     # long multi-domain run outlives the proxy's process by many hours.
@@ -798,10 +832,8 @@ canonical_dns_label_nxdomain() {
         return 0
     fi
 
-    local cap="${DNSX_TIMEOUT}"
-    local scaled=$(( n / 50 ))
-    (( scaled > cap )) && cap=$scaled
-    (( cap > 3600 )) && cap=3600
+    local cap
+    cap=$(_dnsx_scaled_cap "$n")
 
     log_info "Canonical DNS: confirming NXDOMAIN for ${n} unresolved hostname(s) (rcode pass, ${cap}s cap)"
 
@@ -1075,10 +1107,8 @@ canonical_dns_takeover_check() {
 
     log_info "Takeover check: resolving ${target_count} distinct CNAME target(s) behind ${pair_count} cname_only host(s)"
 
-    local cap="${DNSX_TIMEOUT}"
-    local scaled=$(( target_count / 50 ))
-    (( scaled > cap )) && cap=$scaled
-    (( cap > 3600 )) && cap=3600
+    local cap
+    cap=$(_dnsx_scaled_cap "$target_count")
 
     : > "${work}/resolve.json"
     _dnsx_resolve_to "${work}/targets.txt" "${work}/resolve.json" \
@@ -1096,12 +1126,9 @@ canonical_dns_takeover_check() {
     comm -23 "${work}/targets.txt" "${work}/alive.txt" > "${work}/unknown.txt" 2>/dev/null || true
     : > "${work}/dead.txt"
     if [[ -s "${work}/unknown.txt" ]]; then
-        local n_cap="${DNSX_TIMEOUT}"
-        local n_unknown
+        local n_unknown n_cap
         n_unknown=$(wc -l < "${work}/unknown.txt" | tr -d '[:space:]')
-        local n_scaled=$(( n_unknown / 50 ))
-        (( n_scaled > n_cap )) && n_cap=$n_scaled
-        (( n_cap > 3600 )) && n_cap=3600
+        n_cap=$(_dnsx_scaled_cap "$n_unknown")
         cat "${work}/unknown.txt" | timeout "$n_cap" dnsx \
             -silent -rcode nxdomain -json \
             -retry "${DNSX_RETRY}" \

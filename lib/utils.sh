@@ -324,6 +324,26 @@ _using_doh_transport() {
     return 0
 }
 
+# Per-request httpx timeout, transport-aware. $1 = "1" when on the DoH transport
+# (httpx resolves through the local proxy, which needs the wider DoH window).
+# Pure — takes the transport as an argument so it is unit-testable without a
+# live proxy. See HTTPX_TIMEOUT / HTTPX_TIMEOUT_DOH.
+_httpx_probe_timeout() {
+    if [[ "${1:-0}" == "1" ]]; then echo "${HTTPX_TIMEOUT_DOH:-25}"; else echo "${HTTPX_TIMEOUT:-10}"; fi
+}
+
+# httpx concurrency, transport-aware. On DoH ($1="1") cap to a share the proxy
+# pool can answer, but never raise an explicitly-lowered HTTPX_THREADS. Pure and
+# unit-testable. See HTTPX_THREADS / HTTPX_THREADS_DOH.
+_httpx_probe_threads() {
+    if [[ "${1:-0}" == "1" ]]; then
+        local _cap="${HTTPX_THREADS_DOH:-50}"
+        if (( HTTPX_THREADS < _cap )); then echo "$HTTPX_THREADS"; else echo "$_cap"; fi
+    else
+        echo "$HTTPX_THREADS"
+    fi
+}
+
 # Does the proxy actually resolve? A listening socket is not enough — the
 # proxy can be up while every endpoint is blocked.
 _doh_proxy_answers() {
@@ -921,6 +941,20 @@ HTTPX_THREADS="${HTTPX_THREADS:-150}"
 HTTPX_TIMEOUT_BASE="${HTTPX_TIMEOUT_BASE:-60}"
 HTTPX_SECONDS_PER_TARGET="${HTTPX_SECONDS_PER_TARGET:-1}"
 HTTPX_TIMEOUT_MAX="${HTTPX_TIMEOUT_MAX:-3600}"
+# Per-request httpx budget (seconds), transport-aware. httpx re-resolves every
+# hostname itself; on the DoH transport that resolution is an HTTPS round-trip
+# through the local proxy, far slower than a UDP reply. The UDP-tuned 10s all-in
+# budget expired DURING DNS on a congested proxy and recorded live hosts as
+# dead — a real vodafone.com run confirmed 5 live out of 1,044 resolved. DoH
+# gets a wider window; UDP is unchanged. See _httpx_probe_timeout.
+HTTPX_TIMEOUT="${HTTPX_TIMEOUT:-10}"
+HTTPX_TIMEOUT_DOH="${HTTPX_TIMEOUT_DOH:-25}"
+# httpx concurrency on the DoH transport. Every probe's DNS goes through ONE
+# local proxy pool (DOH_PROXY_THREADS:-128); the full 150-thread fan-out, each
+# opening a cold DoH lookup, overran it and the surplus expired as "dead". Cap
+# to a share the proxy can actually answer (an explicit lower HTTPX_THREADS
+# still wins). See _httpx_probe_threads.
+HTTPX_THREADS_DOH="${HTTPX_THREADS_DOH:-50}"
 # The clamp's error message tells the operator to raise this deliberately, so it
 # has to be raisable — a plain assignment here silently ignored the environment
 # and made that advice impossible to follow without editing this file.
@@ -982,29 +1016,32 @@ CRAWL_STAGE_TIMEOUT="${CRAWL_STAGE_TIMEOUT:-1800}"
 # — it is one code-search crawl — so it gets a flat cap rather than sharing the
 # crawl budget.
 #
-# Raised from 300 to 600: on the run above it was killed at 300s having
-# contributed 68 net-new hostnames (~14/min) and was still finding them, which
-# makes it the cheapest recovery on the board — 5 more minutes for a source that
-# had not finished. Declared here rather than inline at its call site so it is
-# visible in --help-adjacent listings and the run banner alongside the other
-# budgets.
-GITHUB_SUBDOMAINS_TIMEOUT="${GITHUB_SUBDOMAINS_TIMEOUT:-600}"
+# Raised to 1200: at 600s it was still being killed mid-yield on vodafone.com
+# (531 subdomains and climbing), the same "killed while still finding them"
+# pattern that took it from 300 to 600. It stays cheap — one code-search crawl,
+# no host fan-out — and GitHub's own API rate limit caps the real cost well
+# below the wall-clock budget. Declared here rather than inline at its call site
+# so it is visible in --help-adjacent listings and the run banner alongside the
+# other budgets.
+GITHUB_SUBDOMAINS_TIMEOUT="${GITHUB_SUBDOMAINS_TIMEOUT:-1200}"
 # Per-domain wall-clock cap (seconds) for Phase 1. A single pathological domain
 # (huge permutation set, or DNS grinding through per-query timeouts) must never
 # gate the whole parallel pool. A watchdog TERMs then KILLs that domain's worker
 # once it outlives the cap; already-written partial results are kept. 0 =
 # unlimited.
 #
-# Raised from 5400 (90m) to 7200 (2h). Hitting this is the single worst outcome
-# in the pipeline: the domain is killed mid-stage and EVERY later stage for it —
-# Katana, SubDomainizer, Stage 7 consolidation, and its HTTPX round — never runs
-# at all. The motivating run had a 28,993-hostname domain finish Phase 1 in
-# 65m19s, i.e. only 25 minutes of headroom even before the crawl budget above was
-# lengthened; with it, the same domain would land near 82m, inside the old cap by
-# eight minutes. A cap that close to real work is a data-loss trap rather than a
-# hang guard, which is all it is meant to be. Single-target runs do not share a
-# parallel pool, so the original anti-gating argument for 5400s does not apply.
-DOMAIN_TIMEOUT="${DOMAIN_TIMEOUT:-7200}"
+# Raised to 14400 (4h). Hitting this is the single worst outcome in the pipeline:
+# the domain is killed mid-stage and EVERY later stage for it — Katana,
+# SubDomainizer, Stage 7 consolidation, and its HTTPX round — never runs at all.
+# The 2h value assumed the old fixed-600s DNS caps; once the DNS passes scale to
+# the transport's real throughput (see _dnsx_scaled_cap), a 28,993-hostname root
+# over DoH spends several multi-hundred-second resolve/rcode passes in Phase 1
+# alone — measured at ~16 q/s a single full resolve pass is ~30m, and Phase 1
+# runs several. 4h keeps the completing passes inside the cap with headroom;
+# raising DNSX_THREADS_DOH (now 128) shortens them, so this is a ceiling, not a
+# target. Single-target runs do not share a parallel pool, so the old anti-gating
+# argument for a tighter cap does not apply.
+DOMAIN_TIMEOUT="${DOMAIN_TIMEOUT:-14400}"
 # Probe hosts whose every address is reserved/private (status `bogon`).
 #
 # Those hosts are unreachable from the internet but NOT necessarily unreachable
@@ -1787,11 +1824,22 @@ httpx_probe() {
     # cannot regress. The divergence still exists there, so it is reported
     # rather than left implicit.
     local -a _httpx_resolver_args=()
+    local _httpx_on_doh=0
     if _using_doh_transport && [[ -s "${RESOLVERS_FILE:-}" ]]; then
         _httpx_resolver_args=(-r "$RESOLVERS_FILE")
+        _httpx_on_doh=1
     else
         log_info "httpx: not on the DoH transport (DNS_MODE=${DNS_MODE}) — probing via the system resolver; IPs may differ from the canonical dataset"
     fi
+
+    # httpx re-resolves every name itself, so on the DoH transport its DNS runs
+    # through the local proxy. A UDP-tuned 10s all-in timeout expired during that
+    # resolution and marked live hosts dead, and the full thread fan-out overran
+    # the shared proxy pool. Widen the timeout and cap concurrency on DoH only.
+    local _httpx_timeout _httpx_threads
+    _httpx_timeout=$(_httpx_probe_timeout "$_httpx_on_doh")
+    _httpx_threads=$(_httpx_probe_threads "$_httpx_on_doh")
+    (( _httpx_on_doh == 1 )) && log_info "httpx: DoH transport — ${_httpx_threads} threads, ${_httpx_timeout}s per-request timeout (DNS resolves through the local proxy)"
 
     # Bound the round. See HTTPX_TIMEOUT_MAX for why this did not exist before:
     # Phase 3's late probe has no watchdog above it, so an unbounded httpx there
@@ -1810,8 +1858,8 @@ httpx_probe() {
         -tech-detect \
         -web-server \
         -content-length \
-        -threads "$HTTPX_THREADS" \
-        -timeout 10 \
+        -threads "$_httpx_threads" \
+        -timeout "$_httpx_timeout" \
         -retries 2 \
         -rate-limit "$_rl" \
         -o "$output_json" > /dev/null 2>"$httpx_log" || _httpx_rc=$?

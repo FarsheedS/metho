@@ -263,7 +263,9 @@ run_phase3() {
         # live run — so a cap kill here must not pass as a thin reverse-DNS
         # result. Redirect first, sort after, so timeout(1)'s status survives.
         local _ptr_rc=0
-        cat "${pdir}/all_ips.txt" | timeout "${DNSX_TIMEOUT}" dnsx \
+        local _ptr_cap
+        _ptr_cap=$(_dnsx_scaled_cap "$ip_count")
+        cat "${pdir}/all_ips.txt" | timeout "${_ptr_cap}" dnsx \
             -silent -ptr -resp-only \
             -r "${RESOLVERS_FILE:-/opt/scripts/wordlists/resolvers.txt}" \
             -timeout "$(_dnsx_query_timeout)" \
@@ -273,8 +275,8 @@ run_phase3() {
             || : > "${pdir}/ptr_hostnames.txt"
         rm -f "${pdir}/.ptr_raw.txt"
         if _was_capped "$_ptr_rc"; then
-            _record_truncation "all" "dnsx-ptr" "hit its ${DNSX_TIMEOUT}s cap — reverse-DNS coverage is partial"
-            log_warn "PTR lookups were KILLED at their ${DNSX_TIMEOUT}s cap — reverse-DNS coverage is PARTIAL"
+            _record_truncation "all" "dnsx-ptr" "hit its ${_ptr_cap}s cap — reverse-DNS coverage is partial"
+            log_warn "PTR lookups were KILLED at their ${_ptr_cap}s cap — reverse-DNS coverage is PARTIAL"
         fi
 
         if [[ -s "${pdir}/ptr_hostnames.txt" ]]; then
