@@ -1169,8 +1169,17 @@ NAABU_TOTAL_TIMEOUT_MAX="${NAABU_TOTAL_TIMEOUT_MAX:-0}"
 # which matters most on its fallback path (naabu found nothing, so every
 # candidate is handed to -sV): 6,501 hosts × a 33-port version scan can outlast
 # the rest of the run. Scaled per host like naabu and capped by NMAP_TIMEOUT_MAX.
-NMAP_TIMEOUT_BASE="${NMAP_TIMEOUT_BASE:-60}"
-NMAP_SECONDS_PER_HOST="${NMAP_SECONDS_PER_HOST:-30}"
+#
+# Raised 60/30 -> 180/90: on the 2026-09-29 ravro.ir/arvancloud.ir run — just 7
+# non-CDN hosts in 4 port-set groups, hardly a large target — the old formula
+# (60 + 7*30 = 270s) killed Stage 4b after only 2/4 groups, losing -sV on 5
+# hosts including a BGP port (179) and an SSL mail stack (465/587/993/995),
+# both slower than average to version-probe. -sV's per-host cost is not
+# naabu's SYN-only cost, so the per-host rate needs real headroom, not just the
+# base. Large targets are unaffected: they already hit NMAP_TIMEOUT_MAX either
+# way (see below).
+NMAP_TIMEOUT_BASE="${NMAP_TIMEOUT_BASE:-180}"
+NMAP_SECONDS_PER_HOST="${NMAP_SECONDS_PER_HOST:-90}"
 # nmap -sV wall-clock ceiling. Raised 3600 -> 7200: on a large DoH run Stage 4b
 # shares the phase with the throughput-scaled DNS passes, and -sV on hundreds of
 # hosts can want more than an hour even now that each host is probed only on its
@@ -1968,4 +1977,40 @@ _cloud_asset_normalize() {
         | sed -E 's/^\.+//; s/\.+$//' \
         | tr '[:upper:]' '[:lower:]' \
         | grep -E '^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$' || true
+}
+
+# ── GCS path-style bucket -> virtual-hosted-style rewrite ───────────────────
+# cloud_enum reports every GCP bucket as storage.googleapis.com/<bucket>
+# (path-style) — the bucket name is the only identifying part, and it lives in
+# the path, not the host. The generic `_cloud_asset_normalize` above strips
+# everything after the first `/` for every source (correctly, for the URLs
+# katana and dnsx contribute), so unmodified GCP findings collapse to the bare
+# host "storage.googleapis.com": on the 2026-09-29 ravro.ir/arvancloud.ir run,
+# 3,674 of 3,678 cloud_enum findings (nearly all of it, spanning bucket-name
+# candidates for BOTH roots) reduced to that one anonymous line, absent from
+# either root's cloud_assets.txt and uncounted in the final summary.
+#
+# GCS serves the identical object at <bucket>.storage.googleapis.com too (the
+# same vhost-style convention S3 uses) — a real, dereferenceable address for
+# the SAME resource, not a fabricated one — and, being an ordinary hostname,
+# it survives every existing slash/colon-stripping normalizer and the
+# per-root keyword attribution in results.sh unchanged. A bucket name with
+# dots (GCS's domain-verified buckets, e.g. "www.example.com") is fine here —
+# the dots just become ordinary extra hostname labels. Applied only when
+# every dot-separated part of the bucket name is itself a legal DNS label
+# (GCS bucket names may also contain underscores or run past 63 chars in a
+# single label, neither valid in a hostname); anything that does not qualify
+# is left as the bare host, the same lossy-but-safe fallback as before this
+# function existed.
+_gcs_bucket_to_vhost() {
+    sed -E 's|^[a-zA-Z][a-zA-Z0-9+.-]*://||; s/["[:space:]]+$//; s/[?#].*$//' \
+        | awk -F'/' '
+            BEGIN { IGNORECASE = 1 }
+            tolower($1) == "storage.googleapis.com" && NF >= 2 && $2 != "" && \
+            length($2) <= 200 && \
+            $2 ~ /^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/ {
+                print tolower($2) "." tolower($1); next
+            }
+            { print }
+        '
 }

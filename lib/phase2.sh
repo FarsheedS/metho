@@ -236,9 +236,12 @@ run_phase2() {
                 # Normalized through the same normalize_hostname the canonical
                 # layer uses (strip scheme/port/path, lowercase) so the three
                 # sources are actually comparable under `sort -u` below.
+                # _gcs_bucket_to_vhost runs BEFORE the generic normalizer: it needs
+                # the path (the bucket name) that _cloud_asset_normalize discards.
+                # See its definition in utils.sh for why.
                 jq -Rr 'fromjson? // empty | select(.msg != null) | .target' \
                     "${pdir}/cloud_enum_results.json" 2>/dev/null | \
-                    _cloud_asset_normalize | sort -u \
+                    _gcs_bucket_to_vhost | _cloud_asset_normalize | sort -u \
                     > "${pdir}/cloud_enum_assets.txt" || true
 
                 # Extract any newly discovered hostnames from cloud_enum and add

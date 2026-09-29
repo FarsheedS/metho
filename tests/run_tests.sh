@@ -834,6 +834,17 @@ t "1 is an ordinary failure"   "0" "$(_was_capped 1 && echo 1 || echo 0)"
 t "0 is success"               "0" "$(_was_capped 0 && echo 1 || echo 0)"
 t "empty is not a cap kill"    "0" "$(_was_capped '' && echo 1 || echo 0)"
 
+# ── nmap -sV default cap: a small target must not starve ────────────────────
+# Regression for the 2026-09-29 ravro.ir/arvancloud.ir run: just 7 non-CDN
+# hosts in 4 port-set groups (hardly a large target) hit the OLD default
+# formula's 270s cap (60 + 7*30) after only 2/4 groups, losing -sV on 5 hosts.
+# -sV's per-host cost is not naabu's SYN-only cost, so the floor here pins the
+# per-host rate actually has headroom now, not just the ceiling.
+t "nmap per-host rate has real headroom for -sV, not naabu's SYN-scan rate" "1" \
+    "$([[ "${NMAP_SECONDS_PER_HOST}" -ge 90 ]] && echo 1 || echo 0)"
+t "the 7-host run that used to get capped at 270s now gets well over 600s" "1" \
+    "$([[ "$(_scaled_scan_cap 7 "$NMAP_TIMEOUT_BASE" "$NMAP_SECONDS_PER_HOST" "$NMAP_TIMEOUT_MAX")" -gt 600 ]] && echo 1 || echo 0)"
+
 # ── nmap -sV port union: support floor ──────────────────────────────────────
 # The union is global, so a port seen on one odd host is probed across the whole
 # estate. On a live run 226 of 247 ports appeared on exactly 2 hosts — all GCP
@@ -1087,6 +1098,53 @@ t "cloud: scheme stripped" "1" "$(printf '%s\n' "$_can_out" | grep -cx 'bynder-s
 t "cloud: path and query stripped" "1" "$(printf '%s\n' "$_can_out" | grep -cx 'fonts.googleapis.com')"
 t "cloud: wildcard dropped, not de-starred" "0" "$(printf '%s\n' "$_can_out" | grep -cx 'amazonaws.com')"
 t "cloud: target lowercased" "1" "$(printf '%s\n' "$_can_out" | grep -cx 'upper.case.amazonaws.com')"
+
+# ── _gcs_bucket_to_vhost: GCP path-style buckets keep their name ─────────────
+# cloud_enum reports GCP hits as storage.googleapis.com/<bucket> — the only
+# source whose identifying part is a PATH, not the host. Piped straight into
+# _cloud_asset_normalize (which strips everything after the first /), every
+# GCP finding collapsed to the bare host "storage.googleapis.com": on the
+# 2026-09-29 ravro.ir/arvancloud.ir run, 3,674 of 3,678 cloud_enum findings
+# reduced to that one anonymous, unattributable line.
+_gcs_in="$(mktemp)"
+cat > "$_gcs_in" <<'GCSEOF'
+http://storage.googleapis.com/ravro
+http://storage.googleapis.com/ravro-0
+http://storage.googleapis.com/www.example.com
+http://storage.googleapis.com/bad_bucket_name
+http://storage.googleapis.com/
+https://bynder-static.s3.amazonaws.com
+GCSEOF
+_gcs_out="$(_gcs_bucket_to_vhost < "$_gcs_in" | _cloud_asset_normalize)"
+t "gcs: bucket name becomes a vhost-style host" "1" \
+    "$(printf '%s\n' "$_gcs_out" | grep -cx 'ravro.storage.googleapis.com')"
+t "gcs: a hyphenated bucket name survives" "1" \
+    "$(printf '%s\n' "$_gcs_out" | grep -cx 'ravro-0.storage.googleapis.com')"
+t "gcs: a dotted (domain-verified) bucket name survives" "1" \
+    "$(printf '%s\n' "$_gcs_out" | grep -cx 'www.example.com.storage.googleapis.com')"
+# Both the illegal-bucket-name line and the bare-host (no path) line fall
+# through unchanged to the same bare host, so it's counted twice here — sort -u
+# downstream (as in the real pipeline) is what dedupes it to one.
+t "gcs: illegal bucket name and no-path host both fall back to the bare host" "2" \
+    "$(printf '%s\n' "$_gcs_out" | grep -cx 'storage.googleapis.com')"
+t "gcs: a non-GCS source is passed through unchanged" "1" \
+    "$(printf '%s\n' "$_gcs_out" | grep -cx 'bynder-static.s3.amazonaws.com')"
+
+# End-to-end: the vhost-style rewrite must actually reach the per-root file via
+# the real keyword-attribution path in results.sh (not just survive its own
+# unit test) — this is the same regression shape as the CNAME dedup fix above.
+_PRC2_SAVE_OUT="${OUTPUT_DIR:-}"; _PRC2_SAVE_ROOTS="${ROOT_DOMAINS_FILE:-}"
+PRC2="$(mktemp -d)"; mkdir -p "$PRC2/phase2"
+printf 'hostname\troot_domain\tdiscovery_sources\tA\tAAAA\tCNAME\tresolution_status\n' > "$PRC2/canonical_dns.tsv"
+printf 'ravro.storage.googleapis.com\n' | _gcs_bucket_to_vhost > "$PRC2/phase2/final_cloud_assets.txt"
+printf 'ravro.ir\n' > "$PRC2/.prc2_roots.txt"
+OUTPUT_DIR="$PRC2"; ROOT_DOMAINS_FILE="$PRC2/.prc2_roots.txt"
+generate_per_root_results >/dev/null 2>&1
+_PRC2_OUT="$(cat "$PRC2/results/ravro.ir/cloud_assets.txt" 2>/dev/null)"
+OUTPUT_DIR="$_PRC2_SAVE_OUT"; ROOT_DOMAINS_FILE="$_PRC2_SAVE_ROOTS"
+t "gcs: vhost-style bucket reaches its root's cloud_assets.txt via keyword match" "1" \
+    "$(printf '%s\n' "$_PRC2_OUT" | grep -cx 'ravro.storage.googleapis.com')"
+rm -rf "$PRC2"
 
 # ── per-root cloud_assets: CNAME-derived + cloud_enum keyword attribution ─────
 # Regression for results/<root>/cloud_assets.txt = 1 while the aggregate had
