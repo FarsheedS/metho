@@ -563,6 +563,8 @@ results/
     ├── httpx_metadata.tsv                 # Per-host HTTPX metadata (companion to canonical_dns.tsv)
     ├── canonical_dns.tsv                  # Canonical hostname→DNS dataset
     ├── final_waymore_urls.txt             # All historical URLs from Waymore
+    ├── final_discovered_urls.txt          # All URLs crawled by Katana, across all root domains
+    ├── final_javascript_assets.txt        # All JS file URLs crawled by Katana, across all root domains
     ├── final_cloud_assets.txt             # Every cloud asset
     ├── final_asn_list.txt                 # All ASNs
     ├── final_asn_summary.txt             # ASNs sorted by occurrence count
@@ -590,6 +592,7 @@ Key files:
 - **`final_nmap_candidates.txt`** — IPs that were actually port-scanned (excludes CDN IPs, and cloud IPs by default — see `NMAP_INCLUDE_CLOUD`).
 - **`final_httpx_metadata.json`** — Full HTTPx output with CDN detection, tech fingerprinting, web server, and content length for every live host. Consolidated across **all** probe rounds, not just the last.
 - **`final_waymore_urls.txt`** — All historical URLs discovered by Waymore across all root domains.
+- **`final_discovered_urls.txt`** / **`final_javascript_assets.txt`** — Every URL, and every JS file URL, Katana crawled in Phase 1, merged across all root domains. Previously these only existed per-root under `phase1/<root>/katana/`, absent from both `final/` and `RECON_SUMMARY.txt` despite being real, complete crawl data — the exact "present in one place, invisible everywhere else" gap the rest of this directory exists to close. Feed `final_javascript_assets.txt` to a secret scanner and `final_discovered_urls.txt` to endpoint/param mining.
 - **`final_takeover_candidates.txt`** — Subdomain-takeover candidates. One row per `cname_only` host (a host whose only DNS answer is a CNAME), with the CNAME target and a verdict:
 
   | verdict | meaning |

@@ -1267,6 +1267,11 @@ printf 'http://a.this.example\n' > "${_cs_dir}/phase1/this.example/live_subdomai
 printf 'http://a.stale.example\n' > "${_cs_dir}/phase1/stale.example/live_subdomains_final.txt"
 printf 'http://a.this.example/old\n' > "${_cs_dir}/phase1/this.example/waymore_urls.txt"
 printf 'http://a.stale.example/old\n' > "${_cs_dir}/phase1/stale.example/waymore_urls.txt"
+mkdir -p "${_cs_dir}/phase1/this.example/katana" "${_cs_dir}/phase1/stale.example/katana"
+printf 'http://a.this.example/page\n' > "${_cs_dir}/phase1/this.example/katana/discovered_urls.txt"
+printf 'http://a.stale.example/page\n' > "${_cs_dir}/phase1/stale.example/katana/discovered_urls.txt"
+printf 'http://a.this.example/app.js\n' > "${_cs_dir}/phase1/this.example/katana/javascript_assets.txt"
+printf 'http://a.stale.example/app.js\n' > "${_cs_dir}/phase1/stale.example/katana/javascript_assets.txt"
 printf 'hostname\troot_domain\tdiscovery_sources\tA\tAAAA\tCNAME\tresolution_status\n' > "${_cs_dir}/canonical_dns.tsv"
 printf 'a.this.example\tthis.example\tptr-reverse\t1.2.3.4\t\t\tresolved\n' >> "${_cs_dir}/canonical_dns.tsv"
 printf 'new.this.example\tthis.example\tdnsx-cloud\t\t\t\tcname_only\n'   >> "${_cs_dir}/canonical_dns.tsv"
@@ -1284,6 +1289,20 @@ t "final_all_domains includes a dnsx-cloud discovery" "1" \
     "$(_count_in "${_cs_dir}/final/final_all_domains.txt" '^new.this.example$')"
 t "final_all_domains includes a ptr-reverse discovery" "1" \
     "$(_count_in "${_cs_dir}/final/final_all_domains.txt" '^a.this.example$')"
+
+# ── run_consolidation: katana's crawl output is promoted into final/ ─────────
+# phase1/<root>/katana/discovered_urls.txt and javascript_assets.txt were real,
+# complete crawl data that nothing copied into final/ — absent from
+# RECON_SUMMARY and from every other deliverable's home. Same fixture,
+# same stale-root scoping rule as the two checks above.
+t "final/ promotes this run's discovered URLs" "1" \
+    "$(_count_in "${_cs_dir}/final/final_discovered_urls.txt" 'this[.]example')"
+t "final/ promotes this run's JS assets" "1" \
+    "$(_count_in "${_cs_dir}/final/final_javascript_assets.txt" 'this[.]example')"
+t "final/ excludes a stale phase1 root from discovered URLs" "0" \
+    "$(_count_in "${_cs_dir}/final/final_discovered_urls.txt" 'stale[.]example')"
+t "final/ excludes a stale phase1 root from JS assets" "0" \
+    "$(_count_in "${_cs_dir}/final/final_javascript_assets.txt" 'stale[.]example')"
 
 echo ""
 echo "RESULT: $PASS passed, $FAIL failed"

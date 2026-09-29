@@ -142,6 +142,23 @@ run_consolidation() {
     local waymore_total=0
     [[ -s "${fdir}/final_waymore_urls.txt" ]] && waymore_total=$(wc -l < "${fdir}/final_waymore_urls.txt")
 
+    # ── Katana Crawl Output (discovered URLs + JS assets) ───────────────────
+    # Phase 1's katana crawl writes these per-root under phase1/<root>/katana/,
+    # and nothing copied them into final/: real, complete data (244K+359K lines
+    # of crawled URLs, 447 JS assets across both roots on the 2026-09-29 run)
+    # sitting only in a phase-scoped directory, absent from RECON_SUMMARY and
+    # from every other deliverable's home. Same aggregation as Waymore above.
+    local -a _katana_url_srcs=() _katana_js_srcs=()
+    for _d in "${_p1_dirs[@]}"; do
+        _katana_url_srcs+=("${_d%/}/katana/discovered_urls.txt")
+        _katana_js_srcs+=("${_d%/}/katana/javascript_assets.txt")
+    done
+    cat "${_katana_url_srcs[@]}" 2>/dev/null | sort -u > "${fdir}/final_discovered_urls.txt" || true
+    cat "${_katana_js_srcs[@]}" 2>/dev/null | sort -u > "${fdir}/final_javascript_assets.txt" || true
+    local katana_url_total=0 katana_js_total=0
+    [[ -s "${fdir}/final_discovered_urls.txt" ]] && katana_url_total=$(wc -l < "${fdir}/final_discovered_urls.txt")
+    [[ -s "${fdir}/final_javascript_assets.txt" ]] && katana_js_total=$(wc -l < "${fdir}/final_javascript_assets.txt")
+
     # ── Cloud Assets (Phase 2 aggregate ∪ FINAL canonical CNAME targets) ────
     # Phase 2 builds its aggregate mid-run, before Phase 3 resolves more hosts
     # (PTR, timeout recoveries), so its snapshot misses cloud CNAME targets that
@@ -243,6 +260,8 @@ ASSETS DISCOVERED:
 - All Subdomains:     ${domain_total}
 - Live Web Servers:   ${live_total}
 - Waymore URLs:       ${waymore_total}
+- Discovered URLs (katana): ${katana_url_total}
+- JS Assets (katana): ${katana_js_total}
 - Cloud Assets:       ${cloud_total}
 - ASNs:               ${asn_total}
 - Network Ranges:     ${network_total}
@@ -264,6 +283,8 @@ FILES CREATED IN final/:
 - httpx_metadata.tsv              (per-host HTTPX metadata companion to canonical_dns.tsv)
 - canonical_dns.tsv               (canonical hostname→DNS dataset)
 - final_waymore_urls.txt          (historical URLs from Waymore)
+- final_discovered_urls.txt       (all URLs crawled by katana — content discovery, param/endpoint mining)
+- final_javascript_assets.txt     (all JS file URLs crawled by katana — secret scanning, endpoint mining)
 - final_cloud_assets.txt         (cloud assets)
 - final_asn_list.txt             (ASN numbers)
 - final_asn_summary.txt          (ASNs sorted by IP count)
